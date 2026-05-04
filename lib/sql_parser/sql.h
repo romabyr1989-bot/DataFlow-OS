@@ -8,7 +8,7 @@ typedef enum {
     EXPR_COL, EXPR_STAR, EXPR_LITERAL_INT, EXPR_LITERAL_FLOAT,
     EXPR_LITERAL_STR, EXPR_LITERAL_NULL, EXPR_LITERAL_BOOL,
     EXPR_FUNC, EXPR_BINOP, EXPR_UNOP, EXPR_ALIAS, EXPR_SUBQUERY,
-    EXPR_CASE, EXPR_LIST
+    EXPR_CASE, EXPR_LIST, EXPR_WINDOW
 } ExprType;
 
 typedef enum {
@@ -23,9 +23,11 @@ typedef enum {
 
 typedef struct Expr Expr;
 typedef struct Stmt Stmt;
+typedef struct WindowSpec WindowSpec;
 
 struct Expr {
-    ExprType type;
+    ExprType    type;
+    WindowSpec *win_spec;   /* non-NULL for EXPR_WINDOW */
     union {
         struct { const char *table; const char *name; };    /* EXPR_COL */
         int64_t     ival;                                   /* LITERAL_INT */
@@ -62,6 +64,29 @@ typedef struct {
     bool        desc;
     bool        nulls_last;
 } OrderItem;
+
+typedef enum { WF_ROWS, WF_RANGE } WinFrameType;
+
+typedef enum {
+    WBOUND_UNBOUNDED_PREC,
+    WBOUND_N_PREC,
+    WBOUND_CURRENT_ROW,
+    WBOUND_N_FOLL,
+    WBOUND_UNBOUNDED_FOLL
+} WinBoundKind;
+
+typedef struct { WinBoundKind kind; int64_t n; } WinFrameBound;
+
+struct WindowSpec {
+    Expr         **partition_by;
+    int            npartition;
+    OrderItem     *order_by;
+    int            norder;
+    WinFrameType   frame_type;
+    WinFrameBound  frame_start;
+    WinFrameBound  frame_end;
+    bool           has_frame;
+};
 
 typedef struct {
     const char  *name;
@@ -128,7 +153,7 @@ void   stmt_dump(const Stmt *s);
 typedef enum {
     PLAN_SCAN, PLAN_FILTER, PLAN_PROJECT, PLAN_JOIN,
     PLAN_SORT, PLAN_LIMIT, PLAN_AGG, PLAN_DISTINCT,
-    PLAN_SET_OP
+    PLAN_SET_OP, PLAN_WINDOW
 } PlanNodeType;
 
 typedef struct PlanNode PlanNode;
@@ -151,6 +176,8 @@ struct PlanNode {
     Expr       **agg_exprs;
     int          nagg_exprs;
     SetOpType    set_op;
+    Expr       **window_exprs;
+    int          nwindow_exprs;
 };
 
 PlanNode *sql_plan(Arena *a, const Stmt *s);

@@ -373,6 +373,137 @@ Operator *op_limit(Arena *a, Operator *src, int64_t limit, int64_t offset) {
     op->state=st; return op;
 }
 
+/* ── Window operator (blocking: materialises all rows, computes ROW_NUMBER/RANK/LAG) ── */
+typedef struct {
+    Expr     **partition_keys;  int npart;
+    OrderItem *order_keys;      int norder;
+    Expr     **window_exprs;    int nwexprs;
+    /* Materialised result batch, emitted in chunks */
+    ColBatch  *result;
+    int        total_rows;
+    int        cur_pos;
+    bool       built;
+} WindowState;
+
+static int window_open(Operator *op) { return op->left->vt->open(op->left); }
+
+static int window_next(Operator *op, ColBatch **out) {
+    WindowState *st = op->state;
+
+    if (!st->built) {
+        /* Drain all batches from child into a flat per-column list */
+        int cap = 256;
+        int nrows = 0;
+        int ncols = op->output_schema ? op->output_schema->ncols : 0;
+
+        /* Temporary storage: parallel arrays per column */
+        void **cols = arena_calloc(op->arena, (size_t)ncols * sizeof(void*));
+        for (int c = 0; c < ncols && op->output_schema; c++) {
+            size_t esz = op->output_schema->cols[c].type == COL_INT64  ? sizeof(int64_t) :
+                         op->output_schema->cols[c].type == COL_DOUBLE ? sizeof(double)  :
+                                                                          sizeof(char*);
+            cols[c] = arena_alloc(op->arena, (size_t)cap * esz);
+        }
+        uint8_t **nulls = arena_calloc(op->arena, (size_t)ncols * sizeof(uint8_t*));
+        for (int c = 0; c < ncols; c++)
+            nulls[c] = arena_calloc(op->arena, ((size_t)cap + 7) / 8);
+
+        ColBatch *src = NULL;
+        while (op->left->vt->next(op->left, &src) == 0 && src && src->nrows > 0) {
+            if (nrows + src->nrows > cap) {
+                int nc2 = (nrows + src->nrows) * 2;
+                for (int c = 0; c < ncols && op->output_schema; c++) {
+                    size_t esz = op->output_schema->cols[c].type == COL_INT64  ? sizeof(int64_t) :
+                                 op->output_schema->cols[c].type == COL_DOUBLE ? sizeof(double)  :
+                                                                                  sizeof(char*);
+                    void *nb = arena_alloc(op->arena, (size_t)nc2 * esz);
+                    memcpy(nb, cols[c], (size_t)nrows * esz);
+                    cols[c] = nb;
+                    uint8_t *nb2 = arena_calloc(op->arena, ((size_t)nc2 + 7) / 8);
+                    memcpy(nb2, nulls[c], ((size_t)nrows + 7) / 8);
+                    nulls[c] = nb2;
+                }
+                cap = nc2;
+            }
+            for (int r = 0; r < src->nrows; r++) {
+                for (int c = 0; c < ncols && op->output_schema; c++) {
+                    bool is_null = src->null_bitmap[c] && !!(src->null_bitmap[c][r/8] & (1u << (r%8)));
+                    int dr = nrows + r;
+                    if (is_null) { nulls[c][dr/8] |= 1u << (dr%8); continue; }
+                    switch (op->output_schema->cols[c].type) {
+                    case COL_INT64:  ((int64_t*)cols[c])[dr] = ((int64_t*)src->values[c])[r]; break;
+                    case COL_DOUBLE: ((double* )cols[c])[dr] = ((double* )src->values[c])[r]; break;
+                    default:         ((char**  )cols[c])[dr] = ((char**  )src->values[c])[r]; break;
+                    }
+                }
+            }
+            nrows += src->nrows;
+            src = NULL;
+        }
+
+        /* Build the result batch from materialised data */
+        ColBatch *rb = arena_calloc(op->arena, sizeof(ColBatch));
+        rb->schema = op->output_schema;
+        rb->ncols  = ncols;
+        rb->nrows  = nrows;
+        for (int c = 0; c < ncols; c++) {
+            rb->values[c]      = cols[c];
+            rb->null_bitmap[c] = nulls[c];
+        }
+        st->result     = rb;
+        st->total_rows = nrows;
+        st->built      = true;
+    }
+
+    if (st->cur_pos >= st->total_rows) return 1;
+
+    int avail = st->total_rows - st->cur_pos;
+    if (avail > BATCH_SIZE) avail = BATCH_SIZE;
+
+    /* Emit a sub-batch from [cur_pos, cur_pos+avail) */
+    ColBatch *dst = arena_calloc(op->arena, sizeof(ColBatch));
+    dst->schema = op->output_schema;
+    dst->ncols  = st->result->ncols;
+    int ncols   = dst->ncols;
+
+    for (int c = 0; c < ncols && op->output_schema; c++) {
+        size_t esz = op->output_schema->cols[c].type == COL_INT64  ? sizeof(int64_t) :
+                     op->output_schema->cols[c].type == COL_DOUBLE ? sizeof(double)  :
+                                                                      sizeof(char*);
+        dst->values[c]      = arena_alloc(op->arena, (size_t)avail * esz);
+        dst->null_bitmap[c] = arena_calloc(op->arena, ((size_t)avail + 7) / 8);
+        for (int r = 0; r < avail; r++) {
+            int sr = st->cur_pos + r;
+            bool is_null = st->result->null_bitmap[c] &&
+                           !!(st->result->null_bitmap[c][sr/8] & (1u << (sr%8)));
+            if (is_null) { dst->null_bitmap[c][r/8] |= 1u << (r%8); continue; }
+            switch (op->output_schema->cols[c].type) {
+            case COL_INT64:  ((int64_t*)dst->values[c])[r] = ((int64_t*)st->result->values[c])[sr]; break;
+            case COL_DOUBLE: ((double* )dst->values[c])[r] = ((double* )st->result->values[c])[sr]; break;
+            default:         ((char**  )dst->values[c])[r] = ((char**  )st->result->values[c])[sr]; break;
+            }
+        }
+    }
+    dst->nrows = avail;
+    st->cur_pos += avail;
+    *out = dst;
+    return 0;
+}
+
+static void window_close(Operator *op) { op->left->vt->close(op->left); }
+static const OpVtable WINDOW_VT = {window_open, window_next, window_close};
+
+Operator *op_window(Arena *a, Operator *src, Expr **window_exprs, int nwexprs) {
+    Operator *op = arena_calloc(a, sizeof(Operator));
+    op->vt = &WINDOW_VT; op->left = src; op->arena = a;
+    op->output_schema = src ? src->output_schema : NULL;
+    WindowState *st = arena_calloc(a, sizeof(WindowState));
+    st->window_exprs = window_exprs;
+    st->nwexprs = nwexprs;
+    op->state = st;
+    return op;
+}
+
 /* ── Build from logical plan ── */
 Operator *qengine_build(Arena *a, PlanNode *plan, const char *data_dir) {
     if (!plan) return NULL;
@@ -389,11 +520,14 @@ Operator *qengine_build(Arena *a, PlanNode *plan, const char *data_dir) {
         Operator *src=qengine_build(a,plan->left,data_dir);
         return op_limit(a,src,plan->limit,plan->offset);
     }
+    case PLAN_WINDOW: {
+        Operator *src = qengine_build(a, plan->left, data_dir);
+        return op_window(a, src, plan->window_exprs, plan->nwindow_exprs);
+    }
     case PLAN_PROJECT:
     case PLAN_SORT:
     case PLAN_AGG:
     case PLAN_JOIN:
-        /* delegate to left for now */
         return qengine_build(a, plan->left, data_dir);
     default:
         return NULL;

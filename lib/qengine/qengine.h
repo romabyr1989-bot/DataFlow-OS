@@ -37,6 +37,8 @@ Operator *op_sort(Arena *a, Operator *src,
 
 Operator *op_limit(Arena *a, Operator *src, int64_t limit, int64_t offset);
 
+Operator *op_window(Arena *a, Operator *src, Expr **window_exprs, int nwexprs);
+
 Operator *op_hash_join(Arena *a, Operator *left, Operator *right,
                        Expr *on, JoinType jtype);
 

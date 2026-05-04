@@ -23,7 +23,9 @@ typedef enum {
     TK_UNION, TK_INTERSECT, TK_EXCEPT, TK_ALL, TK_CROSS,
     TK_WITH, TK_RECURSIVE,
     TK_NULLS, TK_FIRST, TK_LAST,
-    TK_EXISTS, TK_CAST
+    TK_EXISTS, TK_CAST,
+    TK_OVER, TK_PARTITION, TK_ROWS, TK_RANGE, TK_UNBOUNDED,
+    TK_PRECEDING, TK_FOLLOWING, TK_CURRENT, TK_ROW
 } TkType;
 
 typedef struct { TkType type; const char *start; size_t len; int64_t ival; double fval; } Token;
@@ -50,6 +52,9 @@ static struct { const char *kw; TkType tk; } KEYWORDS[] = {
     {"CROSS",TK_CROSS},{"WITH",TK_WITH},{"RECURSIVE",TK_RECURSIVE},
     {"NULLS",TK_NULLS},{"FIRST",TK_FIRST},{"LAST",TK_LAST},
     {"EXISTS",TK_EXISTS},{"CAST",TK_CAST},
+    {"OVER",TK_OVER},{"PARTITION",TK_PARTITION},{"ROWS",TK_ROWS},{"RANGE",TK_RANGE},
+    {"UNBOUNDED",TK_UNBOUNDED},{"PRECEDING",TK_PRECEDING},{"FOLLOWING",TK_FOLLOWING},
+    {"CURRENT",TK_CURRENT},{"ROW",TK_ROW},
     {NULL,TK_EOF}
 };
 
@@ -173,8 +178,104 @@ static bool lex_peek_is(Lexer *l, TkType t) {
 }
 
 /* forward declarations */
-static Expr *parse_expr(Lexer *l, int prec);
-static Stmt *parse_stmt(Lexer *l);
+static Expr         *parse_expr(Lexer *l, int prec);
+static Stmt         *parse_stmt(Lexer *l);
+static WinFrameBound parse_frame_bound(Lexer *l);
+static WindowSpec   *parse_window_spec(Lexer *l);
+
+/* ── Window spec parser ── */
+static WinFrameBound parse_frame_bound(Lexer *l) {
+    WinFrameBound b = {0};
+    Token t = lex_peek(l);
+    if (t.type == TK_UNBOUNDED) {
+        lex_consume(l);
+        if (lex_eat(l, TK_FOLLOWING)) b.kind = WBOUND_UNBOUNDED_FOLL;
+        else { lex_eat(l, TK_PRECEDING); b.kind = WBOUND_UNBOUNDED_PREC; }
+    } else if (t.type == TK_CURRENT) {
+        lex_consume(l);
+        lex_eat(l, TK_ROW);
+        b.kind = WBOUND_CURRENT_ROW;
+    } else {
+        Token n = lex_consume(l);
+        b.n = (n.type == TK_NUM_INT) ? n.ival : 1;
+        if (lex_eat(l, TK_FOLLOWING)) b.kind = WBOUND_N_FOLL;
+        else { lex_eat(l, TK_PRECEDING); b.kind = WBOUND_N_PREC; }
+    }
+    return b;
+}
+
+static WindowSpec *parse_window_spec(Lexer *l) {
+    lex_eat(l, TK_LPAREN);
+    WindowSpec *ws = arena_calloc(l->a, sizeof(WindowSpec));
+
+    /* PARTITION BY col, ... */
+    if (lex_peek_is(l, TK_PARTITION)) {
+        lex_consume(l); lex_eat(l, TK_BY);
+        int cap = 4;
+        ws->partition_by = arena_alloc(l->a, cap * sizeof(Expr*));
+        do {
+            if (ws->npartition == cap) {
+                cap *= 2;
+                Expr **nb = arena_alloc(l->a, cap*sizeof(Expr*));
+                memcpy(nb, ws->partition_by, ws->npartition*sizeof(Expr*));
+                ws->partition_by = nb;
+            }
+            ws->partition_by[ws->npartition++] = parse_expr(l, 0);
+        } while (lex_eat(l, TK_COMMA));
+    }
+
+    /* ORDER BY col [ASC|DESC], ... */
+    if (lex_peek_is(l, TK_ORDER)) {
+        lex_consume(l); lex_eat(l, TK_BY);
+        int cap = 4;
+        ws->order_by = arena_alloc(l->a, cap * sizeof(OrderItem));
+        do {
+            if (ws->norder == cap) {
+                cap *= 2;
+                OrderItem *nb = arena_alloc(l->a, cap*sizeof(OrderItem));
+                memcpy(nb, ws->order_by, ws->norder*sizeof(OrderItem));
+                ws->order_by = nb;
+            }
+            OrderItem *oi = &ws->order_by[ws->norder++];
+            memset(oi, 0, sizeof(*oi));
+            oi->expr = parse_expr(l, 0);
+            oi->nulls_last = true;
+            if (lex_peek_is(l, TK_DESC)) { lex_consume(l); oi->desc = true; }
+            else lex_eat(l, TK_ASC);
+        } while (lex_eat(l, TK_COMMA));
+    }
+
+    /* ROWS/RANGE [BETWEEN bound AND bound | bound] */
+    if (lex_peek_is(l, TK_ROWS) || lex_peek_is(l, TK_RANGE)) {
+        ws->has_frame = true;
+        ws->frame_type = lex_peek_is(l, TK_ROWS) ? WF_ROWS : WF_RANGE;
+        lex_consume(l);
+        if (lex_eat(l, TK_BETWEEN)) {
+            ws->frame_start = parse_frame_bound(l);
+            lex_eat(l, TK_AND);
+            ws->frame_end = parse_frame_bound(l);
+        } else {
+            ws->frame_start = parse_frame_bound(l);
+            ws->frame_end = (WinFrameBound){WBOUND_CURRENT_ROW, 0};
+        }
+    }
+
+    lex_eat(l, TK_RPAREN);
+    return ws;
+}
+
+/* ── Helper: deep scan for EXPR_WINDOW in expression tree ── */
+static bool has_window_expr(Expr *e) {
+    if (!e) return false;
+    if (e->type == EXPR_WINDOW) return true;
+    if (e->type == EXPR_ALIAS)  return has_window_expr(e->expr);
+    if (e->type == EXPR_BINOP)  return has_window_expr(e->left) || has_window_expr(e->right);
+    if (e->type == EXPR_UNOP)   return has_window_expr(e->left);
+    if (e->type == EXPR_FUNC) {
+        for (int i = 0; i < e->nargs; i++) if (has_window_expr(e->args[i])) return true;
+    }
+    return false;
+}
 
 /* ── Parser ── */
 static Expr *parse_primary(Lexer *l) {
@@ -305,6 +406,12 @@ static Expr *parse_primary(Lexer *l) {
                     e->args[e->nargs++]=star;
                 }
                 lex_eat(l, TK_RPAREN);
+                /* window function: func(...) OVER (...) */
+                if (lex_peek_is(l, TK_OVER)) {
+                    lex_consume(l);
+                    e->type = EXPR_WINDOW;
+                    e->win_spec = parse_window_spec(l);
+                }
                 return e;
             }
             /* table.col or col */
@@ -798,6 +905,18 @@ PlanNode *sql_plan(Arena *a, const Stmt *s) {
     {
         PlanNode *p=arena_calloc(a,sizeof(PlanNode));
         p->type=PLAN_PROJECT;p->exprs=sel->select_list;p->nexprs=sel->nselect;p->left=root;root=p;
+    }
+    {
+        bool has_win = false;
+        for (int i = 0; i < sel->nselect && !has_win; i++)
+            has_win = has_window_expr(sel->select_list[i]);
+        if (has_win) {
+            PlanNode *wn = arena_calloc(a, sizeof(PlanNode));
+            wn->type = PLAN_WINDOW;
+            wn->window_exprs = sel->select_list;
+            wn->nwindow_exprs = sel->nselect;
+            wn->left = root; root = wn;
+        }
     }
     if (sel->norder > 0) {
         PlanNode *srt=arena_calloc(a,sizeof(PlanNode));

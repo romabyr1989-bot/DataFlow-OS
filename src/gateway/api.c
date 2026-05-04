@@ -271,11 +271,13 @@ static bool vt_get(VTReg *vt, const char *name, RS **rs_out, Schema **sc_out) {
 }
 
 /* forward decls */
-static Val eval_val(Expr *e, JoinCtx *ctx, Arena *a);
-static RS *exec_stmt(Arena *a, const Stmt *s, VTReg *vt);
+static Val  eval_val(Expr *e, JoinCtx *ctx, Arena *a);
+static RS  *exec_stmt(Arena *a, const Stmt *s, VTReg *vt);
 static bool expr_has_agg(Expr *e);
+static bool expr_has_window(Expr *e);
 static Expr *find_first_agg(Expr *e);
 static bool expr_find_agg_args(Expr *e, const char *fn, Expr **call_args, int nargs);
+static void apply_windows(Arena *a, RS *rs, const SelectStmt *sel);
 
 /* ── GrpAcc forward declaration for thread-local group context ── */
 typedef struct GrpAcc_s {
@@ -292,6 +294,12 @@ static __thread GrpAcc           *tl_grp = NULL;
 static __thread const SelectStmt *tl_sel = NULL;
 /* Thread-local outer join context: for correlated subqueries */
 static __thread JoinCtx          *tl_outer_ctx = NULL;
+
+/* Thread-local window function pre-computed values (set during apply_windows re-eval) */
+typedef struct { Expr *win_expr; char **values; } WinValEntry;
+static __thread WinValEntry *tl_win_vals    = NULL;
+static __thread int          tl_nwin_vals   = 0;
+static __thread int          tl_win_cur_row = -1;
 
 /* ── Expression evaluator ── */
 
@@ -659,6 +667,20 @@ static Val eval_val(Expr *e, JoinCtx *ctx, Arena *a) {
         return rv;
     }
     case EXPR_LIST: return vnull(); /* lists not evaluated directly */
+    case EXPR_WINDOW:
+        /* placeholder: actual value injected by apply_windows re-evaluation pass */
+        if (tl_win_vals && tl_win_cur_row >= 0) {
+            for (int _i = 0; _i < tl_nwin_vals; _i++) {
+                if (tl_win_vals[_i].win_expr == e) {
+                    const char *_v = tl_win_vals[_i].values[tl_win_cur_row];
+                    if (!_v) return vnull();
+                    Val _rv = vstr_s(_v);
+                    double _n; if (pnum(_v, &_n)) { _rv.is_num=true; _rv.num=_n; }
+                    return _rv;
+                }
+            }
+        }
+        return vnull();
     case EXPR_UNOP: {
         if (e->op == OP_IS_NULL) {
             Val inner = eval_val(e->left, ctx, a);
@@ -784,9 +806,10 @@ static Val eval_val(Expr *e, JoinCtx *ctx, Arena *a) {
 /* ── Column name inference ── */
 static const char *expr_name(Expr *e, int pos, Arena *a) {
     if (!e) return arena_sprintf(a,"col%d",pos+1);
-    if (e->type == EXPR_ALIAS) return e->alias;
-    if (e->type == EXPR_COL)   return e->name;
-    if (e->type == EXPR_FUNC)  return e->func_name;
+    if (e->type == EXPR_ALIAS)   return e->alias;
+    if (e->type == EXPR_COL)     return e->name;
+    if (e->type == EXPR_FUNC)    return e->func_name;
+    if (e->type == EXPR_WINDOW)  return e->func_name ? e->func_name : arena_sprintf(a,"col%d",pos+1);
     if (e->type == EXPR_STAR)  return "*";
     if (e->type == EXPR_LITERAL_INT)   return arena_sprintf(a,"%lld",(long long)e->ival);
     if (e->type == EXPR_LITERAL_FLOAT) return arena_sprintf(a,"%.10g",e->fval);
@@ -1327,6 +1350,330 @@ static void build_star_col_names(Arena *a, const SelectStmt *sel, TblData *table
     (void)sel;
 }
 
+/* ── Window function support ── */
+
+static bool expr_has_window(Expr *e) {
+    if (!e) return false;
+    if (e->type == EXPR_WINDOW) return true;
+    if (e->type == EXPR_ALIAS)  return expr_has_window(e->expr);
+    if (e->type == EXPR_BINOP)  return expr_has_window(e->left) || expr_has_window(e->right);
+    if (e->type == EXPR_UNOP)   return expr_has_window(e->left);
+    if (e->type == EXPR_FUNC) {
+        for (int i = 0; i < e->nargs; i++) if (expr_has_window(e->args[i])) return true;
+    }
+    if (e->type == EXPR_CASE) {
+        if (expr_has_window(e->case_op)) return true;
+        for (int i = 0; i < e->nwhens; i++)
+            if (expr_has_window(e->whens[i]) || expr_has_window(e->thens[i])) return true;
+        return expr_has_window(e->else_expr);
+    }
+    return false;
+}
+
+/* Collect all unique EXPR_WINDOW nodes from expression tree into out[]. */
+static int collect_win_exprs(Expr *e, Expr **out, int cap, int n) {
+    if (!e || n >= cap) return n;
+    if (e->type == EXPR_WINDOW) {
+        for (int i = 0; i < n; i++) if (out[i] == e) return n;
+        out[n++] = e; return n;
+    }
+    if (e->type == EXPR_ALIAS)  return collect_win_exprs(e->expr, out, cap, n);
+    if (e->type == EXPR_BINOP) { n = collect_win_exprs(e->left,out,cap,n); return collect_win_exprs(e->right,out,cap,n); }
+    if (e->type == EXPR_UNOP)   return collect_win_exprs(e->left, out, cap, n);
+    if (e->type == EXPR_FUNC) {
+        for (int i = 0; i < e->nargs; i++) n = collect_win_exprs(e->args[i], out, cap, n);
+    }
+    if (e->type == EXPR_CASE) {
+        n = collect_win_exprs(e->case_op, out, cap, n);
+        for (int i = 0; i < e->nwhens; i++) {
+            n = collect_win_exprs(e->whens[i], out, cap, n);
+            n = collect_win_exprs(e->thens[i], out, cap, n);
+        }
+        n = collect_win_exprs(e->else_expr, out, cap, n);
+    }
+    return n;
+}
+
+/* Resolve frame start index (0-based position within sorted partition). */
+static int win_frame_start(WindowSpec *ws, int pi, int plen) {
+    (void)plen;
+    switch (ws->frame_start.kind) {
+    case WBOUND_UNBOUNDED_PREC: return 0;
+    case WBOUND_N_PREC: { int v = pi - (int)ws->frame_start.n; return v < 0 ? 0 : v; }
+    case WBOUND_N_FOLL: { int v = pi + (int)ws->frame_start.n; return v >= plen ? plen : v; }
+    default:            return pi; /* CURRENT_ROW */
+    }
+}
+
+/* Resolve frame end index. */
+static int win_frame_end(WindowSpec *ws, int pi, int plen) {
+    switch (ws->frame_end.kind) {
+    case WBOUND_UNBOUNDED_FOLL: return plen - 1;
+    case WBOUND_N_FOLL: { int v = pi + (int)ws->frame_end.n; return v >= plen ? plen-1 : v; }
+    case WBOUND_N_PREC: { int v = pi - (int)ws->frame_end.n; return v < 0 ? 0 : v; }
+    case WBOUND_UNBOUNDED_PREC: return 0;
+    default:            return pi; /* CURRENT_ROW */
+    }
+}
+
+/* Compare two rows by their per-key order-key arrays. Returns <0 / 0 / >0. */
+static int win_ord_cmp(char **ak, char **bk, OrderItem *order_by, int norder) {
+    for (int k = 0; k < norder; k++) {
+        double na, nb;
+        int c;
+        if (pnum(ak[k], &na) && pnum(bk[k], &nb)) c = (na<nb)?-1:(na>nb?1:0);
+        else c = strcmp(ak[k], bk[k]);
+        if (order_by[k].desc) c = -c;
+        if (c != 0) return c;
+    }
+    return 0;
+}
+
+/*
+ * apply_windows — post-processing step that computes all window function values
+ * for every row in rs, then re-evaluates expressions containing EXPR_WINDOW nodes
+ * so that combined expressions like "revenue - LAG(...)" work correctly.
+ */
+static void apply_windows(Arena *a, RS *rs, const SelectStmt *sel) {
+    if (rs->nrows == 0) return;
+
+    /* Collect all unique EXPR_WINDOW nodes across the select list */
+#define MAX_WIN_EXPRS 32
+    Expr *win_exprs[MAX_WIN_EXPRS];
+    int nwin = 0;
+    for (int si = 0; si < sel->nselect; si++)
+        nwin = collect_win_exprs(sel->select_list[si], win_exprs, MAX_WIN_EXPRS, nwin);
+    if (nwin == 0) return;
+
+    /* Build output schema: maps col_names → cells positions */
+    Schema *out_sc = arena_calloc(a, sizeof(Schema));
+    out_sc->ncols = rs->ncols;
+    out_sc->cols  = arena_alloc(a, (size_t)rs->ncols * sizeof(ColDef));
+    for (int i = 0; i < rs->ncols; i++) {
+        out_sc->cols[i].name = rs->col_names[i];
+        out_sc->cols[i].type = COL_TEXT;
+    }
+
+    /* Allocate per-window, per-row value storage */
+    WinValEntry *wve = arena_alloc(a, (size_t)nwin * sizeof(WinValEntry));
+    for (int wi = 0; wi < nwin; wi++) {
+        wve[wi].win_expr = win_exprs[wi];
+        wve[wi].values   = arena_alloc(a, (size_t)rs->nrows * sizeof(char*));
+        for (int r = 0; r < rs->nrows; r++) wve[wi].values[r] = "";
+    }
+
+    /* Compute window function values for each EXPR_WINDOW node */
+    for (int wi = 0; wi < nwin; wi++) {
+        Expr      *e  = win_exprs[wi];
+        WindowSpec *ws = e->win_spec;
+        const char *fn = e->func_name ? e->func_name : "";
+
+        /* Compute partition key string and per-order-key strings for every row */
+        char  **part_keys    = arena_alloc(a, (size_t)rs->nrows * sizeof(char*));
+        char ***row_ord_keys = NULL;
+        if (ws->norder > 0)
+            row_ord_keys = arena_alloc(a, (size_t)rs->nrows * sizeof(char**));
+
+        for (int r = 0; r < rs->nrows; r++) {
+            JoinCtx ctx = {0};
+            ctx.n = 1; ctx.schemas[0] = out_sc;
+            ctx.rows[0] = rs->rows[r].cells;
+            ctx.tnames[0] = ""; ctx.aliases[0] = "";
+
+            char kbuf[4096]; kbuf[0] = '\0';
+            for (int k = 0; k < ws->npartition; k++) {
+                Val v = eval_val(ws->partition_by[k], &ctx, a);
+                if (k) strncat(kbuf, "\x01", sizeof(kbuf)-strlen(kbuf)-1);
+                strncat(kbuf, val_str(v, a), sizeof(kbuf)-strlen(kbuf)-1);
+            }
+            part_keys[r] = arena_strdup(a, kbuf);
+
+            if (ws->norder > 0) {
+                row_ord_keys[r] = arena_alloc(a, (size_t)ws->norder * sizeof(char*));
+                for (int k = 0; k < ws->norder; k++) {
+                    Val v = eval_val(ws->order_by[k].expr, &ctx, a);
+                    row_ord_keys[r][k] = arena_strdup(a, val_str(v, a));
+                }
+            }
+        }
+
+        /* Sort row indices by (partition_key, order_keys) — stable insertion sort */
+        int *idx = arena_alloc(a, (size_t)rs->nrows * sizeof(int));
+        for (int r = 0; r < rs->nrows; r++) idx[r] = r;
+        for (int i = 1; i < rs->nrows; i++) {
+            int ki = idx[i], j = i - 1;
+            while (j >= 0) {
+                int ai = idx[j];
+                int c = strcmp(part_keys[ai], part_keys[ki]);
+                if (c == 0 && ws->norder > 0)
+                    c = win_ord_cmp(row_ord_keys[ai], row_ord_keys[ki], ws->order_by, ws->norder);
+                if (c <= 0) break;
+                idx[j+1] = idx[j]; j--;
+            }
+            idx[j+1] = ki;
+        }
+
+        /* Walk partitions and compute window values per function type */
+        const char *prev_part = NULL;
+        int part_start = 0;
+
+        for (int i = 0; i <= rs->nrows; i++) {
+            bool ep = (i == rs->nrows) || (!prev_part) ||
+                      (strcmp(part_keys[idx[i]], prev_part) != 0);
+
+            if (i > 0 && ep) {
+                int plen = i - part_start;
+
+                if (!strcasecmp(fn, "row_number")) {
+                    for (int pi = 0; pi < plen; pi++)
+                        wve[wi].values[idx[part_start+pi]] = arena_sprintf(a, "%d", pi+1);
+
+                } else if (!strcasecmp(fn, "rank")) {
+                    char **prev_ord = NULL;
+                    int rank = 1;
+                    for (int pi = 0; pi < plen; pi++) {
+                        int ri = idx[part_start+pi];
+                        if (pi == 0) {
+                            prev_ord = ws->norder > 0 ? row_ord_keys[ri] : NULL;
+                        } else {
+                            bool same = true;
+                            if (ws->norder > 0 && prev_ord)
+                                for (int k=0; k<ws->norder && same; k++)
+                                    if (strcmp(prev_ord[k], row_ord_keys[ri][k])) same=false;
+                            if (!same) { rank = pi+1; prev_ord = ws->norder > 0 ? row_ord_keys[ri] : NULL; }
+                        }
+                        wve[wi].values[ri] = arena_sprintf(a, "%d", rank);
+                    }
+
+                } else if (!strcasecmp(fn, "dense_rank")) {
+                    char **prev_ord = NULL;
+                    int dr = 1;
+                    for (int pi = 0; pi < plen; pi++) {
+                        int ri = idx[part_start+pi];
+                        if (pi == 0) {
+                            prev_ord = ws->norder > 0 ? row_ord_keys[ri] : NULL;
+                        } else {
+                            bool same = true;
+                            if (ws->norder > 0 && prev_ord)
+                                for (int k=0; k<ws->norder && same; k++)
+                                    if (strcmp(prev_ord[k], row_ord_keys[ri][k])) same=false;
+                            if (!same) { dr++; prev_ord = ws->norder > 0 ? row_ord_keys[ri] : NULL; }
+                        }
+                        wve[wi].values[ri] = arena_sprintf(a, "%d", dr);
+                    }
+
+                } else if (!strcasecmp(fn, "lag") || !strcasecmp(fn, "lead")) {
+                    int offset = 1;
+                    const char *def_val = "0";
+                    if (e->nargs >= 2) {
+                        JoinCtx c0 = {0}; Val ov = eval_val(e->args[1], &c0, a);
+                        if (ov.is_num) offset = (int)ov.num;
+                    }
+                    if (e->nargs >= 3) {
+                        JoinCtx c0 = {0}; Val dv = eval_val(e->args[2], &c0, a);
+                        def_val = arena_strdup(a, val_str(dv, a));
+                    }
+                    bool is_lead = !strcasecmp(fn, "lead");
+                    for (int pi = 0; pi < plen; pi++) {
+                        int ri  = idx[part_start+pi];
+                        int spi = is_lead ? (pi + offset) : (pi - offset);
+                        if (spi < 0 || spi >= plen) {
+                            wve[wi].values[ri] = arena_strdup(a, def_val);
+                        } else {
+                            int sri = idx[part_start+spi];
+                            JoinCtx ctx = {0}; ctx.n=1; ctx.schemas[0]=out_sc;
+                            ctx.rows[0]=rs->rows[sri].cells; ctx.tnames[0]=""; ctx.aliases[0]="";
+                            Val v = e->nargs > 0 ? eval_val(e->args[0], &ctx, a) : vnull();
+                            wve[wi].values[ri] = arena_strdup(a, val_str(v, a));
+                        }
+                    }
+
+                } else if (!strcasecmp(fn, "first_value") || !strcasecmp(fn, "last_value")) {
+                    bool is_last = !strcasecmp(fn, "last_value");
+                    for (int pi = 0; pi < plen; pi++) {
+                        int ri  = idx[part_start+pi];
+                        int f_s = ws->has_frame ? win_frame_start(ws,pi,plen) : 0;
+                        int f_e = ws->has_frame ? win_frame_end(ws,pi,plen)   : plen-1;
+                        int spi = is_last ? f_e : f_s;
+                        int sri = idx[part_start+spi];
+                        JoinCtx ctx = {0}; ctx.n=1; ctx.schemas[0]=out_sc;
+                        ctx.rows[0]=rs->rows[sri].cells; ctx.tnames[0]=""; ctx.aliases[0]="";
+                        Val v = e->nargs > 0 ? eval_val(e->args[0], &ctx, a) : vnull();
+                        wve[wi].values[ri] = arena_strdup(a, val_str(v, a));
+                    }
+
+                } else {
+                    /* Aggregate window: AVG / SUM / MIN / MAX / COUNT with frame */
+                    for (int pi = 0; pi < plen; pi++) {
+                        int ri  = idx[part_start+pi];
+                        int f_s, f_e;
+                        if (ws->has_frame) {
+                            f_s = win_frame_start(ws, pi, plen);
+                            f_e = win_frame_end(ws, pi, plen);
+                        } else if (ws->norder > 0) {
+                            f_s = 0; f_e = pi; /* default: UNBOUNDED PRECEDING to CURRENT ROW */
+                        } else {
+                            f_s = 0; f_e = plen - 1; /* no ORDER: entire partition */
+                        }
+                        double sum=0, cnt=0, minv=0, maxv=0;
+                        bool min_set=false, max_set=false;
+                        for (int fi = f_s; fi <= f_e; fi++) {
+                            int fri = idx[part_start+fi];
+                            JoinCtx ctx = {0}; ctx.n=1; ctx.schemas[0]=out_sc;
+                            ctx.rows[0]=rs->rows[fri].cells; ctx.tnames[0]=""; ctx.aliases[0]="";
+                            Val v = e->nargs > 0 ? eval_val(e->args[0], &ctx, a) : vnull();
+                            if (!v.is_null) {
+                                double nv = v.is_num ? v.num : 0;
+                                if (!v.is_num) pnum(val_str(v, a), &nv);
+                                sum += nv; cnt++;
+                                if (!min_set || nv < minv) { minv=nv; min_set=true; }
+                                if (!max_set || nv > maxv) { maxv=nv; max_set=true; }
+                            }
+                        }
+                        const char *res;
+                        if      (!strcasecmp(fn,"count")) res = arena_sprintf(a,"%.0f",cnt);
+                        else if (!strcasecmp(fn,"sum"))   res = arena_sprintf(a,"%.10g",sum);
+                        else if (!strcasecmp(fn,"avg"))   res = cnt>0 ? arena_sprintf(a,"%.10g",sum/cnt) : "";
+                        else if (!strcasecmp(fn,"min"))   res = min_set ? arena_sprintf(a,"%.10g",minv) : "";
+                        else if (!strcasecmp(fn,"max"))   res = max_set ? arena_sprintf(a,"%.10g",maxv) : "";
+                        else res = "";
+                        wve[wi].values[ri] = arena_strdup(a, res);
+                    }
+                }
+            }
+
+            if (i < rs->nrows) {
+                if (!prev_part || strcmp(part_keys[idx[i]], prev_part) != 0) {
+                    prev_part = part_keys[idx[i]];
+                    part_start = i;
+                }
+            }
+        }
+    }
+
+    /* Re-evaluate all select expressions that contain a window node,
+       with tl_win_cur_row set so EXPR_WINDOW returns the pre-computed value. */
+    tl_win_vals    = wve;
+    tl_nwin_vals   = nwin;
+
+    for (int si = 0; si < sel->nselect; si++) {
+        if (!expr_has_window(sel->select_list[si])) continue;
+        Expr *se   = sel->select_list[si];
+        Expr *base = (se->type == EXPR_ALIAS) ? se->expr : se;
+        for (int r = 0; r < rs->nrows; r++) {
+            tl_win_cur_row = r;
+            JoinCtx ctx = {0}; ctx.n=1; ctx.schemas[0]=out_sc;
+            ctx.rows[0]=rs->rows[r].cells; ctx.tnames[0]=""; ctx.aliases[0]="";
+            Val v = eval_val(base, &ctx, a);
+            rs->rows[r].cells[si] = arena_strdup(a, val_str(v, a));
+        }
+    }
+
+    tl_win_vals    = NULL;
+    tl_nwin_vals   = 0;
+    tl_win_cur_row = -1;
+}
+
 /* ── Execute a SELECT statement ── */
 static RS *exec_select(Arena *a, const SelectStmt *sel, VTReg *parent_vt) {
     /* Setup VT registry — inherit parent + add CTEs */
@@ -1449,6 +1796,14 @@ static RS *exec_select(Arena *a, const SelectStmt *sel, VTReg *parent_vt) {
         int new_n=0;
         for(int i=0;i<rs->nrows;i++) if(keep[i]) rs->rows[new_n++]=rs->rows[i];
         rs->nrows=new_n;
+    }
+
+    /* ── Window functions ── */
+    {
+        bool has_win = false;
+        for (int i = 0; i < sel->nselect && !has_win; i++)
+            has_win = expr_has_window(sel->select_list[i]);
+        if (has_win) apply_windows(a, rs, sel);
     }
 
     /* ── ORDER BY ── */
