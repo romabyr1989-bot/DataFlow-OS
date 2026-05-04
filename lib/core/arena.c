@@ -1,11 +1,17 @@
+/* Арена-аллокатор: выделяет память из непрерывных блоков, освобождение — только всей арены целиком.
+ * Это даёт O(1) аллокацию без фрагментации, идеально для данных с одинаковым временем жизни
+ * (один HTTP-запрос, один батч, одна операция). */
 #include "arena.h"
 #include <stdlib.h>
 #include <string.h>
 #include <stdarg.h>
 #include <stdio.h>
 
+/* Выравнивание по границе ARENA_ALIGN байт: гарантирует корректный доступ к int64/double. */
 static inline size_t align_up(size_t n, size_t a) { return (n + a - 1) & ~(a - 1); }
 
+/* Блок хранится как: [ArenaBlock header][data байты].
+ * malloc одним куском — один вызов, меньше накладных расходов. */
 static ArenaBlock *block_new(size_t cap, ArenaBlock *prev) {
     ArenaBlock *b = malloc(sizeof(ArenaBlock) + cap);
     if (!b) return NULL;
@@ -23,6 +29,7 @@ Arena *arena_create(size_t sz) {
     return a;
 }
 
+/* Освобождаем цепочку блоков от вершины к основанию — порядок важен, т.к. блоки связаны односторонне. */
 void arena_destroy(Arena *a) {
     for (ArenaBlock *b = a->top; b; ) { ArenaBlock *p = b->prev; free(b); b = p; }
     free(a);
@@ -33,9 +40,14 @@ void *arena_alloc(Arena *a, size_t sz) {
     sz = align_up(sz, ARENA_ALIGN);
     ArenaBlock *b = a->top;
     if (b && b->used + sz <= b->cap) {
+        /* Быстрый путь: просто сдвигаем указатель внутри текущего блока. */
         void *p = b->data + b->used; b->used += sz; a->total_allocated += sz; return p;
     }
+    /* Текущий блок переполнен — фиксируем потери и выделяем новый.
+     * total_wasted помогает диагностировать слишком маленький начальный размер. */
     if (b) a->total_wasted += (b->cap - b->used);
+    /* Если запрос больше стандартного блока — выделяем блок с удвоенным запасом,
+     * чтобы следующее выделение тоже поместилось без нового malloc. */
     size_t cap = sz > ARENA_DEFAULT_BLOCK ? sz * 2 : ARENA_DEFAULT_BLOCK;
     ArenaBlock *nb = block_new(cap, b);
     if (!nb) return NULL;
@@ -60,6 +72,8 @@ char *arena_strndup(Arena *a, const char *s, size_t n) {
     memcpy(p, s, len); p[len] = '\0'; return p;
 }
 
+/* Двухпроходный vsnprintf: первый проход — узнаём точную длину без записи,
+ * второй — пишем в заранее выделенный буфер арены. */
 char *arena_sprintf(Arena *a, const char *fmt, ...) {
     va_list ap; va_start(ap, fmt);
     int n = vsnprintf(NULL, 0, fmt, ap); va_end(ap);
@@ -69,6 +83,8 @@ char *arena_sprintf(Arena *a, const char *fmt, ...) {
     return buf;
 }
 
+/* Сброс арены без освобождения памяти: оставляем только первый блок, сбрасываем счётчик.
+ * Позволяет переиспользовать арену (например, при переиспользовании соединения). */
 void arena_reset(Arena *a) {
     ArenaBlock *b = a->top;
     while (b && b->prev) { ArenaBlock *p = b->prev; free(b); b = p; }
@@ -76,8 +92,12 @@ void arena_reset(Arena *a) {
     a->total_allocated = a->total_wasted = 0;
 }
 
+/* Метка фиксирует состояние арены (текущий блок + позицию в нём).
+ * Нужна для временных аллокаций: выделили, использовали, откатились. */
 ArenaMark arena_mark(Arena *a) { return (ArenaMark){a->top, a->top ? a->top->used : 0}; }
 
+/* Откат к метке: освобождаем все блоки, выделенные после метки,
+ * и восстанавливаем позицию записи в блоке-метке. */
 void arena_restore(Arena *a, ArenaMark m) {
     while (a->top && a->top != m.block) { ArenaBlock *p = a->top->prev; free(a->top); a->top = p; }
     if (a->top) a->top->used = m.used;

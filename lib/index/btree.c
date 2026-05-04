@@ -1,3 +1,6 @@
+/* B+ дерево на страницах по 4 КБ: int64 ключи, int64 смещения в WAL-файле.
+ * Листья связаны в цепочку для диапазонных сканирований без возврата к корню.
+ * Страница 0 — заголовок файла, страница 1 — начальный корневой лист. */
 #include "btree.h"
 #include "../core/log.h"
 #include <stdlib.h>
@@ -7,18 +10,17 @@
 #include <sys/stat.h>
 #include <errno.h>
 
-/* ── Constants ── */
+/* ── Константы ── */
 #define MAGIC    UINT64_C(0x44464F42545245FF)
 #define VERSION  1
 
 #define PT_LEAF  1
 #define PT_INT   2
 
-/* Capacities:
- *   Leaf  page payload = 4096 - 8 = 4088 bytes → 4088/16 = 255 entries
- *   Internal page payload = 4096 - 8 = 4088 bytes
- *     Layout: child0(4) + N*(key(8)+child(4)) → 4 + N*12 ≤ 4088
- *             N ≤ (4088-4)/12 = 340 */
+/* Ёмкости страниц:
+ *   Лист: (4096 - 8 байт заголовка) / 16 байт на запись = 255 записей
+ *   Внутренняя: 4 байта child[0] + N*(8 байт ключа + 4 байта child) ≤ 4088
+ *               N ≤ (4088-4)/12 = 340 ключей */
 #define LEAF_MAX  255
 #define INT_MAX   340
 
@@ -26,12 +28,12 @@ typedef uint8_t Page[BT_PAGE_SIZE];
 
 struct BTree {
     int     fd;
-    int32_t root;    /* page index of current root */
-    int32_t npages;  /* total allocated pages      */
-    int64_t nkeys;   /* total inserted key count   */
+    int32_t root;    /* номер страницы текущего корня */
+    int32_t npages;  /* общее количество выделенных страниц */
+    int64_t nkeys;   /* количество вставленных ключей */
 };
 
-/* ── File header — stored verbatim in page 0 ── */
+/* Заголовок файла — хранится в странице 0. Packed: нет паддинга между полями. */
 typedef struct __attribute__((packed)) {
     uint64_t magic;
     uint32_t version;
@@ -40,31 +42,28 @@ typedef struct __attribute__((packed)) {
     int32_t  npages;
 } FHdr;
 
-/* ── Page header — first 8 bytes of every B-tree page ── */
+/* Заголовок каждой B-tree страницы — первые 8 байт. */
 typedef struct __attribute__((packed)) {
-    uint8_t  type;   /* PT_LEAF or PT_INT                        */
+    uint8_t  type;   /* PT_LEAF или PT_INT */
     uint8_t  _pad;
-    uint16_t n;      /* number of keys stored                    */
-    int32_t  next;   /* leaf: next sibling page; internal: -1   */
+    uint16_t n;      /* количество ключей на странице */
+    int32_t  next;   /* лист: следующий сосед; внутренняя: -1 */
 } PHdr;
 
-/* ── Leaf entry ── 16 bytes ── */
+/* Запись листа: 16 байт = 8 (ключ) + 8 (WAL-смещение). */
 typedef struct __attribute__((packed)) { int64_t key; int64_t off; } LE;
 
-/* ─────────────────────────────────────────────────────────────
-   Internal page data layout (after 8-byte PHdr):
-     [int32_t child[0]]
-     [int64_t key[0]]  [int32_t child[1]]
-     [int64_t key[1]]  [int32_t child[2]]
-     ...
-     [int64_t key[n-1]] [int32_t child[n]]
-   Offsets from data start (p+8):
-     child[0]   → byte 0
-     key[i]     → byte 4 + i*12
-     child[i+1] → byte 4 + i*12 + 8
-   ───────────────────────────────────────────────────────────── */
+/* Схема данных внутренней страницы (после 8-байтного PHdr):
+ *   [child[0], 4 байта]
+ *   [key[0], 8 байт][child[1], 4 байта]
+ *   [key[1], 8 байт][child[2], 4 байта]
+ *   ...
+ * Смещения от начала данных (p+8):
+ *   child[0]   → байт 0
+ *   key[i]     → байт 4 + i*12
+ *   child[i+1] → байт 4 + i*12 + 8 */
 
-/* ── Raw page I/O ── */
+/* ── Низкоуровневый ввод-вывод страниц ── */
 static int rd(int fd, int32_t pg, Page p) {
     ssize_t r = pread(fd, p, BT_PAGE_SIZE, (off_t)pg * BT_PAGE_SIZE);
     return r == BT_PAGE_SIZE ? 0 : -1;
@@ -73,12 +72,16 @@ static int wr(int fd, int32_t pg, const Page p) {
     ssize_t w = pwrite(fd, p, BT_PAGE_SIZE, (off_t)pg * BT_PAGE_SIZE);
     return w == BT_PAGE_SIZE ? 0 : -1;
 }
+
+/* Выделяем новую страницу: просто увеличиваем счётчик и записываем нули. */
 static int32_t alloc_pg(BTree *t) {
     int32_t no = t->npages++;
     Page blank; memset(blank, 0, BT_PAGE_SIZE);
     wr(t->fd, no, blank);
     return no;
 }
+
+/* Сброс заголовка файла на диск — вызывается после каждой вставки. */
 static void flush_hdr(BTree *t) {
     Page p; memset(p, 0, BT_PAGE_SIZE);
     FHdr *h = (FHdr *)p;
@@ -87,12 +90,12 @@ static void flush_hdr(BTree *t) {
     wr(t->fd, 0, p);
 }
 
-/* ── Leaf accessors ── */
+/* ── Акцессоры листовой страницы ── */
 static PHdr *L_hdr(Page p)       { return (PHdr *)p; }
 static LE   *L_ent(Page p, int i){ return (LE *)(p + 8) + i; }
 static void  L_init(Page p)      { memset(p, 0, BT_PAGE_SIZE); L_hdr(p)->type=PT_LEAF; L_hdr(p)->next=-1; }
 
-/* ── Internal accessors ── */
+/* ── Акцессоры внутренней страницы ── */
 static PHdr*   I_hdr(Page p)          { return (PHdr *)p; }
 static int32_t I_ch (Page p, int i)   {
     const uint8_t *d = p + 8;
@@ -108,15 +111,16 @@ static void I_set_ch(Page p, int i, int32_t c) {
 static void I_set_key(Page p, int i, int64_t k) { *(int64_t *)(p + 8 + 4 + (size_t)i*12) = k; }
 static void I_init(Page p) { memset(p, 0, BT_PAGE_SIZE); I_hdr(p)->type=PT_INT; I_hdr(p)->next=-1; }
 
-/* ── Leaf insert ──
- * Returns 0  = inserted, no split.
- * Returns 1  = split; left half stays at pgno, new right page at *rnew,
- *              first key of right half is *mk (push up to parent). */
+/* ── Вставка в лист ──
+ * Возвращает 0 = вставлено без разбиения.
+ * Возвращает 1 = разбиение: левая половина остаётся в pgno, правая — в *rnew,
+ *                первый ключ правой половины передаётся вверх через *mk. */
 static int leaf_ins(BTree *t, int32_t pgno, int64_t key, int64_t off,
                     int64_t *mk, int32_t *rnew) {
     Page p; rd(t->fd, pgno, p);
     PHdr *h = L_hdr(p);
     int n = h->n;
+    /* Двоичный поиск позиции вставки (здесь — линейный для простоты). */
     int pos = 0;
     while (pos < n && L_ent(p, pos)->key <= key) pos++;
 
@@ -128,7 +132,7 @@ static int leaf_ins(BTree *t, int32_t pgno, int64_t key, int64_t off,
         return 0;
     }
 
-    /* gather all LEAF_MAX+1 entries into tmp */
+    /* Страница полна: собираем LEAF_MAX+1 записей во временный массив и делим пополам. */
     LE tmp[LEAF_MAX + 1];
     memcpy(tmp, L_ent(p, 0), (size_t)pos * sizeof(LE));
     tmp[pos].key = key; tmp[pos].off = off;
@@ -136,11 +140,11 @@ static int leaf_ins(BTree *t, int32_t pgno, int64_t key, int64_t off,
 
     int mid = (LEAF_MAX + 1) / 2;   /* = 128 */
 
-    /* left stays in pgno */
+    /* Левая половина остаётся на месте. */
     memcpy(L_ent(p, 0), tmp, (size_t)mid * sizeof(LE));
     h->n = mid;
 
-    /* right goes to new page */
+    /* Правая половина — в новую страницу; вставляем её в цепочку листьев. */
     int32_t rno = alloc_pg(t);
     Page rp; L_init(rp);
     int rn = LEAF_MAX + 1 - mid;
@@ -155,11 +159,9 @@ static int leaf_ins(BTree *t, int32_t pgno, int64_t key, int64_t off,
     return 1;
 }
 
-/* ── Internal insert ──
- * Inserts (key, right_child) into the in-memory page p.
- * Returns 0  = inserted (p updated in-place).
- * Returns 1  = split; left stays in p, right content in rp_out,
- *              pushed-up key is *mk. */
+/* ── Вставка в внутреннюю страницу ──
+ * Работает с in-memory буфером страницы (p уже прочитан вызывающим).
+ * Возвращает 0 = вставлено. Возвращает 1 = разбиение: левая в p, правая в rp_out, *mk вверх. */
 static int int_ins(Page p, int64_t key, int32_t rc, int64_t *mk, Page rp_out) {
     PHdr *h = I_hdr(p);
     int n = h->n;
@@ -177,7 +179,8 @@ static int int_ins(Page p, int64_t key, int32_t rc, int64_t *mk, Page rp_out) {
         return 0;
     }
 
-    /* build tmp arrays and insert */
+    /* Разбиение: средний ключ поднимается вверх, не сохраняется ни в одной из половин.
+     * Это отличает B+ дерево от B-дерева в обработке внутренних узлов. */
     int64_t tkeys[INT_MAX + 1];
     int32_t tchs [INT_MAX + 2];
     for (int i = 0; i <= n; i++) tchs[i]  = I_ch(p, i);
@@ -186,16 +189,13 @@ static int int_ins(Page p, int64_t key, int32_t rc, int64_t *mk, Page rp_out) {
     memmove(&tkeys[pos+1], &tkeys[pos], (size_t)(n-pos) * sizeof(int64_t));
     memmove(&tchs[pos+2],  &tchs[pos+1], (size_t)(n-pos) * sizeof(int32_t));
     tkeys[pos] = key; tchs[pos+1] = rc;
-    /* now n+1 keys, n+2 children */
 
-    int mid = (n + 1) / 2;  /* key at mid is pushed up, not stored */
+    int mid = (n + 1) / 2;  /* ключ в позиции mid выталкивается вверх */
 
-    /* rebuild left half */
     I_init(p); h = I_hdr(p); h->n = mid;
     I_set_ch(p, 0, tchs[0]);
     for (int i = 0; i < mid; i++) { I_set_key(p, i, tkeys[i]); I_set_ch(p, i+1, tchs[i+1]); }
 
-    /* build right half */
     I_init(rp_out);
     PHdr *rh = I_hdr(rp_out);
     int rn = n - mid;
@@ -209,7 +209,7 @@ static int int_ins(Page p, int64_t key, int32_t rc, int64_t *mk, Page rp_out) {
     return 1;
 }
 
-/* ── Recursive descent insert ── */
+/* ── Рекурсивный спуск для вставки ── */
 static int do_insert(BTree *t, int32_t pgno, int64_t key, int64_t off,
                      int64_t *mk, int32_t *rnew) {
     Page p; rd(t->fd, pgno, p);
@@ -218,7 +218,7 @@ static int do_insert(BTree *t, int32_t pgno, int64_t key, int64_t off,
     if (h->type == PT_LEAF)
         return leaf_ins(t, pgno, key, off, mk, rnew);
 
-    /* internal: pick child */
+    /* Внутренний узел: выбираем нужного ребёнка и рекурсируем. */
     int n = h->n, ci = 0;
     while (ci < n && key >= I_key(p, ci)) ci++;
     int32_t child = I_ch(p, ci);
@@ -227,8 +227,9 @@ static int do_insert(BTree *t, int32_t pgno, int64_t key, int64_t off,
     int split = do_insert(t, child, key, off, &cmk, &crnew);
     if (!split) return 0;
 
-    /* child split — insert (cmk, crnew) into this node */
-    rd(t->fd, pgno, p);          /* re-read (safe: child writes don't touch us) */
+    /* Ребёнок разбился — вставляем разделитель в текущий узел.
+     * Перечитываем страницу: дочерняя запись не затронула нас, но это защита от кэша. */
+    rd(t->fd, pgno, p);
     Page rp;
     int me_split = int_ins(p, cmk, crnew, mk, rp);
     wr(t->fd, pgno, p);
@@ -239,14 +240,14 @@ static int do_insert(BTree *t, int32_t pgno, int64_t key, int64_t off,
     return 1;
 }
 
-/* ── Public: insert ── */
+/* ── Публичный интерфейс: вставка ── */
 int btree_insert(BTree *t, int64_t key, int64_t off) {
     if (!t) return -1;
     int64_t mk; int32_t rnew;
     int split = do_insert(t, t->root, key, off, &mk, &rnew);
 
     if (split) {
-        /* grow a new root */
+        /* Корень разбился — создаём новый корень на уровень выше. */
         int32_t new_root = alloc_pg(t);
         Page p; I_init(p);
         PHdr *h = I_hdr(p); h->n = 1;
@@ -261,7 +262,7 @@ int btree_insert(BTree *t, int64_t key, int64_t off) {
     return 0;
 }
 
-/* ── Find leftmost leaf where max_key >= target ── */
+/* ── Поиск крайнего левого листа, содержащего ключ >= target ── */
 static int32_t find_leaf_ge(BTree *t, int64_t target) {
     int32_t cur = t->root;
     Page p;
@@ -269,13 +270,15 @@ static int32_t find_leaf_ge(BTree *t, int64_t target) {
         rd(t->fd, cur, p);
         PHdr *h = (PHdr *)p;
         if (h->type == PT_LEAF) return cur;
+        /* В внутреннем узле идём в первый дочерний узел, ключ которого > target. */
         int n = h->n, ci = 0;
         while (ci < n && target > I_key(p, ci)) ci++;
         cur = I_ch(p, ci);
     }
 }
 
-/* ── Public: range scan [lo, hi] ── */
+/* ── Публичный интерфейс: диапазонный поиск [lo, hi] ──
+ * Находим левый лист и идём по цепочке, пока ключи ≤ hi или не заполнен буфер. */
 int btree_range(BTree *t, int64_t lo, int64_t hi,
                 int64_t *offs, int *n_out) {
     *n_out = 0;
@@ -293,18 +296,18 @@ int btree_range(BTree *t, int64_t lo, int64_t hi,
             if (e->key > hi) { lpg = -1; goto done; }
             if (e->key >= lo) offs[(*n_out)++] = e->off;
         }
-        lpg = h->next;
+        lpg = h->next;  /* переходим к следующему листу по связному списку */
     }
 done:
     return 0;
 }
 
-/* ── Public: point lookup ── */
+/* Точечный поиск — частный случай диапазона [key, key]. */
 int btree_lookup(BTree *t, int64_t key, int64_t *offs, int *n_out) {
     return btree_range(t, key, key, offs, n_out);
 }
 
-/* ── Public: create (new file) ── */
+/* ── Создание нового дерева (новый файл) ── */
 BTree *btree_create(const char *path) {
     int fd = open(path, O_RDWR|O_CREAT|O_TRUNC|O_CLOEXEC, 0644);
     if (fd < 0) { LOG_ERROR("btree_create %s: %s", path, strerror(errno)); return NULL; }
@@ -312,11 +315,11 @@ BTree *btree_create(const char *path) {
     BTree *t = calloc(1, sizeof(BTree));
     t->fd = fd; t->root = 1; t->npages = 1; t->nkeys = 0;
 
-    /* page 0 = header */
+    /* Страница 0 — заголовок (пока пустая, flush_hdr запишет). */
     Page blank; memset(blank, 0, BT_PAGE_SIZE);
     wr(fd, 0, blank);
 
-    /* page 1 = initial root leaf */
+    /* Страница 1 — начальный корневой лист. */
     Page root; L_init(root);
     wr(fd, 1, root);
     t->npages = 2;
@@ -325,7 +328,7 @@ BTree *btree_create(const char *path) {
     return t;
 }
 
-/* ── Public: open (existing file) ── */
+/* ── Открытие существующего дерева ── */
 BTree *btree_open(const char *path) {
     int fd = open(path, O_RDWR|O_CLOEXEC);
     if (fd < 0) return NULL;
@@ -333,6 +336,7 @@ BTree *btree_open(const char *path) {
     Page p;
     if (pread(fd, p, BT_PAGE_SIZE, 0) != BT_PAGE_SIZE) { close(fd); return NULL; }
     FHdr *h = (FHdr *)p;
+    /* Проверяем magic: защита от случайного открытия чужого файла. */
     if (h->magic != MAGIC) { close(fd); return NULL; }
 
     BTree *t = calloc(1, sizeof(BTree));
@@ -340,7 +344,6 @@ BTree *btree_open(const char *path) {
     return t;
 }
 
-/* ── Public: close ── */
 void btree_close(BTree *t) {
     if (!t) return;
     flush_hdr(t);

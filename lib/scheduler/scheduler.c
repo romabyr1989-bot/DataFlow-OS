@@ -1,3 +1,5 @@
+/* Планировщик пайплайнов: разбирает cron-выражения, хранит список пайплайнов
+ * и в фоновом потоке каждые 30 секунд проверяет, не пора ли запустить очередной. */
 #include "scheduler.h"
 #include "../core/log.h"
 #include <stdlib.h>
@@ -7,7 +9,8 @@
 #include <stdio.h>
 
 #ifdef __APPLE__
-/* timegm is not exposed under strict POSIX on macOS — provide it inline */
+/* timegm — POSIX-расширение, которого нет в macOS без _GNU_SOURCE.
+ * Реализуем сами через формулу пролептического григорианского календаря. */
 static time_t timegm(struct tm *tm) {
     int y = tm->tm_year + 1900, m = tm->tm_mon + 1;
     if (m <= 2) { m += 12; y--; }
@@ -16,14 +19,17 @@ static time_t timegm(struct tm *tm) {
 }
 #endif
 
-/* ── Cron parser ── */
+/* ── Парсер cron-выражений ── */
+
+/* CronField хранит развёрнутый список допустимых значений для одного поля (минуты, часы и т.д.).
+ * Это упрощает проверку «подходит ли текущий момент» до одного вызова field_has(). */
 typedef struct { int vals[60]; int n; bool star; } CronField;
 
 static void parse_field(const char *s, CronField *f, int lo, int hi) {
     f->n = 0;
     if (strcmp(s,"*")==0) { f->star=true; for(int i=lo;i<=hi;i++) f->vals[f->n++]=i; return; }
     f->star = false;
-    /* handle comma-separated list */
+    /* Разбираем запятые, диапазоны (a-b) и шаги (step-синтаксис start/n). */
     char buf[64]; strncpy(buf,s,sizeof(buf)-1); buf[sizeof(buf)-1]='\0';
     char *tok=strtok(buf,",");
     while(tok) {
@@ -48,8 +54,10 @@ static bool field_has(CronField *f, int v) {
     return false;
 }
 
+/* Находим следующий момент запуска после after (unix ts).
+ * Перебираем минуты вперёд — максимум 527040 итераций (1 год). */
 int64_t cron_next(const char *expr, int64_t after) {
-    /* Handle aliases */
+    /* Алиасы @hourly/@daily и т.д. разворачиваем в стандартный формат "мин час д м дн_нед". */
     if(strcmp(expr,"@hourly")==0)   expr="0 * * * *";
     if(strcmp(expr,"@daily")==0)    expr="0 0 * * *";
     if(strcmp(expr,"@weekly")==0)   expr="0 0 * * 0";
@@ -88,7 +96,8 @@ int64_t cron_next(const char *expr, int64_t after) {
     return -1;
 }
 
-/* ── DAG topological sort (Kahn) ── */
+/* ── Топологическая сортировка DAG зависимостей шагов (алгоритм Кана) ──
+ * Возвращает 0 и порядок выполнения в order[], или -1 при обнаружении цикла. */
 static int topo_sort(Pipeline *p, int *order) {
     int indegree[MAX_STEPS] = {0};
     for(int i=0;i<p->nsteps;i++)
@@ -105,8 +114,10 @@ static int topo_sort(Pipeline *p, int *order) {
     return n == p->nsteps ? 0 : -1; /* -1 = cycle */
 }
 
-/* ── JSON serialization ── */
-/* Serialize any JVal back to compact JSON — used to preserve object-valued fields */
+/* ── Сериализация/десериализация пайплайнов в JSON ── */
+
+/* Рекурсивная запись JVal в JBuf: нужна для сохранения connector_config,
+ * который может прийти как JSON-объект в теле запроса, а храниться должен как строка. */
 static void jval_write(JBuf *jb, JVal *v) {
     if (!v) { jb_null(jb); return; }
     switch (v->type) {
@@ -138,8 +149,9 @@ static const char *jval_to_json(JVal *v, Arena *a) {
     return jb_done(&jb);
 }
 
-/* Copy JVal field into a fixed-size char buffer.
- * If the field is a JSON object/array, serialise it back to JSON first. */
+/* Копируем JVal-поле в char[]-буфер фиксированного размера.
+ * Если значение — объект/массив, сериализуем в JSON-строку, чтобы connector_config
+ * можно было передавать в create() коннектора как обычную C-строку. */
 static void copy_jval_str(JVal *v, char *dst, size_t dstsz, Arena *a) {
     if (!v) { dst[0] = '\0'; return; }
     if (v->type == JV_STRING) {
@@ -218,11 +230,12 @@ char *pipeline_to_json(const Pipeline *p, Arena *a) {
     return (char*)jb_done(&jb);
 }
 
-/* ── Scheduler thread ── */
+/* ── Поток планировщика ── */
 static void *sched_loop(void *arg) {
     Scheduler *s = arg;
     LOG_INFO("scheduler started");
     while(s->running) {
+        /* Проверяем расписание каждые 30 секунд — достаточно для minutely-cron. */
         sleep(30);
         if(!s->running) break;
         int64_t now = (int64_t)time(NULL);
@@ -234,7 +247,7 @@ static void *sched_loop(void *arg) {
                 p->next_run=cron_next(p->cron,now);
             if(p->next_run>0 && now>=p->next_run && p->run_status!=RUN_RUNNING){
                 p->last_run=now;
-                /* @reboot runs once only */
+                /* @reboot запускается один раз при старте; INT64_MAX исключает повторный запуск. */
                 if(strcmp(p->cron,"@reboot")==0)
                     p->next_run=INT64_MAX;
                 else

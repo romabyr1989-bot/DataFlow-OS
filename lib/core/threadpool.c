@@ -1,3 +1,7 @@
+/* Пул потоков с ограниченной очередью задач и поддержкой graceful-shutdown.
+ * Один мьютекс + два condvar управляют тремя состояниями:
+ *   cond_work — разбудить воркеров при появлении задачи
+ *   cond_idle — разбудить tp_wait/tp_submit при опустении очереди или освобождении места */
 #include "threadpool.h"
 #include <stdlib.h>
 #include <stdio.h>
@@ -6,14 +10,18 @@ static void *worker(void *arg) {
     ThreadPool *p = arg;
     for (;;) {
         pthread_mutex_lock(&p->mu);
+        /* Ждём задачу или сигнал остановки. */
         while (!p->head && !p->shutdown)
             pthread_cond_wait(&p->cond_work, &p->mu);
+        /* Останавливаемся только после полного дренажа очереди — задачи не теряются. */
         if (p->shutdown && !p->head) { pthread_mutex_unlock(&p->mu); break; }
+        /* Забираем задачу с головы FIFO-очереди. */
         Task *t = p->head;
         p->head = t->next;
         if (!p->head) p->tail = NULL;
         p->queue_size--; p->active++;
-        pthread_cond_signal(&p->cond_idle); /* wake any tp_submit blocked on full queue */
+        /* Сигналим: освободилось место в очереди (если tp_submit ждал). */
+        pthread_cond_signal(&p->cond_idle);
         pthread_mutex_unlock(&p->mu);
 
         t->fn(t->arg);
@@ -21,6 +29,7 @@ static void *worker(void *arg) {
 
         pthread_mutex_lock(&p->mu);
         p->active--;
+        /* Если все воркеры простаивают и очередь пуста — будим tp_wait. */
         if (!p->active && !p->head) pthread_cond_broadcast(&p->cond_idle);
         pthread_mutex_unlock(&p->mu);
     }
@@ -38,6 +47,8 @@ ThreadPool *tp_create(int n, int qmax) {
     return p;
 }
 
+/* tp_submit блокируется при заполненной очереди — встроенное backpressure.
+ * Это предотвращает неограниченный рост памяти при перегрузке. */
 void tp_submit(ThreadPool *p, task_fn fn, void *arg) {
     Task *t = malloc(sizeof(Task));
     t->fn = fn; t->arg = arg; t->next = NULL;
@@ -50,12 +61,15 @@ void tp_submit(ThreadPool *p, task_fn fn, void *arg) {
     pthread_mutex_unlock(&p->mu);
 }
 
+/* Ждём завершения всех активных задач и опустения очереди. */
 void tp_wait(ThreadPool *p) {
     pthread_mutex_lock(&p->mu);
     while (p->active || p->head) pthread_cond_wait(&p->cond_idle, &p->mu);
     pthread_mutex_unlock(&p->mu);
 }
 
+/* Плановое завершение: устанавливаем флаг, будим все потоки,
+ * join ждёт их выхода из цикла после обработки оставшихся задач. */
 void tp_destroy(ThreadPool *p) {
     pthread_mutex_lock(&p->mu);
     p->shutdown = 1;
@@ -69,6 +83,7 @@ void tp_destroy(ThreadPool *p) {
     free(p);
 }
 
+/* active + queue_size: оба компонента определяют «загруженность» пула. */
 int tp_active(ThreadPool *p) {
     pthread_mutex_lock(&p->mu); int a = p->active + p->queue_size; pthread_mutex_unlock(&p->mu);
     return a;

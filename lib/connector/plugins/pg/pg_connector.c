@@ -1,4 +1,6 @@
-/* PostgreSQL connector — reads from live PG instances via libpq */
+/* PostgreSQL коннектор: реализует DfoConnector ABI через libpq.
+ * Подключается к живой БД, умеет: список таблиц, схема, постраничное чтение.
+ * CDC (logical replication) — MVP не реализован, зарезервировано для фазы 3. */
 #include "../../connector.h"
 #include "../../../core/log.h"
 #include <libpq-fe.h>
@@ -8,11 +10,12 @@
 #include <strings.h>
 #include <time.h>
 
-/* ── Config defaults ── */
+/* ── Конфигурация по умолчанию ── */
 #define PG_DEFAULT_BATCH 8192
 #define PG_MAX_DSN       1024
 #define PG_MAX_SQL       4096
 
+/* Контекст одного подключения к PG. Живёт в арене, переданной в create(). */
 typedef struct {
     PGconn *conn;
     char    dsn[PG_MAX_DSN];
@@ -20,7 +23,7 @@ typedef struct {
     Arena  *arena;
 } PgCtx;
 
-/* ── PostgreSQL type string → ColType ── */
+/* ── Маппинг pg-типа (строка из information_schema) в ColType ── */
 static ColType pg_col_type(const char *pg_type) {
     if (!pg_type) return COL_TEXT;
     if (strstr(pg_type, "int")   || strstr(pg_type, "serial")) return COL_INT64;
@@ -31,7 +34,8 @@ static ColType pg_col_type(const char *pg_type) {
     return COL_TEXT;
 }
 
-/* ── Parse a quoted or bare JSON string value for key ── */
+/* Ручной парсер JSON-поля: ищет "key": и извлекает строку или bare-значение.
+ * Не зависит от арены — вызывается до её полной инициализации в create(). */
 static void cfg_get(const char *json, const char *key, char *out, size_t outsz, const char *def) {
     if (def) strncpy(out, def, outsz-1);
     if (!json) return;
@@ -61,7 +65,8 @@ static void cfg_get(const char *json, const char *key, char *out, size_t outsz, 
     }
 }
 
-/* ── create() — parse config JSON, open PG connection ── */
+/* ── create(): разбираем config JSON и открываем подключение к PG ──
+ * DSN строится в формате "keyword=value" — libpq рекомендует его вместо URL. */
 static void *pg_create(const char *cfg, Arena *a) {
     PgCtx *ctx = arena_calloc(a, sizeof(PgCtx));
     ctx->arena      = a;
@@ -119,7 +124,7 @@ static int pg_ping(void *vctx) {
     return ok ? 0 : -1;
 }
 
-/* ── list_entities() — tables + views in public schema ── */
+/* ── list_entities(): список таблиц и вьюх в схеме public ── */
 static int pg_list_entities(void *vctx, Arena *a, DfoEntityList *out) {
     PgCtx *ctx = vctx;
     if (!ctx || !ctx->conn) return -1;
@@ -148,7 +153,8 @@ static int pg_list_entities(void *vctx, Arena *a, DfoEntityList *out) {
     return 0;
 }
 
-/* ── describe() — column names and types ── */
+/* ── describe(): схема таблицы через information_schema.columns ──
+ * Используем PQexecParams с параметром $1 — защита от SQL-инъекции в имени таблицы. */
 static int pg_describe(void *vctx, Arena *a, const char *entity, Schema **out) {
     PgCtx *ctx = vctx;
     if (!ctx || !ctx->conn) return -1;
@@ -180,7 +186,8 @@ static int pg_describe(void *vctx, Arena *a, const char *entity, Schema **out) {
     return 0;
 }
 
-/* ── Parse ISO-8601 / PG timestamp string → unix seconds ── */
+/* Парсинг метки времени PG ("2024-01-15 12:34:56") в unix-секунды.
+ * Храним timestamp как int64 (COL_INT64), чтобы можно было строить B-tree индекс. */
 static int64_t parse_pg_ts(const char *s) {
     if (!s || !*s) return 0;
     struct tm tm = {0};
@@ -200,7 +207,10 @@ static int64_t parse_pg_ts(const char *s) {
     return 0;
 }
 
-/* ── read_batch() — fetch one batch of rows ── */
+/* ── read_batch(): читаем один батч строк из PG ──
+ * Cursor — строковое представление целого смещения (OFFSET).
+ * Если entity начинается с SELECT — выполняем как подзапрос, иначе строим SELECT * FROM table.
+ * Схема ColBatch выводится из OID-типов результата — не требует предварительного describe(). */
 static int pg_read_batch(void *vctx, Arena *a, DfoReadReq *req,
                           const char *entity, ColBatch **out_batch) {
     PgCtx *ctx = vctx;
@@ -250,11 +260,9 @@ static int pg_read_batch(void *vctx, Arena *a, DfoReadReq *req,
     for (int c = 0; c < ncols; c++) {
         sc->cols[c].name     = arena_strdup(a, PQfname(res, c));
         Oid oid              = PQftype(res, c);
-        /* Map OIDs to ColType */
-        /* int2=21, int4=23, int8=20, serial/bigserial OIDs are same */
-        /* float4=700, float8=701, numeric=1700 */
-        /* bool=16, timestamp=1114, timestamptz=1184, date=1082 */
-        /* uuid=2950, text=25, varchar=1043, char=18 */
+        /* OID → ColType. OID-константы из PostgreSQL src/include/catalog/pg_type.h:
+         * int2=21, int4=23, int8=20 | float4=700, float8=701, numeric=1700
+         * bool=16 | timestamp=1114, timestamptz=1184, date=1082 */
         switch (oid) {
             case 20: case 21: case 23:
             case 1114: case 1184: case 1082:

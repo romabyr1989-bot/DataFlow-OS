@@ -1,3 +1,5 @@
+/* Минимальный JSON-строитель (streaming) + рекурсивно-нисходящий парсер.
+ * Весь результат живёт в Arena — никаких отдельных free(). */
 #include "json.h"
 #include <stdlib.h>
 #include <string.h>
@@ -5,7 +7,10 @@
 #include <math.h>
 #include <ctype.h>
 
-/* ── Builder ── */
+/* ── Строитель (JBuf) ── */
+
+/* Геометрическое удвоение буфера в арене: не освобождаем старый (он в арене),
+ * просто выделяем больший и копируем. */
 static void jb_ensure(JBuf *j, size_t need) {
     if (j->len + need <= j->cap) return;
     size_t nc = j->cap * 2 + need + 64;
@@ -20,8 +25,9 @@ static void jb_append(JBuf *j, const char *s, size_t n) {
 
 static void jb_ch(JBuf *j, char c) { jb_ensure(j, 1); j->buf[j->len++] = c; }
 
+/* Автоматическая запятая: смотрим на последний символ буфера.
+ * После '[', '{', ':' запятая не нужна — значение идёт первым. */
 static void jb_comma(JBuf *j) {
-    /* If last non-space char is value/string end, add comma */
     if (j->len > 0) {
         char last = j->buf[j->len-1];
         if (last != '[' && last != '{' && last != ':') jb_ch(j, ',');
@@ -42,7 +48,7 @@ void jb_key(JBuf *j, const char *k) {
     jb_comma(j);
     jb_ch(j, '"');
     jb_append(j, k, strlen(k));
-    jb_append(j, "\":", 2);
+    jb_append(j, "\":", 2);   /* ключ всегда без экранирования — имена полей ASCII */
 }
 
 void jb_str(JBuf *j, const char *s) {
@@ -50,6 +56,7 @@ void jb_str(JBuf *j, const char *s) {
     jb_strn(j, s, strlen(s));
 }
 
+/* Экранирование строк согласно RFC 8259: спецсимволы и байты < 0x20. */
 void jb_strn(JBuf *j, const char *s, size_t n) {
     jb_comma(j); jb_ch(j, '"');
     for (size_t i = 0; i < n; i++) {
@@ -77,25 +84,34 @@ void jb_double(JBuf *j, double v) {
 
 void jb_bool(JBuf *j, bool v) { jb_comma(j); jb_append(j, v?"true":"false", v?4:5); }
 void jb_null(JBuf *j)         { jb_comma(j); jb_append(j, "null", 4); }
+
+/* jb_raw — вставляет уже готовый JSON-фрагмент без экранирования.
+ * Используется для вложенных объектов, уже хранящихся в виде строки (например, из каталога). */
 void jb_raw(JBuf *j, const char *raw) { jb_comma(j); jb_append(j, raw, strlen(raw)); }
 
+/* NUL-терминируем буфер и возвращаем указатель. Буфер живёт в арене вызывающего. */
 const char *jb_done(JBuf *j) {
     jb_ensure(j, 1); j->buf[j->len] = '\0'; return j->buf;
 }
 
-/* ── Parser ── */
+/* ── Парсер (рекурсивный спуск) ── */
+
+/* Состояние парсера: src — входная строка, pos — текущая позиция, a — арена для JVal. */
 typedef struct { const char *src; size_t pos, len; Arena *a; } JP;
 
 static void skip_ws(JP *p) {
     while (p->pos < p->len && isspace((unsigned char)p->src[p->pos])) p->pos++;
 }
 
+/* arena_calloc обнуляет union — важно, чтобы неинициализированные поля не содержали мусор. */
 static JVal *jv_new(JP *p, JValType t) {
     JVal *v = arena_calloc(p->a, sizeof(JVal)); v->type = t; return v;
 }
 
 static JVal *parse_value(JP *p);
 
+/* Парсим строку с inline-декодированием escape-последовательностей.
+ * Выходной буфер аллоцируем с запасом (p->len - p->pos) — никогда не превысит входной длины. */
 static JVal *parse_string(JP *p) {
     if (p->src[p->pos] != '"') return jv_new(p, JV_ERROR);
     p->pos++;
@@ -113,6 +129,7 @@ static JVal *parse_string(JP *p) {
                 case 'r': out[outlen++]='\r'; break;
                 case 't': out[outlen++]='\t'; break;
                 case 'u': {
+                    /* \uXXXX → UTF-8: BMP-кодпоинт до U+FFFF кодируем в 1–3 байта */
                     unsigned int cp = 0;
                     for (int _k = 0; _k < 4; _k++) {
                         if (p->pos+1 >= p->len) break;
@@ -140,14 +157,15 @@ static JVal *parse_string(JP *p) {
         p->pos++;
     }
     (void)start;
-    if (p->pos < p->len) p->pos++; /* skip closing " */
+    if (p->pos < p->len) p->pos++; /* пропускаем закрывающую кавычку */
     out[outlen] = '\0';
     JVal *v = jv_new(p, JV_STRING); v->s = out; v->len = outlen;
     return v;
 }
 
+/* Массивы и объекты динамически расширяют буфер вдвое — классический amortized O(1). */
 static JVal *parse_array(JP *p) {
-    p->pos++; /* skip [ */
+    p->pos++; /* пропускаем '[' */
     JVal *v = jv_new(p, JV_ARRAY);
     size_t cap = 8;
     JVal **items = arena_alloc(p->a, cap * sizeof(JVal *));
@@ -168,7 +186,7 @@ static JVal *parse_array(JP *p) {
 }
 
 static JVal *parse_object(JP *p) {
-    p->pos++; /* skip { */
+    p->pos++; /* пропускаем '{' */
     JVal *v = jv_new(p, JV_OBJECT);
     size_t cap = 8;
     const char **keys = arena_alloc(p->a, cap * sizeof(char *));
@@ -197,6 +215,7 @@ static JVal *parse_object(JP *p) {
     return v;
 }
 
+/* Точка входа рекурсивного спуска: определяем тип значения по первому символу. */
 static JVal *parse_value(JP *p) {
     skip_ws(p);
     if (p->pos >= p->len) return jv_new(p, JV_ERROR);
@@ -208,6 +227,7 @@ static JVal *parse_value(JP *p) {
     if (strncmp(p->src+p->pos,"true",4)==0) { p->pos+=4; JVal *v=jv_new(p,JV_BOOL); v->b=true; return v; }
     if (strncmp(p->src+p->pos,"false",5)==0){ p->pos+=5; JVal *v=jv_new(p,JV_BOOL); v->b=false; return v; }
     if (c=='-'||isdigit((unsigned char)c)) {
+        /* Числа: используем strtod — он сам продвигает указатель до конца числа. */
         char *end; double d = strtod(p->src+p->pos, &end);
         p->pos = (size_t)(end - p->src);
         JVal *v = jv_new(p,JV_NUMBER); v->n=d; return v;
@@ -220,6 +240,7 @@ JVal *json_parse(Arena *a, const char *src, size_t len) {
     return parse_value(&p);
 }
 
+/* Линейный поиск по ключам — для небольших объектов (до ~20 полей) быстрее хэш-таблицы. */
 JVal *json_get(JVal *obj, const char *key) {
     if (!obj || obj->type != JV_OBJECT) return NULL;
     for (size_t i = 0; i < obj->nkeys; i++)

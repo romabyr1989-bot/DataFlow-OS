@@ -1,10 +1,13 @@
+/* Потокобезопасный логгер с поддержкой двух режимов вывода:
+ * - text (цветной ANSI) — для разработки/просмотра в терминале
+ * - json — для передачи в Loki/ELK/Vector без дополнительного парсинга */
 #include "log.h"
 #include <stdarg.h>
 #include <string.h>
 
 Logger g_log;
 
-static const char *level_str[] = {"DEBUG","INFO","WARN","ERROR"};
+static const char *level_str[]   = {"DEBUG","INFO","WARN","ERROR"};
 static const char *level_color[] = {"\033[37m","\033[32m","\033[33m","\033[31m"};
 
 void log_init(Logger *l, FILE *out, LogLevel min_level, int json_mode) {
@@ -23,9 +26,10 @@ void log_write(Logger *l, LogLevel level, const char *file, int line,
     va_list ap; va_start(ap, fmt);
     char msg[4096]; vsnprintf(msg, sizeof(msg), fmt, ap); va_end(ap);
 
-    /* strip path prefix */
+    /* Убираем путь к файлу, оставляем только имя — лаконичнее в логах. */
     const char *f = strrchr(file, '/'); f = f ? f+1 : file;
 
+    /* Мьютекс обеспечивает атомарность строки: строки от разных потоков не перемежаются. */
     pthread_mutex_lock(&l->mu);
     if (l->json_mode) {
         fprintf(l->out, "{\"ts\":\"%s.%03ldZ\",\"level\":\"%s\","
@@ -36,6 +40,6 @@ void log_write(Logger *l, LogLevel level, const char *file, int line,
                 level_color[level], tbuf, ts.tv_nsec/1000000,
                 level_str[level], f, line, msg);
     }
-    fflush(l->out);
+    fflush(l->out);   /* немедленный сброс — при краше теряем меньше строк */
     pthread_mutex_unlock(&l->mu);
 }
