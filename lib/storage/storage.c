@@ -1,36 +1,45 @@
 #include "storage.h"
 #include "../core/log.h"
+#include "../index/btree.h"
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/stat.h>
+#include <dirent.h>
 #include <errno.h>
 #include <sqlite3.h>
 #include <time.h>
 
 /* ── WAL ── */
-struct WAL { int fd; char path[512]; };
+struct WAL {
+    int     fd;
+    char    path[512];
+    int64_t write_pos;   /* byte offset of next write = current file size */
+};
 
 WAL *wal_open(const char *path) {
     WAL *w = calloc(1, sizeof(WAL));
     strncpy(w->path, path, sizeof(w->path)-1);
     w->fd = open(path, O_WRONLY|O_CREAT|O_APPEND|O_CLOEXEC, 0644);
     if (w->fd < 0) { LOG_ERROR("wal_open %s: %s", path, strerror(errno)); free(w); return NULL; }
+    struct stat st;
+    if (fstat(w->fd, &st) == 0) w->write_pos = st.st_size;
     return w;
 }
 
 int wal_append(WAL *w, const void *data, size_t len) {
-    /* TLV: [4-byte len][data] */
     uint32_t l = (uint32_t)len;
     if (write(w->fd, &l, 4) != 4) return -1;
     if (write(w->fd, data, len) != (ssize_t)len) return -1;
+    w->write_pos += 4 + (int64_t)len;
     return 0;
 }
 
-int wal_sync(WAL *w)  { return fdatasync(w->fd); }
-void wal_close(WAL *w){ close(w->fd); free(w); }
+int64_t wal_tell(WAL *w) { return w ? w->write_pos : 0; }
+int     wal_sync(WAL *w) { return fdatasync(w->fd); }
+void    wal_close(WAL *w){ close(w->fd); free(w); }
 
 /* ── ColBatch helpers ── */
 static bool bit_get(const uint8_t *bm, int i) {
@@ -38,14 +47,39 @@ static bool bit_get(const uint8_t *bm, int i) {
 }
 static void bit_set(uint8_t *bm, int i) { bm[i/8] |= (1u << (i%8)); }
 
-/* ── Table (simple flat-file, one file per batch) ── */
+/* ── Table ── */
 struct Table {
     char    name[128];
     char    dir[512];
     Schema *schema;
     int64_t row_count;
     WAL    *wal;
+    /* B-tree indexes: one per indexed column */
+    BTree **indexes;        /* malloc'd array of BTree* */
+    int    *indexed_cols;   /* malloc'd array of column indices */
+    int     nindexes;
 };
+
+/* Scan table dir for idx_N.btree files and open them */
+static void table_load_indexes(Table *t) {
+    DIR *d = opendir(t->dir);
+    if (!d) return;
+    struct dirent *ent;
+    while ((ent = readdir(d)) != NULL) {
+        int col_idx = -1;
+        if (sscanf(ent->d_name, "idx_%d.btree", &col_idx) != 1 || col_idx < 0) continue;
+        char idx_path[700];
+        snprintf(idx_path, sizeof(idx_path), "%s/%s", t->dir, ent->d_name);
+        BTree *bt = btree_open(idx_path);
+        if (!bt) continue;
+        t->indexes     = realloc(t->indexes,     (size_t)(t->nindexes+1) * sizeof(BTree*));
+        t->indexed_cols= realloc(t->indexed_cols,(size_t)(t->nindexes+1) * sizeof(int));
+        t->indexes[t->nindexes]      = bt;
+        t->indexed_cols[t->nindexes] = col_idx;
+        t->nindexes++;
+    }
+    closedir(d);
+}
 
 Table *table_create(const char *name, Schema *schema, const char *dir) {
     Table *t = calloc(1, sizeof(Table));
@@ -55,6 +89,7 @@ Table *table_create(const char *name, Schema *schema, const char *dir) {
     t->schema = schema;
     char wal_path[600]; snprintf(wal_path, sizeof(wal_path), "%s/wal.bin", t->dir);
     t->wal = wal_open(wal_path);
+    table_load_indexes(t);
     return t;
 }
 
@@ -62,15 +97,14 @@ Table *table_open(const char *name, const char *dir) {
     Table *t = calloc(1, sizeof(Table));
     strncpy(t->name, name, sizeof(t->name)-1);
     snprintf(t->dir, sizeof(t->dir), "%s/%s", dir, name);
-    /* minimal: just open WAL */
     char wal_path[600]; snprintf(wal_path, sizeof(wal_path), "%s/wal.bin", t->dir);
     t->wal = wal_open(wal_path);
+    table_load_indexes(t);
     return t;
 }
 
 int table_append(Table *t, ColBatch *batch) {
     if (!batch || batch->nrows == 0) return 0;
-    /* Serialize batch as CSV into WAL for simplicity */
     enum { ROW_BUF_CAP = 262144 };
     char *row_buf = malloc(ROW_BUF_CAP);
     if (!row_buf) return -1;
@@ -82,8 +116,7 @@ int table_append(Table *t, ColBatch *batch) {
             if (batch->null_bitmap[c] && bit_get(batch->null_bitmap[c], r)) {
                 int n = snprintf(row_buf+off, ROW_BUF_CAP-off, "NULL");
                 if (n < 0 || off + n >= ROW_BUF_CAP) { free(row_buf); return -1; }
-                off += n;
-                continue;
+                off += n; continue;
             }
             switch (batch->schema->cols[c].type) {
                 case COL_INT64: {
@@ -111,8 +144,22 @@ int table_append(Table *t, ColBatch *batch) {
         }
         if (off >= ROW_BUF_CAP - 1) { free(row_buf); return -1; }
         row_buf[off++] = '\n';
+        /* record WAL offset BEFORE writing — used for index entries */
+        int64_t row_offset = wal_tell(t->wal);
         wal_append(t->wal, row_buf, (size_t)off);
         t->row_count++;
+        /* update all open B-tree indexes (COL_INT64 only) */
+        if (t->nindexes > 0 && batch->schema) {
+            for (int idx = 0; idx < t->nindexes; idx++) {
+                int ci = t->indexed_cols[idx];
+                if (ci >= batch->ncols) continue;
+                if (batch->schema->cols[ci].type != COL_INT64) continue;
+                bool is_null = batch->null_bitmap[ci] && bit_get(batch->null_bitmap[ci], r);
+                if (is_null) continue;
+                int64_t key = ((int64_t*)batch->values[ci])[r];
+                btree_insert(t->indexes[idx], key, row_offset);
+            }
+        }
     }
     free(row_buf);
     return wal_sync(t->wal);
@@ -122,12 +169,102 @@ int64_t table_row_count(Table *t) { return t->row_count; }
 Schema *table_schema(Table *t)    { return t->schema; }
 
 int table_scan(Table *t, ColBatch **out, Arena *a) {
-    /* Minimal: count rows from WAL file */
     (void)t; (void)out; (void)a;
     return (int)t->row_count;
 }
 
-void table_close(Table *t) { if (t->wal) wal_close(t->wal); free(t); }
+void table_close(Table *t) {
+    if (!t) return;
+    if (t->wal) wal_close(t->wal);
+    for (int i = 0; i < t->nindexes; i++) btree_close(t->indexes[i]);
+    free(t->indexes);
+    free(t->indexed_cols);
+    free(t);
+}
+
+BTree *table_get_index(Table *t, int col_idx) {
+    if (!t) return NULL;
+    for (int i = 0; i < t->nindexes; i++)
+        if (t->indexed_cols[i] == col_idx) return t->indexes[i];
+    return NULL;
+}
+
+int table_create_index(Table *t, int col_idx, Catalog *c) {
+    if (!t || col_idx < 0) return -1;
+    /* Only COL_INT64 supported */
+    if (t->schema && col_idx < t->schema->ncols &&
+        t->schema->cols[col_idx].type != COL_INT64) {
+        LOG_ERROR("table_create_index: col %d is not INT64", col_idx);
+        return -1;
+    }
+
+    /* Drop old index if any */
+    for (int i = 0; i < t->nindexes; i++) {
+        if (t->indexed_cols[i] == col_idx) {
+            btree_close(t->indexes[i]);
+            /* shift remaining entries */
+            memmove(&t->indexes[i],      &t->indexes[i+1],
+                    (size_t)(t->nindexes-i-1)*sizeof(BTree*));
+            memmove(&t->indexed_cols[i], &t->indexed_cols[i+1],
+                    (size_t)(t->nindexes-i-1)*sizeof(int));
+            t->nindexes--;
+            break;
+        }
+    }
+
+    char idx_path[700];
+    snprintf(idx_path, sizeof(idx_path), "%s/idx_%d.btree", t->dir, col_idx);
+    BTree *bt = btree_create(idx_path);
+    if (!bt) return -1;
+
+    /* Scan WAL to populate index */
+    char wal_path[700];
+    snprintf(wal_path, sizeof(wal_path), "%s/wal.bin", t->dir);
+    FILE *wf = fopen(wal_path, "rb");
+    if (wf) {
+        int64_t file_off = 0;
+        char row_buf[262144];
+        while (1) {
+            uint32_t l = 0;
+            if (fread(&l, 4, 1, wf) != 1) break;
+            if (l == 0 || l >= sizeof(row_buf)) {
+                fseek(wf, (long)l, SEEK_CUR);
+                file_off += 4 + (int64_t)l;
+                continue;
+            }
+            int64_t rec_off = file_off;
+            if (fread(row_buf, 1, l, wf) != l) break;
+            row_buf[l] = '\0';
+            file_off += 4 + (int64_t)l;
+
+            /* Skip to col_idx-th comma-separated field */
+            char *p = row_buf;
+            for (int ci = 0; ci < col_idx; ci++) {
+                p = strchr(p, ',');
+                if (!p) { p = NULL; break; }
+                p++;
+            }
+            if (!p || !*p || strncmp(p, "NULL", 4) == 0) continue;
+            int64_t key = strtoll(p, NULL, 10);
+            btree_insert(bt, key, rec_off);
+        }
+        fclose(wf);
+    }
+
+    /* Register the open handle */
+    t->indexes      = realloc(t->indexes,      (size_t)(t->nindexes+1)*sizeof(BTree*));
+    t->indexed_cols = realloc(t->indexed_cols, (size_t)(t->nindexes+1)*sizeof(int));
+    t->indexes[t->nindexes]      = bt;
+    t->indexed_cols[t->nindexes] = col_idx;
+    t->nindexes++;
+
+    /* Register in catalog if provided */
+    if (c && t->schema && col_idx < t->schema->ncols) {
+        const char *col_name = t->schema->cols[col_idx].name;
+        catalog_register_index(c, t->name, col_name, col_idx);
+    }
+    return 0;
+}
 
 /* ── Catalog ── */
 struct Catalog { sqlite3 *db; };
@@ -448,4 +585,82 @@ int catalog_delete_result(Catalog *c, int64_t id) {
     sqlite3_bind_int64(st,1,id);
     int rc=sqlite3_step(st); sqlite3_finalize(st);
     return rc==SQLITE_DONE?0:-1;
+}
+
+/* ── Index registry ── */
+/* The table is created lazily on first use via the migration pragma below */
+static void catalog_ensure_index_table(Catalog *c) {
+    sqlite3_exec(c->db,
+        "CREATE TABLE IF NOT EXISTS table_indexes("
+        "  table_name TEXT NOT NULL,"
+        "  col_name   TEXT NOT NULL,"
+        "  col_idx    INTEGER NOT NULL,"
+        "  created_at INTEGER,"
+        "  PRIMARY KEY (table_name, col_name));",
+        NULL, NULL, NULL);
+}
+
+int catalog_register_index(Catalog *c, const char *table,
+                           const char *col, int col_idx) {
+    catalog_ensure_index_table(c);
+    sqlite3_stmt *st;
+    sqlite3_prepare_v2(c->db,
+        "INSERT OR REPLACE INTO table_indexes(table_name,col_name,col_idx,created_at)"
+        " VALUES(?,?,?,?)", -1, &st, NULL);
+    sqlite3_bind_text(st,1,table,-1,SQLITE_STATIC);
+    sqlite3_bind_text(st,2,col,  -1,SQLITE_STATIC);
+    sqlite3_bind_int (st,3,col_idx);
+    sqlite3_bind_int64(st,4,(int64_t)time(NULL));
+    int rc = sqlite3_step(st); sqlite3_finalize(st);
+    return rc == SQLITE_DONE ? 0 : -1;
+}
+
+int catalog_list_indexes_json(Catalog *c, const char *table,
+                              char **json_out, Arena *a) {
+    catalog_ensure_index_table(c);
+    sqlite3_stmt *st;
+    sqlite3_prepare_v2(c->db,
+        "SELECT col_name, col_idx, created_at FROM table_indexes"
+        " WHERE table_name=? ORDER BY col_idx", -1, &st, NULL);
+    sqlite3_bind_text(st,1,table,-1,SQLITE_STATIC);
+    JBuf jb; jb_init(&jb,a,512); jb_arr_begin(&jb);
+    while (sqlite3_step(st)==SQLITE_ROW) {
+        jb_obj_begin(&jb);
+        jb_key(&jb,"column");  jb_str(&jb,(const char*)sqlite3_column_text(st,0));
+        jb_key(&jb,"col_idx"); jb_int(&jb,sqlite3_column_int(st,1));
+        jb_key(&jb,"type");    jb_str(&jb,"btree");
+        jb_key(&jb,"created_at"); jb_int(&jb,sqlite3_column_int64(st,2));
+        jb_obj_end(&jb);
+    }
+    jb_arr_end(&jb); sqlite3_finalize(st);
+    *json_out = (char*)jb_done(&jb);
+    return 0;
+}
+
+int catalog_drop_indexes(Catalog *c, const char *table) {
+    catalog_ensure_index_table(c);
+    sqlite3_stmt *st;
+    sqlite3_prepare_v2(c->db,
+        "DELETE FROM table_indexes WHERE table_name=?", -1, &st, NULL);
+    sqlite3_bind_text(st,1,table,-1,SQLITE_STATIC);
+    int rc=sqlite3_step(st); sqlite3_finalize(st);
+    return rc==SQLITE_DONE?0:-1;
+}
+
+int catalog_has_index(Catalog *c, const char *table, const char *col,
+                      int *col_idx_out) {
+    catalog_ensure_index_table(c);
+    sqlite3_stmt *st;
+    sqlite3_prepare_v2(c->db,
+        "SELECT col_idx FROM table_indexes WHERE table_name=? AND col_name=?",
+        -1, &st, NULL);
+    sqlite3_bind_text(st,1,table,-1,SQLITE_STATIC);
+    sqlite3_bind_text(st,2,col,  -1,SQLITE_STATIC);
+    int found=0;
+    if (sqlite3_step(st)==SQLITE_ROW) {
+        if (col_idx_out) *col_idx_out = sqlite3_column_int(st,0);
+        found = 1;
+    }
+    sqlite3_finalize(st);
+    return found;
 }

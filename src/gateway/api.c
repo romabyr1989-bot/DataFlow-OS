@@ -793,9 +793,80 @@ static const char *expr_name(Expr *e, int pos, Arena *a) {
     return arena_sprintf(a,"col%d",pos+1);
 }
 
+/* ── Index predicate hint ── */
+typedef struct {
+    const char *col;   /* column name to look up         */
+    int64_t     lo;    /* range low  (inclusive)          */
+    int64_t     hi;    /* range high (inclusive)          */
+    bool        valid; /* true if this hint is usable     */
+} IdxHint;
+
+/* Walk WHERE AST for simple "col op int_literal" patterns */
+static void extract_idx_hint_r(Expr *e, IdxHint *out) {
+    if (!e || out->valid) return;
+    if (e->type == EXPR_BINOP) {
+        if (e->op == OP_AND) {
+            extract_idx_hint_r(e->left, out);
+            extract_idx_hint_r(e->right, out);
+            return;
+        }
+        /* col = int */
+        if (e->op == OP_EQ &&
+            e->left  && e->left->type  == EXPR_COL &&
+            e->right && e->right->type == EXPR_LITERAL_INT) {
+            out->col = e->left->name;
+            out->lo  = out->hi = e->right->ival;
+            out->valid = true;
+            return;
+        }
+        /* int = col (commuted) */
+        if (e->op == OP_EQ &&
+            e->left  && e->left->type  == EXPR_LITERAL_INT &&
+            e->right && e->right->type == EXPR_COL) {
+            out->col = e->right->name;
+            out->lo  = out->hi = e->left->ival;
+            out->valid = true;
+            return;
+        }
+        /* col BETWEEN lo AND hi  (parser packs lo/hi as AND subtree) */
+        if (e->op == OP_BETWEEN &&
+            e->left  && e->left->type  == EXPR_COL  &&
+            e->right && e->right->type == EXPR_BINOP &&
+            e->right->left  && e->right->left->type  == EXPR_LITERAL_INT &&
+            e->right->right && e->right->right->type == EXPR_LITERAL_INT) {
+            out->col = e->left->name;
+            out->lo  = e->right->left->ival;
+            out->hi  = e->right->right->ival;
+            out->valid = true;
+        }
+    }
+}
+static IdxHint extract_idx_hint(Expr *where) {
+    IdxHint h = {0};
+    extract_idx_hint_r(where, &h);
+    return h;
+}
+
+/* Parse one WAL record from *wf at current position into a row array */
+static char **parse_wal_row(Arena *a, FILE *wf, int ncols) {
+    uint32_t l = 0;
+    if (fread(&l, 4, 1, wf) != 1) return NULL;
+    if (l == 0 || l > 262144) return NULL;
+    char *line = arena_alloc(a, (size_t)l + 1);
+    if (fread(line, 1, l, wf) != l) return NULL;
+    line[l] = '\0';
+    size_t rl = strlen(line);
+    while (rl > 0 && (line[rl-1]=='\n'||line[rl-1]=='\r')) line[--rl]='\0';
+    char *vals[MAX_COLS]={0}; int nv=0;
+    split_line_simple(line, ',', vals, MAX_COLS, &nv);
+    char **row = arena_alloc(a, (size_t)ncols * sizeof(char*));
+    for (int i = 0; i < ncols; i++) row[i] = (i<nv&&vals[i]) ? vals[i] : "";
+    return row;
+}
+
 /* ── Load table rows ── */
 static int load_tbl(Arena *a, const char *tname, const char *alias,
-                    VTReg *vt_reg, TblData *out) {
+                    VTReg *vt_reg, TblData *out, const IdxHint *ih) {
     memset(out, 0, sizeof(*out));
     out->tname = tname; out->alias = alias;
 
@@ -812,14 +883,58 @@ static int load_tbl(Arena *a, const char *tname, const char *alias,
     if (catalog_get_schema(g_app.catalog, tname, &out->schema, a) != 0 || !out->schema)
         return -1;
 
+    int ncols = out->schema->ncols;
     char wal_path[1024];
     snprintf(wal_path, sizeof(wal_path), "%s/%s/wal.bin", g_app.data_dir, tname);
+
+    /* ── Index-accelerated path ── */
+    if (ih && ih->valid && ih->col) {
+        /* find col_idx in schema */
+        int ci = -1;
+        for (int i = 0; i < ncols; i++)
+            if (out->schema->cols[i].name &&
+                strcasecmp(out->schema->cols[i].name, ih->col) == 0 &&
+                out->schema->cols[i].type == COL_INT64) { ci = i; break; }
+
+        if (ci >= 0) {
+            /* look for open B-tree handle in g_app.tables */
+            pthread_mutex_lock(&g_app.tables_mu);
+            Table *t = hm_get(&g_app.tables, tname);
+            BTree *bt = t ? table_get_index(t, ci) : NULL;
+            pthread_mutex_unlock(&g_app.tables_mu);
+
+            if (bt) {
+                /* allocate offsets on heap (can be large) */
+                int64_t *offs = malloc((size_t)BT_MAX_OFFSETS * sizeof(int64_t));
+                int noffs = 0;
+                btree_range(bt, ih->lo, ih->hi, offs, &noffs);
+
+                int cap = noffs > 0 ? noffs : 1;
+                char ***rows = arena_alloc(a, (size_t)cap * sizeof(char**));
+                int n = 0;
+
+                FILE *wf = fopen(wal_path, "rb");
+                if (wf) {
+                    for (int oi = 0; oi < noffs; oi++) {
+                        if (fseeko(wf, (off_t)offs[oi], SEEK_SET) != 0) continue;
+                        char **row = parse_wal_row(a, wf, ncols);
+                        if (row) rows[n++] = row;
+                    }
+                    fclose(wf);
+                }
+                free(offs);
+                out->rows = rows; out->nrows = n;
+                return 0;
+            }
+        }
+    }
+
+    /* ── Full scan (fallback) ── */
     FILE *wf = fopen(wal_path, "rb");
     if (!wf) { out->nrows=0; return 0; }
 
     int cap=128, n=0;
     char ***rows = arena_alloc(a, (size_t)cap * sizeof(char**));
-    int ncols = out->schema->ncols;
 
     while (1) {
         uint32_t l=0;
@@ -831,7 +946,6 @@ static int load_tbl(Arena *a, const char *tname, const char *alias,
         size_t rl=strlen(line);
         while(rl>0&&(line[rl-1]=='\n'||line[rl-1]=='\r')) line[--rl]='\0';
 
-        /* skip rows with insufficient printable content (WAL garbage records) */
         int printable=0;
         for (size_t ci=0;ci<rl;ci++) if ((unsigned char)line[ci]>=0x20) printable++;
         if (printable < 2) continue;
@@ -1251,6 +1365,7 @@ static RS *exec_select(Arena *a, const SelectStmt *sel, VTReg *parent_vt) {
         return rs;
     }
 
+    IdxHint ih = extract_idx_hint(sel->where);
     TblData *tables=arena_calloc(a,(size_t)ntables*sizeof(TblData));
     for (int i=0;i<ntables;i++) {
         const char *tname=sel->from[i].table;
@@ -1273,7 +1388,7 @@ static RS *exec_select(Arena *a, const SelectStmt *sel, VTReg *parent_vt) {
             tables[i].tname=alias?alias:"_sub";
             tables[i].alias=alias;
         } else if (tname) {
-            if (load_tbl(a,tname,alias,vt,&tables[i])!=0) {
+            if (load_tbl(a,tname,alias,vt,&tables[i],&ih)!=0) {
                 /* table not found: empty schema */
                 tables[i].schema=arena_calloc(a,sizeof(Schema));
                 tables[i].tname=tname; tables[i].alias=alias;
@@ -1964,6 +2079,56 @@ static void h_result_delete(HttpReq *req, HttpResp *resp) {
     http_resp_json(resp,200,"{\"ok\":true}");
 }
 
+/* ── POST /api/tables/:name/indexes  {"column":"col_name"} ── */
+static void h_index_create(HttpReq *req, HttpResp *resp) {
+    const char *tname = hm_get(&req->params, "name");
+    if (!tname) { http_resp_error(resp,400,"missing name"); return; }
+
+    Arena *a = arena_create(8192);
+    JVal *root = json_parse(a, req->body, req->body_len);
+    if (!root) { http_resp_error(resp,400,"invalid json"); arena_destroy(a); return; }
+    const char *col_name = json_str(json_get(root,"column"), "");
+    if (!col_name[0]) { http_resp_error(resp,400,"missing column"); arena_destroy(a); return; }
+
+    /* find open Table* in hashmap */
+    pthread_mutex_lock(&g_app.tables_mu);
+    Table *tbl = hm_get(&g_app.tables, tname);
+    pthread_mutex_unlock(&g_app.tables_mu);
+    if (!tbl) { http_resp_error(resp,404,"table not found"); arena_destroy(a); return; }
+
+    /* resolve col_idx from catalog schema */
+    Schema *sc = NULL;
+    catalog_get_schema(g_app.catalog, tname, &sc, a);
+    if (!sc) { http_resp_error(resp,500,"no schema"); arena_destroy(a); return; }
+    int col_idx = -1;
+    for (int i = 0; i < sc->ncols; i++) {
+        if (strcasecmp(sc->cols[i].name, col_name) == 0) { col_idx = i; break; }
+    }
+    if (col_idx < 0) { http_resp_error(resp,400,"column not found"); arena_destroy(a); return; }
+    if (sc->cols[col_idx].type != COL_INT64) {
+        http_resp_error(resp,400,"only INT64 columns can be indexed"); arena_destroy(a); return;
+    }
+
+    if (table_create_index(tbl, col_idx, g_app.catalog) != 0) {
+        http_resp_error(resp,500,"index creation failed"); arena_destroy(a); return;
+    }
+    http_resp_json(resp, 200, "{\"ok\":true}");
+    arena_destroy(a);
+}
+
+/* ── GET /api/tables/:name/indexes ── */
+static void h_index_list(HttpReq *req, HttpResp *resp) {
+    const char *tname = hm_get(&req->params, "name");
+    if (!tname) { http_resp_error(resp,400,"missing name"); return; }
+    Arena *a = arena_create(16384);
+    char *json = NULL;
+    if (catalog_list_indexes_json(g_app.catalog, tname, &json, a) != 0 || !json) {
+        http_resp_json(resp, 200, "[]"); arena_destroy(a); return;
+    }
+    http_resp_json(resp, 200, json);
+    arena_destroy(a);
+}
+
 void api_register_routes(Router *r) {
     router_add(r,"GET",  "/",           h_ui_html);
     router_add(r,"GET",  "/style.css",  h_ui_css);
@@ -1985,4 +2150,6 @@ void api_register_routes(Router *r) {
     router_add(r,"GET",    "/api/analytics/results",     h_result_list);
     router_add(r,"GET",    "/api/analytics/results/:id", h_result_get);
     router_add(r,"DELETE", "/api/analytics/results/:id", h_result_delete);
+    router_add(r,"POST",  "/api/tables/:name/indexes",  h_index_create);
+    router_add(r,"GET",   "/api/tables/:name/indexes",  h_index_list);
 }

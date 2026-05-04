@@ -4,7 +4,7 @@ CFLAGS  = -std=c11 -Wall -Wextra -Wpedantic \
            -D_POSIX_C_SOURCE=200809L -D_GNU_SOURCE \
            -Ilib -Ilib/core -Ilib/net -Ilib/storage \
            -Ilib/sql_parser -Ilib/qengine -Ilib/scheduler \
-           -Ilib/observ -Ilib/connector
+           -Ilib/observ -Ilib/connector -Ilib/index
 LDFLAGS = -lpthread -lm -ldl -lsqlite3
 
 # Release flags
@@ -28,7 +28,7 @@ LIBDIR  = $(OUTDIR)/lib
 CORE_SRCS = lib/core/arena.c lib/core/log.c lib/core/hashmap.c \
             lib/core/threadpool.c lib/core/json.c
 NET_SRCS  = lib/net/http.c
-STOR_SRCS = lib/storage/storage.c
+STOR_SRCS = lib/storage/storage.c lib/index/btree.c
 SQL_SRCS  = lib/sql_parser/sql.c
 QE_SRCS   = lib/qengine/qengine.c
 SCHED_SRCS= lib/scheduler/scheduler.c
@@ -61,7 +61,8 @@ dirs:
 	@mkdir -p $(OUTDIR)/lib/core $(OUTDIR)/lib/net $(OUTDIR)/lib/storage \
 	           $(OUTDIR)/lib/sql_parser $(OUTDIR)/lib/qengine \
 	           $(OUTDIR)/lib/scheduler $(OUTDIR)/lib/observ \
-	           $(OUTDIR)/lib/connector $(OUTDIR)/src/gateway
+	           $(OUTDIR)/lib/connector $(OUTDIR)/lib/index \
+	           $(OUTDIR)/src/gateway
 
 # compile rule
 $(OUTDIR)/%.o: %.c
