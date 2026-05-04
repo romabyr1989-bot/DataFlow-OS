@@ -106,6 +106,54 @@ static int topo_sort(Pipeline *p, int *order) {
 }
 
 /* ── JSON serialization ── */
+/* Serialize any JVal back to compact JSON — used to preserve object-valued fields */
+static void jval_write(JBuf *jb, JVal *v) {
+    if (!v) { jb_null(jb); return; }
+    switch (v->type) {
+        case JV_NULL:    jb_null(jb); break;
+        case JV_BOOL:    jb_bool(jb, v->b); break;
+        case JV_NUMBER:  jb_double(jb, v->n); break;
+        case JV_STRING:  jb_strn(jb, v->s, v->len); break;
+        case JV_ARRAY:
+            jb_arr_begin(jb);
+            for (size_t i = 0; i < v->nitems; i++) jval_write(jb, v->items[i]);
+            jb_arr_end(jb);
+            break;
+        case JV_OBJECT:
+            jb_obj_begin(jb);
+            for (size_t i = 0; i < v->nkeys; i++) {
+                jb_key(jb, v->keys[i]);
+                jval_write(jb, v->vals[i]);
+            }
+            jb_obj_end(jb);
+            break;
+        default: jb_null(jb); break;
+    }
+}
+
+static const char *jval_to_json(JVal *v, Arena *a) {
+    if (!v) return "null";
+    JBuf jb; jb_init(&jb, a, 256);
+    jval_write(&jb, v);
+    return jb_done(&jb);
+}
+
+/* Copy JVal field into a fixed-size char buffer.
+ * If the field is a JSON object/array, serialise it back to JSON first. */
+static void copy_jval_str(JVal *v, char *dst, size_t dstsz, Arena *a) {
+    if (!v) { dst[0] = '\0'; return; }
+    if (v->type == JV_STRING) {
+        size_t n = v->len < dstsz-1 ? v->len : dstsz-1;
+        memcpy(dst, v->s, n); dst[n] = '\0';
+    } else if (v->type == JV_OBJECT || v->type == JV_ARRAY) {
+        const char *s = jval_to_json(v, a);
+        strncpy(dst, s, dstsz-1); dst[dstsz-1] = '\0';
+    } else {
+        const char *s = json_str(v, "");
+        strncpy(dst, s, dstsz-1); dst[dstsz-1] = '\0';
+    }
+}
+
 int pipeline_from_json(Pipeline *p, const char *json) {
     Arena *a = arena_create(32768);
     JVal *root = json_parse(a, json, strlen(json));
@@ -125,8 +173,8 @@ int pipeline_from_json(Pipeline *p, const char *json) {
             memset(st,0,sizeof(*st));
             strncpy(st->id,  json_str(json_get(s,"id"),""),  sizeof(st->id)-1);
             strncpy(st->name,json_str(json_get(s,"name"),""),sizeof(st->name)-1);
-            strncpy(st->connector_type,  json_str(json_get(s,"connector_type"),""),  sizeof(st->connector_type)-1);
-            strncpy(st->connector_config,json_str(json_get(s,"connector_config"),""),sizeof(st->connector_config)-1);
+            strncpy(st->connector_type, json_str(json_get(s,"connector_type"),""), sizeof(st->connector_type)-1);
+            copy_jval_str(json_get(s,"connector_config"), st->connector_config, sizeof(st->connector_config), a);
             strncpy(st->transform_sql,   json_str(json_get(s,"transform_sql"),""),   sizeof(st->transform_sql)-1);
             strncpy(st->target_table,    json_str(json_get(s,"target_table"),""),    sizeof(st->target_table)-1);
             JVal *deps=json_get(s,"deps");

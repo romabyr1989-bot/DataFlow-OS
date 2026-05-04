@@ -3,6 +3,7 @@
 #include "../../lib/core/log.h"
 #include "../../lib/sql_parser/sql.h"
 #include "../../lib/storage/storage.h"
+#include "../../lib/connector/connector.h"
 #include <string.h>
 #include <strings.h>
 #include <stdio.h>
@@ -1849,6 +1850,139 @@ static void h_pipeline_get(HttpReq *req, HttpResp *resp) {
     http_resp_json(resp,200,pipeline_to_json(p,a));
 }
 
+/* ── Drop and recreate a target table, return open Table* ── */
+static Table *recreate_table(App *app, Arena *a, const char *tname, Schema *schema) {
+    pthread_mutex_lock(&app->tables_mu);
+    Table *old = hm_get(&app->tables, tname);
+    if (old) { table_close(old); hm_del(&app->tables, tname); }
+    pthread_mutex_unlock(&app->tables_mu);
+
+    catalog_drop_table(app->catalog, tname);
+    char wp[1024], dp[1024];
+    snprintf(dp, sizeof(dp), "%s/%s", app->data_dir, tname);
+    snprintf(wp, sizeof(wp), "%s/wal.bin", dp);
+    unlink(wp); rmdir(dp);
+
+    pthread_mutex_lock(&app->tables_mu);
+    Table *t = table_create(tname, schema, app->data_dir);
+    hm_set(&app->tables, tname, t);
+    pthread_mutex_unlock(&app->tables_mu);
+    catalog_register_table(app->catalog, tname, schema);
+    (void)a;
+    return t;
+}
+
+/* ── Write an RS (result set) into a Table ── */
+static int write_rs_to_table(App *app, Arena *a, const char *tname, RS *rs) {
+    if (!rs || rs->ncols == 0) return 0;
+
+    Schema *schema = arena_calloc(a, sizeof(Schema));
+    schema->ncols = rs->ncols;
+    schema->cols  = arena_alloc(a, (size_t)rs->ncols * sizeof(ColDef));
+    for (int c = 0; c < rs->ncols; c++) {
+        schema->cols[c].name     = rs->col_names[c] ? rs->col_names[c] : "col";
+        schema->cols[c].type     = COL_TEXT;
+        schema->cols[c].nullable = true;
+    }
+    Table *t = recreate_table(app, a, tname, schema);
+
+    char ***cv = arena_alloc(a, (size_t)rs->ncols * sizeof(char **));
+    for (int c = 0; c < rs->ncols; c++)
+        cv[c] = arena_alloc(a, BATCH_SIZE * sizeof(char *));
+    ColBatch batch = {0};
+    batch.schema = schema; batch.ncols = rs->ncols;
+    for (int c = 0; c < rs->ncols; c++) batch.values[c] = cv[c];
+
+    int total = 0;
+    for (int r = 0; r < rs->nrows; r++) {
+        for (int c = 0; c < rs->ncols; c++) {
+            const char *v = rs->rows[r].cells ? rs->rows[r].cells[c] : "";
+            cv[c][batch.nrows] = (char *)(v ? v : "");
+        }
+        if (++batch.nrows == BATCH_SIZE) { table_append(t, &batch); batch.nrows = 0; }
+        total++;
+    }
+    if (batch.nrows > 0) table_append(t, &batch);
+    catalog_update_table_meta(app->catalog, tname, "pipeline", (int64_t)rs->nrows);
+    return total;
+}
+
+/* ── Run one connector step: pull all batches into target_table ── */
+static int run_connector_step(App *app, Arena *a, PipelineStep *st, char *errbuf, size_t errsz) {
+    char so_path[1024];
+    snprintf(so_path, sizeof(so_path), "%s/%s_connector.so",
+             app->plugins_dir, st->connector_type);
+
+    ConnectorInst *inst = connector_load(so_path, st->connector_config, a);
+    if (!inst) {
+        snprintf(errbuf, errsz, "connector_load(%s) failed", so_path);
+        return -1;
+    }
+    const DfoConnector *api = connector_api(inst);
+    void *ctx = connector_ctx(inst);
+
+    /* Determine entity name: if transform_sql is a table name (no spaces), use it;
+     * otherwise pass the full SQL as the filter for the connector to execute */
+    const char *entity = st->transform_sql[0] ? st->transform_sql : "";
+    const char *filter = NULL;
+    /* If the SQL contains spaces it's a query, not a bare table name */
+    if (strchr(entity, ' ')) { filter = entity; entity = ""; }
+
+    /* Describe schema to create the target table correctly */
+    Schema *schema = NULL;
+    if (!filter && entity[0] && api->describe) {
+        api->describe(ctx, a, entity, &schema);
+    }
+
+    /* Create target table (schema may be NULL — will be set from first batch) */
+    Table *t = NULL;
+    bool table_created = false;
+
+    int total_rows = 0;
+    char cursor_buf[32] = "0";
+
+    for (;;) {
+        DfoReadReq req = { .cursor = cursor_buf, .limit = BATCH_SIZE, .filter = filter };
+        ColBatch *batch = NULL;
+        if (api->read_batch(ctx, a, &req, entity, &batch) != 0 || !batch || batch->nrows == 0)
+            break;
+
+        /* Create the table on first non-empty batch */
+        if (!table_created) {
+            Schema *sc = batch->schema ? batch->schema : schema;
+            if (!sc) {
+                /* Build a minimal text schema from batch metadata */
+                sc = arena_calloc(a, sizeof(Schema));
+                sc->ncols = batch->ncols;
+                sc->cols  = arena_alloc(a, (size_t)batch->ncols * sizeof(ColDef));
+                for (int c = 0; c < batch->ncols; c++) {
+                    sc->cols[c].name     = arena_sprintf(a, "col%d", c);
+                    sc->cols[c].type     = COL_TEXT;
+                    sc->cols[c].nullable = true;
+                }
+            }
+            t = recreate_table(app, a, st->target_table, sc);
+            table_created = true;
+        }
+
+        table_append(t, batch);
+        total_rows += batch->nrows;
+
+        /* Advance cursor */
+        snprintf(cursor_buf, sizeof(cursor_buf), "%d", total_rows);
+
+        /* If batch was smaller than requested, we're done */
+        if (batch->nrows < BATCH_SIZE) break;
+    }
+
+    if (table_created)
+        catalog_update_table_meta(app->catalog, st->target_table, st->connector_type, (int64_t)total_rows);
+
+    connector_unload(inst);
+    LOG_INFO("connector step '%s' → %s: %d rows", st->connector_type, st->target_table, total_rows);
+    return total_rows;
+}
+
 /* ── Execute all steps of a pipeline ── */
 void pipeline_execute_steps(Pipeline *p, App *app) {
     Arena *a = arena_create(4194304); /* 4 MiB */
@@ -1858,9 +1992,25 @@ void pipeline_execute_steps(Pipeline *p, App *app) {
 
     for (int si = 0; si < p->nsteps; si++) {
         PipelineStep *st = &p->steps[si];
+        st->status = STEP_RUNNING;
+
+        if (st->connector_type[0]) {
+            /* ── Connector step: pull from external source ── */
+            int n = run_connector_step(app, a, st, p->error_msg, sizeof(p->error_msg));
+            if (n < 0) {
+                st->status = STEP_FAILED;
+                run_error  = p->error_msg;
+                p->run_status = RUN_FAILED;
+                goto done;
+            }
+            total_rows += n;
+            st->status = STEP_SUCCESS;
+            continue;
+        }
+
         if (!st->transform_sql[0]) { st->status = STEP_SUCCESS; continue; }
 
-        st->status = STEP_RUNNING;
+        /* ── SQL transform step ── */
         Stmt *stmt = sql_parse(a, st->transform_sql, strlen(st->transform_sql));
         if (stmt->error) {
             st->status = STEP_FAILED;
@@ -1879,55 +2029,9 @@ void pipeline_execute_steps(Pipeline *p, App *app) {
             goto done;
         }
 
-        /* write results to target_table if specified */
-        if (st->target_table[0] && rs->ncols > 0) {
-            /* drop+recreate for idempotency */
-            pthread_mutex_lock(&app->tables_mu);
-            Table *old = hm_get(&app->tables, st->target_table);
-            if (old) { table_close(old); hm_del(&app->tables, st->target_table); }
-            pthread_mutex_unlock(&app->tables_mu);
-            catalog_drop_table(app->catalog, st->target_table);
-            char wp[1024], dp[1024];
-            snprintf(dp, sizeof(dp), "%s/%s", app->data_dir, st->target_table);
-            snprintf(wp, sizeof(wp), "%s/wal.bin", dp);
-            unlink(wp); rmdir(dp);
+        if (st->target_table[0])
+            total_rows += write_rs_to_table(app, a, st->target_table, rs);
 
-            Schema *schema = arena_calloc(a, sizeof(Schema));
-            schema->ncols = rs->ncols;
-            schema->cols  = arena_alloc(a, rs->ncols * sizeof(ColDef));
-            for (int c = 0; c < rs->ncols; c++) {
-                schema->cols[c].name     = rs->col_names[c] ? rs->col_names[c] : "col";
-                schema->cols[c].type     = COL_TEXT;
-                schema->cols[c].nullable = true;
-            }
-
-            pthread_mutex_lock(&app->tables_mu);
-            Table *t = table_create(st->target_table, schema, app->data_dir);
-            hm_set(&app->tables, st->target_table, t);
-            pthread_mutex_unlock(&app->tables_mu);
-            catalog_register_table(app->catalog, st->target_table, schema);
-
-            /* write in BATCH_SIZE chunks */
-            char ***cv = arena_alloc(a, rs->ncols * sizeof(char **));
-            for (int c = 0; c < rs->ncols; c++)
-                cv[c] = arena_alloc(a, BATCH_SIZE * sizeof(char *));
-            ColBatch batch = {0};
-            batch.schema = schema; batch.ncols = rs->ncols;
-            for (int c = 0; c < rs->ncols; c++) batch.values[c] = cv[c];
-
-            for (int r = 0; r < rs->nrows; r++) {
-                for (int c = 0; c < rs->ncols; c++) {
-                    const char *v = rs->rows[r].cells ? rs->rows[r].cells[c] : "";
-                    cv[c][batch.nrows] = (char *)(v ? v : "");
-                }
-                if (++batch.nrows == BATCH_SIZE) {
-                    table_append(t, &batch); batch.nrows = 0;
-                }
-                total_rows++;
-            }
-            if (batch.nrows > 0) table_append(t, &batch);
-            catalog_update_table_meta(app->catalog, st->target_table, "pipeline", (int64_t)rs->nrows);
-        }
         st->status = STEP_SUCCESS;
     }
     p->run_status = RUN_SUCCESS;
@@ -2129,6 +2233,137 @@ static void h_index_list(HttpReq *req, HttpResp *resp) {
     arena_destroy(a);
 }
 
+/* ─────────────────────────────────────────────────────────────────────
+   Connector probe endpoints — test a connector config from the UI
+   POST /api/connector/probe/entities
+     Body: {"type":"postgresql","config":{...}}
+   POST /api/connector/probe/schema
+     Body: {"type":"postgresql","config":{...},"entity":"users"}
+   ───────────────────────────────────────────────────────────────────── */
+
+/* Load connector by type name → ConnectorInst* (caller must unload) */
+static ConnectorInst *load_connector_by_type(Arena *a, const char *type,
+                                               const char *cfg_json) {
+    char so_path[1024];
+    snprintf(so_path, sizeof(so_path), "%s/%s_connector.so",
+             g_app.plugins_dir, type);
+    return connector_load(so_path, cfg_json, a);
+}
+
+static void h_connector_probe_entities(HttpReq *req, HttpResp *resp) {
+    Arena *a = arena_create(65536);
+    JVal *root = json_parse(a, req->body, req->body_len);
+    if (!root) { http_resp_error(resp,400,"invalid json"); arena_destroy(a); return; }
+
+    const char *type = json_str(json_get(root,"type"), "");
+    if (!type[0]) { http_resp_error(resp,400,"missing type"); arena_destroy(a); return; }
+
+    /* config may be object or string */
+    JVal *cfg_v = json_get(root,"config");
+    const char *cfg_json = "{}";
+    if (cfg_v) {
+        if (cfg_v->type == JV_STRING) {
+            cfg_json = json_str(cfg_v, "{}");
+        } else if (cfg_v->type == JV_OBJECT) {
+            /* Serialize object back to JSON string */
+            JBuf jb; jb_init(&jb, a, 512);
+            jb_obj_begin(&jb);
+            for (size_t i = 0; i < cfg_v->nkeys; i++) {
+                jb_key(&jb, cfg_v->keys[i]);
+                JVal *vv = cfg_v->vals[i];
+                if (vv->type == JV_STRING)       jb_strn(&jb, vv->s, vv->len);
+                else if (vv->type == JV_NUMBER)  jb_double(&jb, vv->n);
+                else if (vv->type == JV_BOOL)    jb_bool(&jb, vv->b);
+                else                             jb_null(&jb);
+            }
+            jb_obj_end(&jb);
+            cfg_json = jb_done(&jb);
+        }
+    }
+
+    ConnectorInst *inst = load_connector_by_type(a, type, cfg_json);
+    if (!inst) { http_resp_error(resp,500,"connector load failed"); arena_destroy(a); return; }
+
+    DfoEntityList el = {0};
+    if (connector_api(inst)->list_entities(connector_ctx(inst), a, &el) != 0) {
+        connector_unload(inst);
+        http_resp_error(resp,500,"list_entities failed"); arena_destroy(a); return;
+    }
+
+    JBuf jb; jb_init(&jb, a, 1024);
+    jb_arr_begin(&jb);
+    for (int i = 0; i < el.count; i++) {
+        jb_obj_begin(&jb);
+        jb_key(&jb,"name"); jb_str(&jb, el.items[i].entity);
+        jb_key(&jb,"type"); jb_str(&jb, el.items[i].type);
+        jb_obj_end(&jb);
+    }
+    jb_arr_end(&jb);
+
+    connector_unload(inst);
+    http_resp_json(resp, 200, (char *)jb_done(&jb));
+    arena_destroy(a);
+}
+
+static void h_connector_probe_schema(HttpReq *req, HttpResp *resp) {
+    Arena *a = arena_create(65536);
+    JVal *root = json_parse(a, req->body, req->body_len);
+    if (!root) { http_resp_error(resp,400,"invalid json"); arena_destroy(a); return; }
+
+    const char *type   = json_str(json_get(root,"type"), "");
+    const char *entity = json_str(json_get(root,"entity"), "");
+    if (!type[0] || !entity[0]) {
+        http_resp_error(resp,400,"missing type or entity"); arena_destroy(a); return;
+    }
+
+    JVal *cfg_v = json_get(root,"config");
+    const char *cfg_json = "{}";
+    if (cfg_v && cfg_v->type == JV_OBJECT) {
+        JBuf jb; jb_init(&jb, a, 512);
+        jb_obj_begin(&jb);
+        for (size_t i = 0; i < cfg_v->nkeys; i++) {
+            jb_key(&jb, cfg_v->keys[i]);
+            JVal *vv = cfg_v->vals[i];
+            if (vv->type == JV_STRING)       jb_strn(&jb, vv->s, vv->len);
+            else if (vv->type == JV_NUMBER)  jb_double(&jb, vv->n);
+            else if (vv->type == JV_BOOL)    jb_bool(&jb, vv->b);
+            else                             jb_null(&jb);
+        }
+        jb_obj_end(&jb);
+        cfg_json = jb_done(&jb);
+    } else if (cfg_v && cfg_v->type == JV_STRING) {
+        cfg_json = json_str(cfg_v, "{}");
+    }
+
+    ConnectorInst *inst = load_connector_by_type(a, type, cfg_json);
+    if (!inst) { http_resp_error(resp,500,"connector load failed"); arena_destroy(a); return; }
+
+    Schema *sc = NULL;
+    if (connector_api(inst)->describe(connector_ctx(inst), a, entity, &sc) != 0 || !sc) {
+        connector_unload(inst);
+        http_resp_error(resp,500,"describe failed"); arena_destroy(a); return;
+    }
+
+    JBuf jb; jb_init(&jb, a, 1024);
+    jb_obj_begin(&jb);
+    jb_key(&jb,"entity"); jb_str(&jb, entity);
+    jb_key(&jb,"columns"); jb_arr_begin(&jb);
+    static const char *type_names[] = {"int64","double","text","bool","null"};
+    for (int c = 0; c < sc->ncols; c++) {
+        jb_obj_begin(&jb);
+        jb_key(&jb,"name");     jb_str(&jb, sc->cols[c].name);
+        jb_key(&jb,"type");     jb_str(&jb, type_names[sc->cols[c].type]);
+        jb_key(&jb,"nullable"); jb_bool(&jb, sc->cols[c].nullable);
+        jb_obj_end(&jb);
+    }
+    jb_arr_end(&jb);
+    jb_obj_end(&jb);
+
+    connector_unload(inst);
+    http_resp_json(resp, 200, (char *)jb_done(&jb));
+    arena_destroy(a);
+}
+
 void api_register_routes(Router *r) {
     router_add(r,"GET",  "/",           h_ui_html);
     router_add(r,"GET",  "/style.css",  h_ui_css);
@@ -2152,4 +2387,6 @@ void api_register_routes(Router *r) {
     router_add(r,"DELETE", "/api/analytics/results/:id", h_result_delete);
     router_add(r,"POST",  "/api/tables/:name/indexes",  h_index_create);
     router_add(r,"GET",   "/api/tables/:name/indexes",  h_index_list);
+    router_add(r,"POST",  "/api/connector/probe/entities", h_connector_probe_entities);
+    router_add(r,"POST",  "/api/connector/probe/schema",   h_connector_probe_schema);
 }

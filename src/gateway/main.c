@@ -51,8 +51,9 @@ static void on_pipeline_run(Pipeline *p, void *ud) {
 
 void app_init(App *app, const char *config_json) {
     memset(app, 0, sizeof(App));
-    strncpy(app->data_dir, DATA_DIR_DEFAULT, sizeof(app->data_dir)-1);
-    strncpy(app->db_path,  DB_PATH_DEFAULT,  sizeof(app->db_path)-1);
+    strncpy(app->data_dir,    DATA_DIR_DEFAULT,    sizeof(app->data_dir)-1);
+    strncpy(app->db_path,     DB_PATH_DEFAULT,     sizeof(app->db_path)-1);
+    strncpy(app->plugins_dir, "./build/release/lib", sizeof(app->plugins_dir)-1);
     app->port = DEFAULT_PORT;
 
     /* parse config */
@@ -62,6 +63,8 @@ void app_init(App *app, const char *config_json) {
         if(cfg&&cfg->type==JV_OBJECT){
             const char *dp=json_str(json_get(cfg,"data_dir"),NULL);
             if(dp) strncpy(app->data_dir,dp,sizeof(app->data_dir)-1);
+            const char *pd=json_str(json_get(cfg,"plugins_dir"),NULL);
+            if(pd) strncpy(app->plugins_dir,pd,sizeof(app->plugins_dir)-1);
             int port=(int)json_int(json_get(cfg,"port"),0);
             if(port>0) app->port=port;
         }

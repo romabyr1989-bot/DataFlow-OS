@@ -45,10 +45,29 @@ ALL_OBJS  = $(patsubst %.c,$(OUTDIR)/%.o,$(ALL_LIB_SRCS) $(GW_SRCS))
 
 GATEWAY   = $(BINDIR)/dfo_gateway
 CSV_PLUGIN= $(LIBDIR)/csv_connector.so
+PG_PLUGIN = $(LIBDIR)/pg_connector.so
+
+# Detect libpq — homebrew keg-only or pkg-config
+_LIBPQ_LOCAL := $(shell test -d /usr/local/opt/libpq/include && echo /usr/local/opt/libpq)
+_LIBPQ_BREW  := $(shell test -d /opt/homebrew/opt/libpq/include && echo /opt/homebrew/opt/libpq)
+LIBPQ_PREFIX := $(or $(_LIBPQ_LOCAL),$(_LIBPQ_BREW))
+ifneq ($(LIBPQ_PREFIX),)
+  PGCFLAGS  = -I$(LIBPQ_PREFIX)/include
+  PGLDFLAGS = -L$(LIBPQ_PREFIX)/lib -lpq
+  HAS_PQ    = yes
+else
+  PGCFLAGS  := $(shell pkg-config --cflags libpq 2>/dev/null)
+  PGLDFLAGS := $(shell pkg-config --libs libpq 2>/dev/null)
+  HAS_PQ    := $(if $(PGLDFLAGS),yes,no)
+endif
 
 .PHONY: all clean run test dirs release debug
 
+ifeq ($(HAS_PQ),yes)
+all: dirs $(GATEWAY) $(CSV_PLUGIN) $(PG_PLUGIN)
+else
 all: dirs $(GATEWAY) $(CSV_PLUGIN)
+endif
 
 release:
 	$(MAKE) BUILD=release all
@@ -80,6 +99,15 @@ $(CSV_PLUGIN): lib/connector/plugins/csv/csv_connector.c \
                $(OUTDIR)/lib/storage/storage.o
 	@echo "  SO  $@"
 	@$(CC) $(CFLAGS) -shared -fPIC $^ -o $@ $(LDFLAGS) \
+	    $(if $(filter Darwin,$(shell uname)),-undefined dynamic_lookup,)
+
+# PostgreSQL connector shared library (requires libpq)
+$(PG_PLUGIN): lib/connector/plugins/pg/pg_connector.c \
+              $(OUTDIR)/lib/core/arena.o \
+              $(OUTDIR)/lib/storage/storage.o \
+              $(OUTDIR)/lib/core/log.o
+	@echo "  SO  $@"
+	@$(CC) $(CFLAGS) $(PGCFLAGS) -shared -fPIC $^ -o $@ $(LDFLAGS) $(PGLDFLAGS) \
 	    $(if $(filter Darwin,$(shell uname)),-undefined dynamic_lookup,)
 
 # ── Tests ──

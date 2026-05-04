@@ -31,6 +31,7 @@ typedef struct {
     /* config */
     char        data_dir[512];
     char        db_path[512];
+    char        plugins_dir[512];  /* directory containing *_connector.so files */
     int         port;
 
     /* server */
