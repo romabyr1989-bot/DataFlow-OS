@@ -1,0 +1,824 @@
+#include "sql.h"
+#include <string.h>
+#include <stdlib.h>
+#include <stdio.h>
+#include <ctype.h>
+
+/* ── Lexer ── */
+typedef enum {
+    TK_EOF, TK_IDENT, TK_NUM_INT, TK_NUM_FLOAT, TK_STRING,
+    TK_STAR, TK_COMMA, TK_DOT, TK_LPAREN, TK_RPAREN,
+    TK_EQ, TK_NE, TK_LT, TK_LE, TK_GT, TK_GE,
+    TK_AND, TK_OR, TK_NOT,
+    TK_PLUS, TK_MINUS, TK_SLASH, TK_PERCENT, TK_CONCAT,
+    TK_SEMICOLON, TK_ERROR,
+    /* keywords */
+    TK_SELECT, TK_FROM, TK_WHERE, TK_GROUP, TK_BY, TK_HAVING,
+    TK_ORDER, TK_LIMIT, TK_OFFSET, TK_AS, TK_JOIN, TK_LEFT,
+    TK_RIGHT, TK_FULL, TK_INNER, TK_OUTER, TK_ON, TK_DISTINCT,
+    TK_INSERT, TK_INTO, TK_VALUES,
+    TK_NULL, TK_TRUE, TK_FALSE,
+    TK_IS, TK_LIKE, TK_ILIKE, TK_IN, TK_BETWEEN, TK_ASC, TK_DESC,
+    TK_CASE, TK_WHEN, TK_THEN, TK_ELSE, TK_END,
+    TK_UNION, TK_INTERSECT, TK_EXCEPT, TK_ALL, TK_CROSS,
+    TK_WITH, TK_RECURSIVE,
+    TK_NULLS, TK_FIRST, TK_LAST,
+    TK_EXISTS, TK_CAST
+} TkType;
+
+typedef struct { TkType type; const char *start; size_t len; int64_t ival; double fval; } Token;
+
+typedef struct {
+    const char *src; size_t pos, len;
+    Token       peek;
+    bool        has_peek;
+    Arena      *a;
+} Lexer;
+
+static struct { const char *kw; TkType tk; } KEYWORDS[] = {
+    {"SELECT",TK_SELECT},{"FROM",TK_FROM},{"WHERE",TK_WHERE},{"GROUP",TK_GROUP},
+    {"BY",TK_BY},{"HAVING",TK_HAVING},{"ORDER",TK_ORDER},{"LIMIT",TK_LIMIT},
+    {"OFFSET",TK_OFFSET},{"AS",TK_AS},{"JOIN",TK_JOIN},{"LEFT",TK_LEFT},
+    {"RIGHT",TK_RIGHT},{"FULL",TK_FULL},{"INNER",TK_INNER},{"OUTER",TK_OUTER},
+    {"ON",TK_ON},{"DISTINCT",TK_DISTINCT},{"INSERT",TK_INSERT},{"INTO",TK_INTO},
+    {"VALUES",TK_VALUES},{"NULL",TK_NULL},{"TRUE",TK_TRUE},{"FALSE",TK_FALSE},
+    {"IS",TK_IS},{"LIKE",TK_LIKE},{"ILIKE",TK_ILIKE},{"IN",TK_IN},
+    {"BETWEEN",TK_BETWEEN},{"AND",TK_AND},{"OR",TK_OR},{"NOT",TK_NOT},
+    {"ASC",TK_ASC},{"DESC",TK_DESC},
+    {"CASE",TK_CASE},{"WHEN",TK_WHEN},{"THEN",TK_THEN},{"ELSE",TK_ELSE},{"END",TK_END},
+    {"UNION",TK_UNION},{"INTERSECT",TK_INTERSECT},{"EXCEPT",TK_EXCEPT},{"ALL",TK_ALL},
+    {"CROSS",TK_CROSS},{"WITH",TK_WITH},{"RECURSIVE",TK_RECURSIVE},
+    {"NULLS",TK_NULLS},{"FIRST",TK_FIRST},{"LAST",TK_LAST},
+    {"EXISTS",TK_EXISTS},{"CAST",TK_CAST},
+    {NULL,TK_EOF}
+};
+
+static Token lex_next(Lexer *l) {
+    while (l->pos < l->len && isspace((unsigned char)l->src[l->pos])) l->pos++;
+    if (l->pos >= l->len) return (Token){TK_EOF};
+    char c = l->src[l->pos];
+    switch(c) {
+        case '*': l->pos++; return (Token){TK_STAR};
+        case ',': l->pos++; return (Token){TK_COMMA};
+        case '.': l->pos++; return (Token){TK_DOT};
+        case '(': l->pos++; return (Token){TK_LPAREN};
+        case ')': l->pos++; return (Token){TK_RPAREN};
+        case '+': l->pos++; return (Token){TK_PLUS};
+        case '-': l->pos++;
+            /* -- comment: skip to end of line */
+            if (l->pos < l->len && l->src[l->pos] == '-') {
+                while (l->pos < l->len && l->src[l->pos] != '\n') l->pos++;
+                return lex_next(l);
+            }
+            return (Token){TK_MINUS};
+        case '/': l->pos++;
+            /* /* block comment */
+            if (l->pos < l->len && l->src[l->pos] == '*') {
+                l->pos++;
+                while (l->pos + 1 < l->len && !(l->src[l->pos]=='*' && l->src[l->pos+1]=='/')) l->pos++;
+                if (l->pos + 1 < l->len) l->pos += 2;
+                return lex_next(l);
+            }
+            return (Token){TK_SLASH};
+        case '%': l->pos++; return (Token){TK_PERCENT};
+        case ';': l->pos++; return (Token){TK_SEMICOLON};
+        case '=': l->pos++; return (Token){TK_EQ};
+        case '<': l->pos++;
+            if (l->pos<l->len&&l->src[l->pos]=='='){l->pos++;return (Token){TK_LE};}
+            if (l->pos<l->len&&l->src[l->pos]=='>'){l->pos++;return (Token){TK_NE};}
+            return (Token){TK_LT};
+        case '>': l->pos++;
+            if (l->pos<l->len&&l->src[l->pos]=='='){l->pos++;return (Token){TK_GE};}
+            return (Token){TK_GT};
+        case '!': l->pos++;
+            if (l->pos<l->len&&l->src[l->pos]=='='){l->pos++;return (Token){TK_NE};}
+            return (Token){TK_ERROR};
+        case '|': l->pos++;
+            if (l->pos<l->len&&l->src[l->pos]=='|'){l->pos++;return (Token){TK_CONCAT};}
+            return (Token){TK_ERROR};
+    }
+    /* quoted identifier */
+    if (c == '"' || c == '`') {
+        char close = (c == '"') ? '"' : '`';
+        l->pos++;
+        size_t s = l->pos;
+        while (l->pos < l->len && l->src[l->pos] != close) l->pos++;
+        Token t = {TK_IDENT, l->src+s, l->pos-s};
+        if (l->pos < l->len) l->pos++;
+        return t;
+    }
+    /* string literal — handles '' escape */
+    if (c == '\'') {
+        l->pos++;
+        size_t s = l->pos;
+        while (l->pos < l->len) {
+            if (l->src[l->pos] == '\'') {
+                if (l->pos+1 < l->len && l->src[l->pos+1] == '\'') { l->pos += 2; continue; }
+                break;
+            }
+            l->pos++;
+        }
+        Token t = {TK_STRING, l->src+s, l->pos-s};
+        if (l->pos < l->len) l->pos++;
+        return t;
+    }
+    /* number */
+    if (isdigit((unsigned char)c)) {
+        size_t s = l->pos;
+        bool has_dot = false;
+        while (l->pos<l->len && (isdigit((unsigned char)l->src[l->pos])||l->src[l->pos]=='.')) {
+            if (l->src[l->pos]=='.') { if (has_dot) break; has_dot=true; }
+            l->pos++;
+        }
+        /* optional E notation */
+        if (l->pos < l->len && (l->src[l->pos]=='e'||l->src[l->pos]=='E')) {
+            has_dot = true; l->pos++;
+            if (l->pos < l->len && (l->src[l->pos]=='+'||l->src[l->pos]=='-')) l->pos++;
+            while (l->pos < l->len && isdigit((unsigned char)l->src[l->pos])) l->pos++;
+        }
+        Token t = {has_dot?TK_NUM_FLOAT:TK_NUM_INT, l->src+s, l->pos-s};
+        if (has_dot) t.fval = strtod(l->src+s, NULL);
+        else t.ival = strtoll(l->src+s, NULL, 10);
+        return t;
+    }
+    /* identifier or keyword */
+    if (isalpha((unsigned char)c) || c == '_') {
+        size_t s = l->pos;
+        while (l->pos<l->len && (isalnum((unsigned char)l->src[l->pos])||l->src[l->pos]=='_')) l->pos++;
+        size_t klen = l->pos - s;
+        char up[128]; size_t ul = klen<127?klen:127;
+        for (size_t i=0;i<ul;i++) up[i]=toupper((unsigned char)l->src[s+i]);
+        up[ul]='\0';
+        for (int i=0; KEYWORDS[i].kw; i++)
+            if (strcmp(KEYWORDS[i].kw, up)==0) return (Token){KEYWORDS[i].tk, l->src+s, klen};
+        return (Token){TK_IDENT, l->src+s, klen};
+    }
+    l->pos++; return (Token){TK_ERROR};
+}
+
+static Token lex_peek(Lexer *l) {
+    if (!l->has_peek) { l->peek = lex_next(l); l->has_peek = true; }
+    return l->peek;
+}
+static Token lex_consume(Lexer *l) {
+    if (l->has_peek) { l->has_peek=false; return l->peek; }
+    return lex_next(l);
+}
+static bool lex_eat(Lexer *l, TkType t) {
+    if (lex_peek(l).type == t) { lex_consume(l); return true; }
+    return false;
+}
+static bool lex_peek_is(Lexer *l, TkType t) {
+    return lex_peek(l).type == t;
+}
+
+/* forward declarations */
+static Expr *parse_expr(Lexer *l, int prec);
+static Stmt *parse_stmt(Lexer *l);
+
+/* ── Parser ── */
+static Expr *parse_primary(Lexer *l) {
+    Token t = lex_peek(l);
+    Expr *e = arena_calloc(l->a, sizeof(Expr));
+
+    /* CASE WHEN ... THEN ... [ELSE ...] END */
+    if (t.type == TK_CASE) {
+        lex_consume(l);
+        e->type = EXPR_CASE;
+        /* simple CASE x WHEN val ... vs searched CASE WHEN cond ... */
+        if (!lex_peek_is(l, TK_WHEN)) {
+            e->case_op = parse_expr(l, 0);
+        }
+        int cap = 4;
+        e->whens = arena_alloc(l->a, cap * sizeof(Expr*));
+        e->thens = arena_alloc(l->a, cap * sizeof(Expr*));
+        e->nwhens = 0;
+        while (lex_eat(l, TK_WHEN)) {
+            if (e->nwhens == cap) {
+                cap *= 2;
+                Expr **nw = arena_alloc(l->a, cap*sizeof(Expr*));
+                Expr **nt = arena_alloc(l->a, cap*sizeof(Expr*));
+                memcpy(nw, e->whens, e->nwhens*sizeof(Expr*));
+                memcpy(nt, e->thens, e->nwhens*sizeof(Expr*));
+                e->whens = nw; e->thens = nt;
+            }
+            e->whens[e->nwhens] = parse_expr(l, 0);
+            lex_eat(l, TK_THEN);
+            e->thens[e->nwhens] = parse_expr(l, 0);
+            e->nwhens++;
+        }
+        if (lex_eat(l, TK_ELSE)) e->else_expr = parse_expr(l, 0);
+        lex_eat(l, TK_END);
+        return e;
+    }
+
+    /* EXISTS (subquery) */
+    if (t.type == TK_EXISTS) {
+        lex_consume(l);
+        lex_eat(l, TK_LPAREN);
+        Stmt *sub = parse_stmt(l);
+        lex_eat(l, TK_RPAREN);
+        e->type = EXPR_FUNC;
+        e->func_name = "exists";
+        e->args = arena_alloc(l->a, sizeof(Expr*));
+        Expr *se = arena_calloc(l->a, sizeof(Expr));
+        se->type = EXPR_SUBQUERY; se->subq = sub;
+        e->args[0] = se; e->nargs = 1;
+        return e;
+    }
+
+    /* CAST(expr AS type) */
+    if (t.type == TK_CAST) {
+        lex_consume(l);
+        lex_eat(l, TK_LPAREN);
+        Expr *inner = parse_expr(l, 0);
+        lex_eat(l, TK_AS);
+        /* consume type name (may be multi-word: DOUBLE PRECISION, CHARACTER VARYING) */
+        char type_buf[64]; type_buf[0]='\0';
+        while (lex_peek_is(l, TK_IDENT)) {
+            Token tt = lex_peek(l);
+            if (tt.type != TK_IDENT) break;
+            lex_consume(l);
+            if (type_buf[0]) strncat(type_buf, "_", sizeof(type_buf)-strlen(type_buf)-1);
+            size_t tl = tt.len < 32 ? tt.len : 31;
+            strncat(type_buf, tt.start, tl < sizeof(type_buf)-strlen(type_buf)-1 ? tl : sizeof(type_buf)-strlen(type_buf)-1);
+            break; /* just consume first word for simplicity */
+        }
+        lex_eat(l, TK_RPAREN);
+        e->type = EXPR_FUNC;
+        e->func_name = "cast";
+        e->args = arena_alloc(l->a, 2*sizeof(Expr*));
+        e->args[0] = inner;
+        Expr *te = arena_calloc(l->a, sizeof(Expr));
+        te->type = EXPR_LITERAL_STR;
+        te->sval = arena_strdup(l->a, type_buf);
+        e->args[1] = te; e->nargs = 2;
+        return e;
+    }
+
+    lex_consume(l);
+
+    switch (t.type) {
+        case TK_NUM_INT:   e->type=EXPR_LITERAL_INT; e->ival=t.ival; return e;
+        case TK_NUM_FLOAT: e->type=EXPR_LITERAL_FLOAT; e->fval=t.fval; return e;
+        case TK_STRING:    e->type=EXPR_LITERAL_STR; e->sval=arena_strndup(l->a,t.start,t.len); return e;
+        case TK_NULL:      e->type=EXPR_LITERAL_NULL; return e;
+        case TK_TRUE:      e->type=EXPR_LITERAL_BOOL; e->bval=true; return e;
+        case TK_FALSE:     e->type=EXPR_LITERAL_BOOL; e->bval=false; return e;
+        case TK_STAR:      e->type=EXPR_STAR; return e;
+        case TK_MINUS: {
+            Expr *inner = parse_primary(l);
+            e->type=EXPR_UNOP; e->op=OP_SUB; e->left=inner; return e;
+        }
+        case TK_NOT: {
+            Expr *inner = parse_primary(l);
+            e->type=EXPR_UNOP; e->op=OP_NOT; e->left=inner; return e;
+        }
+        case TK_LPAREN: {
+            /* subquery or parenthesized expression */
+            if (lex_peek_is(l, TK_SELECT) || lex_peek_is(l, TK_WITH)) {
+                Stmt *sub = parse_stmt(l);
+                lex_eat(l, TK_RPAREN);
+                e->type = EXPR_SUBQUERY; e->subq = sub; return e;
+            }
+            Expr *inner = parse_expr(l, 0);
+            lex_eat(l, TK_RPAREN);
+            return inner;
+        }
+        case TK_IDENT: {
+            char *name = arena_strndup(l->a, t.start, t.len);
+            /* function call? */
+            if (lex_peek_is(l, TK_LPAREN)) {
+                lex_consume(l);
+                e->type = EXPR_FUNC; e->func_name = name;
+                int cap=4; e->args=arena_alloc(l->a,cap*sizeof(Expr*)); e->nargs=0;
+                if (!lex_peek_is(l, TK_RPAREN) && !lex_peek_is(l, TK_STAR)) {
+                    do {
+                        if (lex_peek_is(l, TK_RPAREN)) break;
+                        if (e->nargs==cap){cap*=2;Expr**nb=arena_alloc(l->a,cap*sizeof(Expr*));memcpy(nb,e->args,e->nargs*sizeof(Expr*));e->args=nb;}
+                        e->args[e->nargs++]=parse_expr(l,0);
+                    } while (lex_eat(l,TK_COMMA));
+                } else if (lex_peek_is(l, TK_STAR)) {
+                    /* COUNT(*) */
+                    lex_consume(l);
+                    Expr *star=arena_calloc(l->a,sizeof(Expr)); star->type=EXPR_STAR;
+                    e->args[e->nargs++]=star;
+                }
+                lex_eat(l, TK_RPAREN);
+                return e;
+            }
+            /* table.col or col */
+            e->type = EXPR_COL;
+            if (lex_peek_is(l, TK_DOT)) {
+                lex_consume(l);
+                Token col = lex_consume(l);
+                e->table = name;
+                e->name  = arena_strndup(l->a, col.start, col.len);
+            } else {
+                e->name = name;
+            }
+            return e;
+        }
+        default:
+            e->type = EXPR_LITERAL_NULL; return e;
+    }
+}
+
+static int binop_prec(TkType t) {
+    switch(t) {
+        case TK_OR:  return 1;
+        case TK_AND: return 2;
+        case TK_NOT: return 3;
+        case TK_EQ: case TK_NE: case TK_LT: case TK_LE: case TK_GT: case TK_GE:
+        case TK_LIKE: case TK_ILIKE: case TK_IS: case TK_IN: case TK_BETWEEN: return 4;
+        case TK_CONCAT: return 5;
+        case TK_PLUS: case TK_MINUS: return 6;
+        case TK_STAR: case TK_SLASH: case TK_PERCENT: return 7;
+        default: return -1;
+    }
+}
+
+static OpType tktype_to_op(TkType t) {
+    switch(t) {
+        case TK_EQ:    return OP_EQ;   case TK_NE:    return OP_NE;
+        case TK_LT:    return OP_LT;   case TK_LE:    return OP_LE;
+        case TK_GT:    return OP_GT;   case TK_GE:    return OP_GE;
+        case TK_AND:   return OP_AND;  case TK_OR:    return OP_OR;
+        case TK_PLUS:  return OP_ADD;  case TK_MINUS: return OP_SUB;
+        case TK_STAR:  return OP_MUL;  case TK_SLASH: return OP_DIV;
+        case TK_PERCENT: return OP_MOD;
+        case TK_LIKE:  return OP_LIKE; case TK_ILIKE: return OP_ILIKE;
+        case TK_IN:    return OP_IN;   case TK_CONCAT: return OP_CONCAT;
+        default: return OP_EQ;
+    }
+}
+
+static Expr *parse_expr(Lexer *l, int min_prec) {
+    Expr *lhs = parse_primary(l);
+    for (;;) {
+        Token pt = lex_peek(l);
+
+        /* IS [NOT] NULL */
+        if (pt.type == TK_IS) {
+            lex_consume(l);
+            bool negate = lex_eat(l, TK_NOT);
+            lex_eat(l, TK_NULL);
+            Expr *e = arena_calloc(l->a, sizeof(Expr));
+            e->type = EXPR_UNOP;
+            e->op   = negate ? OP_IS_NOT_NULL : OP_IS_NULL;
+            e->left = lhs; lhs = e; continue;
+        }
+
+        /* NOT LIKE / NOT ILIKE / NOT BETWEEN / NOT IN */
+        if (pt.type == TK_NOT) {
+            lex_consume(l);
+            Token after = lex_peek(l);
+            if (after.type == TK_LIKE || after.type == TK_ILIKE ||
+                after.type == TK_BETWEEN || after.type == TK_IN) {
+                lex_consume(l);
+                Expr *e = arena_calloc(l->a, sizeof(Expr));
+                if (after.type == TK_LIKE) {
+                    Expr *pat = parse_expr(l, 5);
+                    e->type=EXPR_BINOP; e->op=OP_NOT_LIKE; e->left=lhs; e->right=pat;
+                } else if (after.type == TK_ILIKE) {
+                    Expr *pat = parse_expr(l, 5);
+                    e->type=EXPR_BINOP; e->op=OP_NOT_ILIKE; e->left=lhs; e->right=pat;
+                } else if (after.type == TK_BETWEEN) {
+                    Expr *low = parse_expr(l, 6);
+                    lex_eat(l, TK_AND);
+                    Expr *high = parse_expr(l, 6);
+                    Expr *rng = arena_calloc(l->a, sizeof(Expr));
+                    rng->type=EXPR_BINOP; rng->op=OP_AND; rng->left=low; rng->right=high;
+                    e->type=EXPR_BINOP; e->op=OP_NOT_BETWEEN; e->left=lhs; e->right=rng;
+                } else { /* IN */
+                    lex_eat(l, TK_LPAREN);
+                    Expr *list = arena_calloc(l->a, sizeof(Expr));
+                    list->type = EXPR_LIST;
+                    int cap=4; list->items=arena_alloc(l->a,cap*sizeof(Expr*)); list->nitems=0;
+                    /* could be subquery */
+                    if (lex_peek_is(l, TK_SELECT) || lex_peek_is(l, TK_WITH)) {
+                        Stmt *sub = parse_stmt(l);
+                        list->type = EXPR_SUBQUERY; list->subq = sub;
+                    } else if (!lex_peek_is(l, TK_RPAREN)) {
+                        do {
+                            if (list->nitems==cap){cap*=2;Expr**nb=arena_alloc(l->a,cap*sizeof(Expr*));memcpy(nb,list->items,list->nitems*sizeof(Expr*));list->items=nb;}
+                            list->items[list->nitems++]=parse_expr(l,0);
+                        } while (lex_eat(l,TK_COMMA));
+                    }
+                    lex_eat(l, TK_RPAREN);
+                    e->type=EXPR_BINOP; e->op=OP_NOT_IN; e->left=lhs; e->right=list;
+                }
+                lhs = e; continue;
+            }
+            /* put NOT back as unary on next expr — re-parse as unary */
+            Expr *e = arena_calloc(l->a, sizeof(Expr));
+            Expr *rhs = parse_primary(l);
+            e->type=EXPR_UNOP; e->op=OP_NOT; e->left=rhs;
+            /* wrap: lhs AND NOT rhs? no — this was standalone NOT */
+            /* Actually bare NOT consumed ahead of operator — treat as short-circuit */
+            lhs = e; continue;
+        }
+
+        /* BETWEEN */
+        if (pt.type == TK_BETWEEN) {
+            lex_consume(l);
+            Expr *low  = parse_expr(l, 6);
+            lex_eat(l, TK_AND);
+            Expr *high = parse_expr(l, 6);
+            Expr *e = arena_calloc(l->a, sizeof(Expr));
+            Expr *rng = arena_calloc(l->a, sizeof(Expr));
+            rng->type=EXPR_BINOP; rng->op=OP_AND; rng->left=low; rng->right=high;
+            e->type=EXPR_BINOP; e->op=OP_BETWEEN; e->left=lhs; e->right=rng;
+            lhs = e; continue;
+        }
+
+        /* IN (list | subquery) */
+        if (pt.type == TK_IN) {
+            lex_consume(l);
+            lex_eat(l, TK_LPAREN);
+            Expr *list = arena_calloc(l->a, sizeof(Expr));
+            if (lex_peek_is(l, TK_SELECT) || lex_peek_is(l, TK_WITH)) {
+                Stmt *sub = parse_stmt(l);
+                list->type = EXPR_SUBQUERY; list->subq = sub;
+            } else {
+                list->type = EXPR_LIST;
+                int cap=4; list->items=arena_alloc(l->a,cap*sizeof(Expr*)); list->nitems=0;
+                if (!lex_peek_is(l, TK_RPAREN)) {
+                    do {
+                        if (list->nitems==cap){cap*=2;Expr**nb=arena_alloc(l->a,cap*sizeof(Expr*));memcpy(nb,list->items,list->nitems*sizeof(Expr*));list->items=nb;}
+                        list->items[list->nitems++]=parse_expr(l,0);
+                    } while (lex_eat(l,TK_COMMA));
+                }
+            }
+            lex_eat(l, TK_RPAREN);
+            Expr *e = arena_calloc(l->a, sizeof(Expr));
+            e->type=EXPR_BINOP; e->op=OP_IN; e->left=lhs; e->right=list;
+            lhs = e; continue;
+        }
+
+        int prec = binop_prec(pt.type);
+        if (prec < 0 || prec < min_prec) break;
+        lex_consume(l);
+        Expr *rhs = parse_expr(l, prec + 1);
+        Expr *e = arena_calloc(l->a, sizeof(Expr));
+        e->type = EXPR_BINOP; e->op = tktype_to_op(pt.type);
+        e->left = lhs; e->right = rhs;
+        lhs = e;
+    }
+    return lhs;
+}
+
+static const char *consume_ident(Lexer *l) {
+    Token t = lex_consume(l);
+    if (t.type != TK_IDENT) return "";
+    return arena_strndup(l->a, t.start, t.len);
+}
+
+static Expr *parse_select_expr(Lexer *l) {
+    if (lex_peek_is(l, TK_STAR)) {
+        lex_consume(l);
+        Expr *e=arena_calloc(l->a,sizeof(Expr)); e->type=EXPR_STAR; return e;
+    }
+    /* table.* */
+    if (lex_peek_is(l, TK_IDENT)) {
+        Lexer save = *l;
+        Token id = lex_consume(l);
+        if (lex_peek_is(l, TK_DOT)) {
+            lex_consume(l);
+            if (lex_peek_is(l, TK_STAR)) {
+                lex_consume(l);
+                Expr *e=arena_calloc(l->a,sizeof(Expr)); e->type=EXPR_STAR;
+                e->table = arena_strndup(l->a, id.start, id.len);
+                return e;
+            }
+        }
+        *l = save; /* put back */
+    }
+    Expr *base = parse_expr(l, 0);
+    /* optional alias */
+    TkType pk = lex_peek(l).type;
+    if (pk == TK_AS || (pk == TK_IDENT &&
+        pk != TK_FROM && pk != TK_WHERE && pk != TK_GROUP &&
+        pk != TK_HAVING && pk != TK_ORDER && pk != TK_LIMIT &&
+        pk != TK_OFFSET && pk != TK_UNION && pk != TK_INTERSECT &&
+        pk != TK_EXCEPT && pk != TK_SEMICOLON)) {
+        bool explicit_as = (pk == TK_AS);
+        if (explicit_as || pk == TK_IDENT) {
+            if (explicit_as) lex_consume(l);
+            if (!explicit_as && lex_peek(l).type != TK_IDENT) goto no_alias;
+            Token alias = lex_consume(l);
+            if (alias.type != TK_IDENT && alias.type != TK_STRING) goto no_alias;
+            Expr *e = arena_calloc(l->a, sizeof(Expr));
+            e->type = EXPR_ALIAS; e->expr = base;
+            e->alias = arena_strndup(l->a, alias.start, alias.len);
+            return e;
+        }
+    }
+no_alias:
+    return base;
+}
+
+static SelectStmt parse_select(Lexer *l);
+
+static SelectStmt parse_select(Lexer *l) {
+    SelectStmt s = {0}; s.limit = -1; s.offset = 0;
+    if (lex_eat(l, TK_DISTINCT)) s.distinct = true;
+    else lex_eat(l, TK_ALL);
+
+    /* select list */
+    int cap=8;
+    s.select_list = arena_alloc(l->a, cap*sizeof(Expr*));
+    do {
+        if (s.nselect==cap){cap*=2;Expr**nb=arena_alloc(l->a,cap*sizeof(Expr*));memcpy(nb,s.select_list,s.nselect*sizeof(Expr*));s.select_list=nb;}
+        s.select_list[s.nselect++] = parse_select_expr(l);
+    } while (lex_eat(l, TK_COMMA));
+
+    /* FROM */
+    if (lex_eat(l, TK_FROM)) {
+        int fcap=4; s.from = arena_alloc(l->a, fcap*sizeof(FromItem));
+
+        /* parse first table or derived table */
+        auto_from_item: ;
+        if (s.nfrom==fcap){fcap*=2;FromItem*nb=arena_alloc(l->a,fcap*sizeof(FromItem));memcpy(nb,s.from,s.nfrom*sizeof(FromItem));s.from=nb;}
+        FromItem *fi = &s.from[s.nfrom++];
+        memset(fi, 0, sizeof(*fi)); fi->join_type = JOIN_INNER;
+
+        if (lex_peek_is(l, TK_LPAREN)) {
+            lex_consume(l);
+            if (lex_peek_is(l, TK_SELECT) || lex_peek_is(l, TK_WITH)) {
+                fi->subquery = parse_stmt(l);
+            } else {
+                /* VALUES or other — skip */
+                while (!lex_peek_is(l, TK_RPAREN) && !lex_peek_is(l, TK_EOF)) lex_consume(l);
+            }
+            lex_eat(l, TK_RPAREN);
+        } else {
+            fi->table = consume_ident(l);
+        }
+        if (lex_eat(l, TK_AS)) fi->alias = consume_ident(l);
+        else if (lex_peek_is(l, TK_IDENT)) {
+            TkType pk = lex_peek(l).type;
+            if (pk == TK_IDENT) fi->alias = consume_ident(l);
+        }
+
+        /* comma-separated additional tables (implicit cross join) */
+        while (lex_eat(l, TK_COMMA)) {
+            goto auto_from_item;
+        }
+    }
+
+    /* JOINs */
+    for (;;) {
+        JoinType jt = JOIN_INNER;
+        Token pk = lex_peek(l);
+        if (pk.type==TK_LEFT){lex_consume(l);jt=JOIN_LEFT;lex_eat(l,TK_OUTER);}
+        else if (pk.type==TK_RIGHT){lex_consume(l);jt=JOIN_RIGHT;lex_eat(l,TK_OUTER);}
+        else if (pk.type==TK_FULL){lex_consume(l);jt=JOIN_FULL;lex_eat(l,TK_OUTER);}
+        else if (pk.type==TK_CROSS){lex_consume(l);jt=JOIN_CROSS;}
+        else if (pk.type==TK_INNER){lex_consume(l);}
+        else if (pk.type!=TK_JOIN) break;
+        if (!lex_eat(l,TK_JOIN)) break;
+
+        int fcap=s.nfrom+1;
+        FromItem *nb=arena_alloc(l->a,fcap*sizeof(FromItem));
+        memcpy(nb,s.from,s.nfrom*sizeof(FromItem));
+        s.from=nb;
+        FromItem *fi=&s.from[s.nfrom++]; memset(fi,0,sizeof(*fi));
+        fi->join_type=jt;
+
+        if (lex_peek_is(l, TK_LPAREN)) {
+            lex_consume(l);
+            if (lex_peek_is(l, TK_SELECT)||lex_peek_is(l, TK_WITH)) {
+                fi->subquery = parse_stmt(l);
+            } else {
+                while (!lex_peek_is(l, TK_RPAREN)&&!lex_peek_is(l,TK_EOF)) lex_consume(l);
+            }
+            lex_eat(l, TK_RPAREN);
+        } else {
+            fi->table = consume_ident(l);
+        }
+        if (lex_eat(l,TK_AS)) fi->alias=consume_ident(l);
+        else if (lex_peek_is(l,TK_IDENT)) fi->alias=consume_ident(l);
+
+        if (lex_eat(l,TK_ON)) fi->on=parse_expr(l,0);
+        /* USING (...) — simplified: ignore */
+    }
+
+    /* WHERE */
+    if (lex_eat(l, TK_WHERE)) s.where=parse_expr(l,0);
+
+    /* GROUP BY */
+    if (lex_peek_is(l,TK_GROUP)){
+        lex_consume(l); lex_eat(l,TK_BY);
+        int gcap=4; s.group_by=arena_alloc(l->a,gcap*sizeof(Expr*));
+        do {
+            if(s.ngroup==gcap){gcap*=2;Expr**nb=arena_alloc(l->a,gcap*sizeof(Expr*));memcpy(nb,s.group_by,s.ngroup*sizeof(Expr*));s.group_by=nb;}
+            s.group_by[s.ngroup++]=parse_expr(l,0);
+        } while(lex_eat(l,TK_COMMA));
+    }
+
+    /* HAVING */
+    if (lex_eat(l,TK_HAVING)) s.having=parse_expr(l,0);
+
+    /* ORDER BY */
+    if (lex_peek_is(l,TK_ORDER)){
+        lex_consume(l); lex_eat(l,TK_BY);
+        int ocap=4; s.order_by=arena_alloc(l->a,ocap*sizeof(OrderItem));
+        do {
+            if(s.norder==ocap){ocap*=2;OrderItem*nb=arena_alloc(l->a,ocap*sizeof(OrderItem));memcpy(nb,s.order_by,s.norder*sizeof(OrderItem));s.order_by=nb;}
+            OrderItem *oi=&s.order_by[s.norder++]; memset(oi,0,sizeof(*oi));
+            oi->expr=parse_expr(l,0);
+            oi->nulls_last = true; /* default */
+            if(lex_peek_is(l,TK_DESC)){lex_consume(l);oi->desc=true;}
+            else lex_eat(l,TK_ASC);
+            if(lex_eat(l,TK_NULLS)){
+                if(lex_eat(l,TK_FIRST)) oi->nulls_last=false;
+                else lex_eat(l,TK_LAST);
+            }
+        } while(lex_eat(l,TK_COMMA));
+    }
+
+    /* LIMIT / OFFSET */
+    if (lex_eat(l,TK_LIMIT)){
+        Token t=lex_consume(l);
+        if(t.type==TK_NUM_INT) s.limit=t.ival;
+        else if(t.type==TK_IDENT && strcmp(t.start,"ALL")==0) s.limit=-1; /* LIMIT ALL */
+    }
+    if (lex_eat(l,TK_OFFSET)){Token t=lex_consume(l);if(t.type==TK_NUM_INT)s.offset=t.ival;}
+    /* also accept: OFFSET n ROWS FETCH NEXT m ROWS ONLY */
+
+    return s;
+}
+
+/* Parse WITH CTEs then SELECT */
+static Stmt *parse_with(Lexer *l) {
+    Stmt *s = arena_calloc(l->a, sizeof(Stmt));
+    lex_eat(l, TK_RECURSIVE); /* optional */
+
+    SelectStmt *sel = &s->select;
+    int ctecap = 4;
+    sel->ctes = arena_alloc(l->a, ctecap * sizeof(CTE));
+    sel->nctes = 0;
+
+    do {
+        if (sel->nctes == ctecap) {
+            ctecap *= 2;
+            CTE *nb = arena_alloc(l->a, ctecap * sizeof(CTE));
+            memcpy(nb, sel->ctes, sel->nctes * sizeof(CTE));
+            sel->ctes = nb;
+        }
+        CTE *cte = &sel->ctes[sel->nctes++];
+        cte->name = consume_ident(l);
+        /* optional column list */
+        if (lex_eat(l, TK_LPAREN)) {
+            while (!lex_peek_is(l,TK_RPAREN)&&!lex_peek_is(l,TK_EOF)) lex_consume(l);
+            lex_eat(l, TK_RPAREN);
+        }
+        lex_eat(l, TK_AS);
+        lex_eat(l, TK_LPAREN);
+        Stmt *body = parse_stmt(l);
+        lex_eat(l, TK_RPAREN);
+        cte->body = (body->type == STMT_SELECT) ? &body->select : NULL;
+    } while (lex_eat(l, TK_COMMA));
+
+    /* Now parse the main SELECT */
+    if (!lex_eat(l, TK_SELECT)) { s->type=STMT_UNKNOWN; s->error="expected SELECT after WITH"; return s; }
+    s->type = STMT_SELECT;
+    SelectStmt main_sel = parse_select(l);
+    /* copy ctes into main_sel */
+    main_sel.ctes = sel->ctes;
+    main_sel.nctes = sel->nctes;
+    s->select = main_sel;
+    return s;
+}
+
+static Stmt *parse_stmt(Lexer *l) {
+    Stmt *s = arena_calloc(l->a, sizeof(Stmt));
+    lex_eat(l, TK_SEMICOLON);
+    Token first = lex_peek(l);
+
+    if (first.type == TK_WITH) {
+        lex_consume(l);
+        return parse_with(l);
+    }
+
+    if (first.type == TK_SELECT) {
+        lex_consume(l);
+        s->type = STMT_SELECT;
+        s->select = parse_select(l);
+    } else {
+        s->type = STMT_UNKNOWN;
+        s->error = "unsupported statement";
+        return s;
+    }
+
+    /* UNION / INTERSECT / EXCEPT */
+    for (;;) {
+        Token pt = lex_peek(l);
+        if (pt.type != TK_UNION && pt.type != TK_INTERSECT && pt.type != TK_EXCEPT) break;
+        lex_consume(l);
+        SetOpType op;
+        if (pt.type == TK_UNION) {
+            op = lex_eat(l, TK_ALL) ? SET_UNION_ALL : SET_UNION;
+        } else if (pt.type == TK_INTERSECT) {
+            op = SET_INTERSECT;
+        } else {
+            op = SET_EXCEPT;
+        }
+        lex_eat(l, TK_SELECT);
+        Stmt *rhs = arena_calloc(l->a, sizeof(Stmt));
+        rhs->type = STMT_SELECT;
+        rhs->select = parse_select(l);
+
+        Stmt *combined = arena_calloc(l->a, sizeof(Stmt));
+        combined->type = STMT_SET_OP;
+        combined->set_op = op;
+        combined->set_left = s;
+        combined->set_right = rhs;
+        s = combined;
+    }
+
+    return s;
+}
+
+Stmt *sql_parse(Arena *a, const char *query, size_t len) {
+    Lexer l = {query, 0, len, {0}, false, a};
+    return parse_stmt(&l);
+}
+
+/* ── Planner ── */
+PlanNode *sql_plan(Arena *a, const Stmt *s) {
+    if (!s) return NULL;
+    if (s->type == STMT_SET_OP) {
+        PlanNode *p = arena_calloc(a, sizeof(PlanNode));
+        p->type = PLAN_SET_OP;
+        p->set_op = s->set_op;
+        p->left  = sql_plan(a, s->set_left);
+        p->right = sql_plan(a, s->set_right);
+        return p;
+    }
+    if (s->type != STMT_SELECT) return NULL;
+    const SelectStmt *sel = &s->select;
+
+    PlanNode *root = NULL;
+    for (int i = 0; i < sel->nfrom; i++) {
+        PlanNode *scan = arena_calloc(a, sizeof(PlanNode));
+        scan->type  = PLAN_SCAN;
+        scan->table = sel->from[i].table ? sel->from[i].table : "";
+        if (!root) { root = scan; continue; }
+        PlanNode *join = arena_calloc(a, sizeof(PlanNode));
+        join->type      = PLAN_JOIN;
+        join->left      = root;
+        join->right     = scan;
+        join->join_type = sel->from[i].join_type;
+        join->join_on   = sel->from[i].on;
+        root = join;
+    }
+    if (!root) { root = arena_calloc(a,sizeof(PlanNode)); root->type=PLAN_SCAN; root->table=""; }
+
+    if (sel->where) {
+        PlanNode *f = arena_calloc(a, sizeof(PlanNode));
+        f->type = PLAN_FILTER; f->predicate = sel->where; f->left = root; root = f;
+    }
+    if (sel->ngroup > 0) {
+        PlanNode *agg = arena_calloc(a, sizeof(PlanNode));
+        agg->type=PLAN_AGG; agg->left=root;
+        agg->group_keys=sel->group_by; agg->ngroup_keys=sel->ngroup;
+        agg->agg_exprs=sel->select_list; agg->nagg_exprs=sel->nselect;
+        root=agg;
+    }
+    if (sel->having) {
+        PlanNode *f=arena_calloc(a,sizeof(PlanNode));
+        f->type=PLAN_FILTER;f->predicate=sel->having;f->left=root;root=f;
+    }
+    if (sel->distinct) {
+        PlanNode *d=arena_calloc(a,sizeof(PlanNode));
+        d->type=PLAN_DISTINCT;d->left=root;root=d;
+    }
+    {
+        PlanNode *p=arena_calloc(a,sizeof(PlanNode));
+        p->type=PLAN_PROJECT;p->exprs=sel->select_list;p->nexprs=sel->nselect;p->left=root;root=p;
+    }
+    if (sel->norder > 0) {
+        PlanNode *srt=arena_calloc(a,sizeof(PlanNode));
+        srt->type=PLAN_SORT;srt->order=sel->order_by;srt->norder=sel->norder;srt->left=root;root=srt;
+    }
+    if (sel->limit >= 0) {
+        PlanNode *lim=arena_calloc(a,sizeof(PlanNode));
+        lim->type=PLAN_LIMIT;lim->limit=sel->limit;lim->offset=sel->offset;lim->left=root;root=lim;
+    }
+    return root;
+}
+
+void stmt_dump(const Stmt *s) {
+    if (!s) { puts("(null stmt)"); return; }
+    if (s->error) { printf("ERROR: %s\n", s->error); return; }
+    if (s->type == STMT_SELECT) {
+        const SelectStmt *sel = &s->select;
+        printf("SELECT %d exprs FROM %d tables WHERE=%s GROUP=%d ORDER=%d LIMIT=%lld\n",
+               sel->nselect, sel->nfrom, sel->where?"yes":"no",
+               sel->ngroup, sel->norder, (long long)sel->limit);
+    } else if (s->type == STMT_SET_OP) {
+        printf("SET_OP %d\n", s->set_op);
+    }
+}

@@ -1,0 +1,59 @@
+#pragma once
+#include "../core/arena.h"
+#include "../core/hashmap.h"
+#include <stddef.h>
+#include <stdbool.h>
+
+#define HTTP_MAX_HEADERS 64
+#define HTTP_MAX_ROUTES  128
+
+/* ── Request ── */
+typedef struct {
+    const char *method;
+    const char *path;
+    const char *query;           /* raw query string after '?' */
+    const char *body;
+    size_t      body_len;
+    HashMap     headers;
+    HashMap     params;          /* URL :param captures */
+    Arena      *arena;
+    int         fd;
+    bool        upgrade_ws;
+} HttpReq;
+
+/* ── Response ── */
+typedef struct {
+    int         status;
+    const char *content_type;
+    const char *body;
+    size_t      body_len;
+    bool        is_ws;
+} HttpResp;
+
+/* ── Router ── */
+typedef void (*HttpHandler)(HttpReq *req, HttpResp *resp);
+
+void http_resp_json(HttpResp *r, int status, const char *json);
+void http_resp_text(HttpResp *r, int status, const char *text);
+void http_resp_error(HttpResp *r, int status, const char *msg);
+
+typedef struct {
+    char        method[8];
+    char        pattern[256];
+    HttpHandler handler;
+} Route;
+
+typedef struct {
+    Route routes[HTTP_MAX_ROUTES];
+    int   nroutes;
+} Router;
+
+void router_add(Router *r, const char *method, const char *pattern, HttpHandler h);
+void router_dispatch(Router *r, HttpReq *req, HttpResp *resp);
+
+/* ── Server ── */
+typedef struct HttpServer HttpServer;
+
+HttpServer *http_server_create(Router *r, int port, int backlog);
+void        http_server_run(HttpServer *s);   /* blocks */
+void        http_server_stop(HttpServer *s);

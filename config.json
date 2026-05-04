@@ -1,0 +1,7 @@
+{
+  "port": 8080,
+  "data_dir": "./data",
+  "log_level": "info",
+  "workers": 4,
+  "connector_dir": "./build/debug/lib"
+}

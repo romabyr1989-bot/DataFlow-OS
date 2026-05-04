@@ -1,0 +1,403 @@
+#include "http.h"
+#include "../core/log.h"
+#include <stdlib.h>
+#include <string.h>
+#include <strings.h>
+#include <stdio.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <errno.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
+#include <signal.h>
+#ifdef __APPLE__
+#  include <sys/event.h>
+#  include <sys/time.h>
+#else
+#  include <sys/epoll.h>
+#endif
+#include <stdarg.h>
+
+/* ── Response helpers ── */
+void http_resp_json(HttpResp *r, int status, const char *json) {
+    r->status = status; r->content_type = "application/json";
+    r->body = json; r->body_len = json ? strlen(json) : 0;
+}
+void http_resp_text(HttpResp *r, int status, const char *text) {
+    r->status = status; r->content_type = "text/plain";
+    r->body = text; r->body_len = text ? strlen(text) : 0;
+}
+void http_resp_error(HttpResp *r, int status, const char *msg) {
+    static _Thread_local char buf[512];
+    snprintf(buf, sizeof(buf), "{\"error\":\"%s\"}", msg ? msg : "internal error");
+    http_resp_json(r, status, buf);
+}
+
+static const char *http_status_text(int code) {
+    switch (code) {
+        case 200: return "OK";
+        case 201: return "Created";
+        case 204: return "No Content";
+        case 400: return "Bad Request";
+        case 401: return "Unauthorized";
+        case 403: return "Forbidden";
+        case 404: return "Not Found";
+        case 409: return "Conflict";
+        case 500: return "Internal Server Error";
+        default:  return "OK";
+    }
+}
+
+/* ── Router ── */
+void router_add(Router *r, const char *method, const char *pattern, HttpHandler h) {
+    if (r->nroutes >= HTTP_MAX_ROUTES) { LOG_ERROR("too many routes"); return; }
+    Route *rt = &r->routes[r->nroutes++];
+    strncpy(rt->method, method, sizeof(rt->method)-1);
+    strncpy(rt->pattern, pattern, sizeof(rt->pattern)-1);
+    rt->handler = h;
+}
+
+static bool route_match(const char *pattern, const char *path, HashMap *params) {
+    /* simple segment match: /api/:id/foo */
+    const char *p = pattern, *q = path;
+    while (*p && *q) {
+        if (*p == ':') {
+            /* capture param */
+            const char *pname_start = ++p;
+            while (*p && *p != '/') p++;
+            char pname[64]; size_t plen = (size_t)(p - pname_start);
+            if (plen >= sizeof(pname)) return false;
+            memcpy(pname, pname_start, plen); pname[plen] = '\0';
+            const char *vstart = q;
+            while (*q && *q != '/') q++;
+            if (params) {
+                size_t vlen = (size_t)(q - vstart);
+                char *val = params->arena
+                    ? arena_strndup(params->arena, vstart, vlen)
+                    : malloc(vlen + 1);
+                if (!params->arena && val) { memcpy(val, vstart, vlen); val[vlen] = '\0'; }
+                if (val) hm_set(params, pname, val);
+            }
+        } else {
+            if (*p != *q) return false;
+            p++; q++;
+        }
+    }
+    /* skip trailing slashes */
+    while (*p == '/') p++;
+    while (*q == '/') q++;
+    return *p == '\0' && *q == '\0';
+}
+
+void router_dispatch(Router *r, HttpReq *req, HttpResp *resp) {
+    resp->status = 404;
+    resp->content_type = "application/json";
+    resp->body = "{\"error\":\"not found\"}";
+    resp->body_len = strlen(resp->body);
+
+    /* Extract path without query */
+    char path[1024]; strncpy(path, req->path, sizeof(path)-1); path[sizeof(path)-1]='\0';
+    char *qs = strchr(path, '?');
+    if (qs) { req->query = qs + 1; *qs = '\0'; }
+
+    for (int i = 0; i < r->nroutes; i++) {
+        Route *rt = &r->routes[i];
+        if (strcmp(rt->method, req->method) != 0 &&
+            strcmp(rt->method, "*") != 0) continue;
+        hm_init(&req->params, req->arena, 8);
+        if (route_match(rt->pattern, path, &req->params)) {
+            rt->handler(req, resp);
+            return;
+        }
+    }
+}
+
+/* ── HTTP/1.1 parser ── */
+static int parse_request(Arena *a, char *buf, size_t len, HttpReq *req) {
+    char *p = buf, *end = buf + len;
+    /* method */
+    char *sp = memchr(p, ' ', (size_t)(end-p)); if (!sp) return -1;
+    req->method = arena_strndup(a, p, (size_t)(sp-p)); p = sp+1;
+    /* path */
+    sp = memchr(p, ' ', (size_t)(end-p)); if (!sp) return -1;
+    req->path   = arena_strndup(a, p, (size_t)(sp-p)); p = sp+1;
+    /* skip HTTP/1.x\r\n */
+    char *nl = memchr(p, '\n', (size_t)(end-p)); if (!nl) return -1; p = nl+1;
+    /* headers */
+    hm_init(&req->headers, a, 16);
+    while (p < end) {
+        if (*p == '\r' || *p == '\n') { p++; if (p < end && *p == '\n') p++; break; }
+        char *colon = memchr(p, ':', (size_t)(end-p)); if (!colon) break;
+        char *hname = arena_strndup(a, p, (size_t)(colon-p));
+        /* lowercase key */
+        for (char *c = hname; *c; c++) if (*c>='A'&&*c<='Z') *c += 32;
+        p = colon+1; while (p < end && *p==' ') p++;
+        nl = memchr(p, '\n', (size_t)(end-p)); if (!nl) break;
+        size_t vlen = (size_t)(nl - p); if (vlen > 0 && p[vlen-1]=='\r') vlen--;
+        char *hval = arena_strndup(a, p, vlen);
+        hm_set(&req->headers, hname, hval);
+        p = nl+1;
+    }
+    req->body = p; req->body_len = (size_t)(end - p);
+    /* check WebSocket upgrade */
+    char *upg = hm_get(&req->headers, "upgrade");
+    if (upg && strcasecmp(upg, "websocket")==0) req->upgrade_ws = true;
+    return 0;
+}
+
+static void send_response(int fd, HttpResp *resp) {
+    char header[512];
+    const char *ct = resp->content_type ? resp->content_type : "application/octet-stream";
+    int hlen = snprintf(header, sizeof(header),
+        "HTTP/1.1 %d %s\r\n"
+        "Content-Type: %s\r\n"
+        "Content-Length: %zu\r\n"
+        "Access-Control-Allow-Origin: *\r\n"
+        "Connection: keep-alive\r\n"
+        "\r\n",
+        resp->status, http_status_text(resp->status), ct, resp->body_len);
+#ifdef MSG_NOSIGNAL
+    send(fd, header, (size_t)hlen, MSG_NOSIGNAL);
+    if (resp->body && resp->body_len > 0)
+        send(fd, resp->body, resp->body_len, MSG_NOSIGNAL);
+#else
+    send(fd, header, (size_t)hlen, 0);
+    if (resp->body && resp->body_len > 0)
+        send(fd, resp->body, resp->body_len, 0);
+#endif
+}
+
+/* ── WebSocket handshake (SHA-1 + base64 inline) ── */
+#include <stdint.h>
+
+/* Helper: compress one 64-byte block into hash state */
+static void sha1_compress(uint32_t h[5], const uint8_t blk[64]) {
+    uint32_t w[80];
+    for (int i = 0; i < 16; i++)
+        w[i] = ((uint32_t)blk[i*4]<<24)|((uint32_t)blk[i*4+1]<<16)|
+               ((uint32_t)blk[i*4+2]<<8)|(uint32_t)blk[i*4+3];
+    for (int i=16;i<80;i++){uint32_t x=w[i-3]^w[i-8]^w[i-14]^w[i-16];w[i]=(x<<1)|(x>>31);}
+    uint32_t a=h[0],b=h[1],c=h[2],d=h[3],e=h[4];
+    #define ROL(v,n) (((v)<<(n))|((v)>>(32-(n))))
+    for (int i=0;i<80;i++){
+        uint32_t f,k;
+        if(i<20){f=(b&c)|(~b&d);k=0x5A827999;}
+        else if(i<40){f=b^c^d;k=0x6ED9EBA1;}
+        else if(i<60){f=(b&c)|(b&d)|(c&d);k=0x8F1BBCDC;}
+        else{f=b^c^d;k=0xCA62C1D6;}
+        uint32_t tmp=ROL(a,5)+f+e+k+w[i]; e=d;d=c;c=ROL(b,30);b=a;a=tmp;
+    }
+    #undef ROL
+    h[0]+=a;h[1]+=b;h[2]+=c;h[3]+=d;h[4]+=e;
+}
+
+static void sha1(const uint8_t *msg, size_t len, uint8_t out[20]) {
+    uint32_t h[5] = {0x67452301,0xEFCDAB89,0x98BADCFE,0x10325476,0xC3D2E1F0};
+    uint8_t blk[64];
+    uint64_t bits = (uint64_t)len * 8;
+
+    /* process full 64-byte blocks */
+    size_t off = 0;
+    for (; off + 64 <= len; off += 64) {
+        memcpy(blk, msg + off, 64);
+        sha1_compress(h, blk);
+    }
+
+    /* last (partial) block: copy remaining bytes + 0x80 padding */
+    size_t rem = len - off;
+    memset(blk, 0, 64);
+    memcpy(blk, msg + off, rem);
+    blk[rem] = 0x80;
+
+    if (rem >= 56) {
+        /* no room for length in this block — need an extra block */
+        sha1_compress(h, blk);
+        memset(blk, 0, 64);
+    }
+
+    /* append 64-bit big-endian bit length */
+    for (int i = 0; i < 8; i++) blk[56+i] = (uint8_t)(bits >> (56 - 8*i));
+    sha1_compress(h, blk);
+    for (int i=0;i<5;i++){out[i*4]=(uint8_t)(h[i]>>24);out[i*4+1]=(uint8_t)(h[i]>>16);
+                           out[i*4+2]=(uint8_t)(h[i]>>8);out[i*4+3]=(uint8_t)h[i];}
+}
+
+static void base64_enc(const uint8_t *in, size_t n, char *out) {
+    static const char t[]="ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    size_t i=0,j=0;
+    for(;i+2<n;i+=3){
+        out[j++]=t[in[i]>>2]; out[j++]=t[((in[i]&3)<<4)|(in[i+1]>>4)];
+        out[j++]=t[((in[i+1]&0xf)<<2)|(in[i+2]>>6)]; out[j++]=t[in[i+2]&0x3f];
+    }
+    if(i<n){out[j++]=t[in[i]>>2];
+        if(i+1<n){out[j++]=t[((in[i]&3)<<4)|(in[i+1]>>4)];out[j++]=t[(in[i+1]&0xf)<<2];}
+        else{out[j++]=t[(in[i]&3)<<4];out[j++]='=';}
+        out[j++]='=';
+    }
+    out[j]='\0';
+}
+
+static void ws_handshake(int fd, const char *key) {
+    /* RFC 6455 magic GUID */
+    const char *magic = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+    char accept_src[128]; snprintf(accept_src, sizeof(accept_src), "%s%s", key, magic);
+    uint8_t sha[20]; sha1((uint8_t*)accept_src, strlen(accept_src), sha);
+    char b64[64]; base64_enc(sha, 20, b64);
+    char resp[512];
+    int n = snprintf(resp, sizeof(resp),
+        "HTTP/1.1 101 Switching Protocols\r\n"
+        "Upgrade: websocket\r\n"
+        "Connection: Upgrade\r\n"
+        "Sec-WebSocket-Accept: %s\r\n\r\n", b64);
+#ifdef MSG_NOSIGNAL
+    send(fd, resp, (size_t)n, MSG_NOSIGNAL);
+#else
+    send(fd, resp, (size_t)n, 0);
+#endif
+}
+
+/* ── Connection handler ── */
+struct HttpServer { Router *router; int port, backlog, epfd, listenfd, running; };
+
+static void handle_conn(HttpServer *srv, int fd) {
+    enum { MAX_REQ_SIZE = 256 * 1024 * 1024 };
+    size_t cap = 131072, used = 0;
+    char *buf = malloc(cap + 1);
+    if (!buf) { close(fd); return; }
+
+    size_t want_total = 0;
+    bool header_done = false;
+    while (1) {
+        if (used == cap) {
+            if (cap >= MAX_REQ_SIZE) { free(buf); close(fd); return; }
+            size_t ncap = cap * 2;
+            if (ncap > MAX_REQ_SIZE) ncap = MAX_REQ_SIZE;
+            char *nb = realloc(buf, ncap + 1);
+            if (!nb) { free(buf); close(fd); return; }
+            buf = nb; cap = ncap;
+        }
+
+        ssize_t n = recv(fd, buf + used, cap - used, 0);
+        if (n <= 0) { free(buf); close(fd); return; }
+        used += (size_t)n;
+        buf[used] = '\0';
+
+        if (!header_done) {
+            char *he = strstr(buf, "\r\n\r\n");
+            if (!he) he = strstr(buf, "\n\n");
+            if (he) {
+                header_done = true;
+                size_t header_len = (size_t)(he - buf) + (he[0] == '\r' ? 4 : 2);
+                size_t cl = 0;
+                /* case-insensitive search for content-length header */
+                char *p = NULL;
+                for (char *s = buf; s < buf + used - 16; s++) {
+                    if (*s == '\n' && strncasecmp(s + 1, "content-length:", 15) == 0)
+                        { p = s; break; }
+                }
+                if (!p && strncasecmp(buf, "content-length:", 15) == 0) p = buf - 1;
+                if (p) cl = (size_t)strtoull(p + 16, NULL, 10);
+                want_total = header_len + cl;
+                if (want_total > MAX_REQ_SIZE) { free(buf); close(fd); return; }
+            }
+        }
+        if (header_done && used >= want_total) break;
+        if (header_done && want_total == 0) break;
+    }
+
+    Arena *a = arena_create(32768);
+    HttpReq req = {0}; req.arena = a; req.fd = fd;
+
+    if (parse_request(a, buf, used, &req) < 0) { free(buf); close(fd); arena_destroy(a); return; }
+
+    /* OPTIONS preflight */
+    if (strcmp(req.method,"OPTIONS")==0) {
+        const char *hdrs = "HTTP/1.1 204 No Content\r\nAccess-Control-Allow-Origin: *\r\n"
+                           "Access-Control-Allow-Methods: GET,POST,DELETE,PUT\r\n"
+                           "Access-Control-Allow-Headers: Content-Type,Authorization\r\n\r\n";
+        send(fd, hdrs, strlen(hdrs), MSG_NOSIGNAL);
+        free(buf); arena_destroy(a); close(fd); return;
+    }
+
+    if (req.upgrade_ws) {
+        char *key = hm_get(&req.headers, "sec-websocket-key");
+        if (key) ws_handshake(fd, key);
+        /* WS fd stays open — handled separately */
+        free(buf);
+        arena_destroy(a);
+        return;
+    }
+
+    HttpResp resp = {0};
+    router_dispatch(srv->router, &req, &resp);
+    send_response(fd, &resp);
+    free(buf);
+    arena_destroy(a);
+    close(fd);
+}
+
+HttpServer *http_server_create(Router *r, int port, int backlog) {
+    HttpServer *s = calloc(1, sizeof(HttpServer));
+    s->router = r; s->port = port; s->backlog = backlog;
+    return s;
+}
+
+void http_server_run(HttpServer *s) {
+    signal(SIGPIPE, SIG_IGN);
+    int lfd = socket(AF_INET, SOCK_STREAM, 0);
+    int yes = 1; setsockopt(lfd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
+#ifdef SO_REUSEPORT
+    setsockopt(lfd, SOL_SOCKET, SO_REUSEPORT, &yes, sizeof(yes));
+#endif
+    struct sockaddr_in addr = {.sin_family=AF_INET, .sin_port=htons((uint16_t)s->port), .sin_addr={INADDR_ANY}};
+    if (bind(lfd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
+        LOG_ERROR("bind port %d: %s", s->port, strerror(errno)); return;
+    }
+    listen(lfd, s->backlog > 0 ? s->backlog : 128);
+    s->listenfd = lfd; s->running = 1;
+    LOG_INFO("HTTP server listening on :%d", s->port);
+
+#ifdef __APPLE__
+    int evfd = kqueue(); s->epfd = evfd;
+    struct kevent kev;
+    EV_SET(&kev, lfd, EVFILT_READ, EV_ADD, 0, 0, NULL);
+    kevent(evfd, &kev, 1, NULL, 0, NULL);
+
+    struct kevent events[64];
+    while (s->running) {
+        struct timespec ts = {0, 100000000}; /* 100ms */
+        int nev = kevent(evfd, NULL, 0, events, 64, &ts);
+        for (int i = 0; i < nev; i++) {
+            if ((int)events[i].ident == lfd) {
+                struct sockaddr_in ca; socklen_t cl = sizeof(ca);
+                int cfd = accept(lfd, (struct sockaddr*)&ca, &cl);
+                if (cfd < 0) continue;
+                fcntl(cfd, F_SETFD, FD_CLOEXEC);
+                handle_conn(s, cfd);
+            }
+        }
+    }
+    close(lfd); close(evfd);
+#else
+    int epfd = epoll_create1(0); s->epfd = epfd;
+    struct epoll_event ev = {.events = EPOLLIN, .data.fd = lfd};
+    epoll_ctl(epfd, EPOLL_CTL_ADD, lfd, &ev);
+
+    struct epoll_event events[64];
+    while (s->running) {
+        int nev = epoll_wait(epfd, events, 64, 100);
+        for (int i = 0; i < nev; i++) {
+            if (events[i].data.fd == lfd) {
+                struct sockaddr_in ca; socklen_t cl = sizeof(ca);
+                int cfd = accept4(lfd, (struct sockaddr*)&ca, &cl, SOCK_CLOEXEC);
+                if (cfd < 0) continue;
+                handle_conn(s, cfd);
+            }
+        }
+    }
+    close(lfd); close(epfd);
+#endif
+}
+
+void http_server_stop(HttpServer *s) { s->running = 0; }

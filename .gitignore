@@ -1,0 +1,10 @@
+build/
+data/*
+!data/*.csv
+*.o
+*.d
+*.so
+*.dylib
+.DS_Store
+.claude/
+{lib/
