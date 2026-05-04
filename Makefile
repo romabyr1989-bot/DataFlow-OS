@@ -5,7 +5,7 @@ CFLAGS  = -std=c11 -Wall -Wextra -Wpedantic \
            -Ilib -Ilib/core -Ilib/net -Ilib/storage \
            -Ilib/sql_parser -Ilib/qengine -Ilib/scheduler \
            -Ilib/observ -Ilib/connector -Ilib/index
-LDFLAGS = -lpthread -lm -ldl -lsqlite3
+LDFLAGS = -lpthread -lm -ldl -lsqlite3 -lcurl
 
 # Release flags
 REL_FLAGS = -O2 -DNDEBUG -flto

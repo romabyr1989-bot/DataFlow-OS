@@ -51,6 +51,9 @@ typedef struct {
 void router_add(Router *r, const char *method, const char *pattern, HttpHandler h);
 void router_dispatch(Router *r, HttpReq *req, HttpResp *resp);
 
+/* ── Outbound HTTP */
+int http_post_json(const char *url, const char *body, int timeout_ms);
+
 /* ── Server ── */
 typedef struct HttpServer HttpServer;
 

@@ -175,6 +175,10 @@ int pipeline_from_json(Pipeline *p, const char *json) {
     strncpy(p->name, json_str(json_get(root,"name"),""),sizeof(p->name)-1);
     strncpy(p->cron, json_str(json_get(root,"cron"),""),sizeof(p->cron)-1);
     p->enabled = json_bool(json_get(root,"enabled"),true);
+    strncpy(p->webhook_url, json_str(json_get(root,"webhook_url"),""), sizeof(p->webhook_url)-1);
+    strncpy(p->webhook_on,  json_str(json_get(root,"webhook_on"),"failure"), sizeof(p->webhook_on)-1);
+    p->alert_cooldown = (int)json_int(json_get(root,"alert_cooldown"), 300);
+    p->last_alert_at = 0;
 
     JVal *steps = json_get(root,"steps");
     if(steps && steps->type==JV_ARRAY) {
@@ -189,6 +193,10 @@ int pipeline_from_json(Pipeline *p, const char *json) {
             copy_jval_str(json_get(s,"connector_config"), st->connector_config, sizeof(st->connector_config), a);
             strncpy(st->transform_sql,   json_str(json_get(s,"transform_sql"),""),   sizeof(st->transform_sql)-1);
             strncpy(st->target_table,    json_str(json_get(s,"target_table"),""),    sizeof(st->target_table)-1);
+            st->max_retries = (int)json_int(json_get(s,"max_retries"), 3);
+            st->retry_delay_sec = (int)json_int(json_get(s,"retry_delay_sec"), 30);
+            st->retry_count = 0;
+            st->retry_after = 0;
             JVal *deps=json_get(s,"deps");
             if(deps&&deps->type==JV_ARRAY)
                 for(int j=0;j<(int)deps->nitems&&j<MAX_STEPS;j++)
@@ -206,6 +214,9 @@ char *pipeline_to_json(const Pipeline *p, Arena *a) {
     jb_key(&jb,"name");    jb_str(&jb,p->name);
     jb_key(&jb,"cron");    jb_str(&jb,p->cron);
     jb_key(&jb,"enabled"); jb_bool(&jb,p->enabled);
+    jb_key(&jb,"webhook_url");   jb_str(&jb,p->webhook_url);
+    jb_key(&jb,"webhook_on");    jb_str(&jb,p->webhook_on);
+    jb_key(&jb,"alert_cooldown"); jb_int(&jb,p->alert_cooldown);
     jb_key(&jb,"last_run");jb_int(&jb,p->last_run);
     jb_key(&jb,"next_run");jb_int(&jb,p->next_run);
     jb_key(&jb,"status");  jb_int(&jb,(int)p->run_status);
@@ -219,6 +230,8 @@ char *pipeline_to_json(const Pipeline *p, Arena *a) {
         jb_key(&jb,"connector_config"); jb_str(&jb,st->connector_config);
         jb_key(&jb,"transform_sql");    jb_str(&jb,st->transform_sql);
         jb_key(&jb,"target_table");     jb_str(&jb,st->target_table);
+        jb_key(&jb,"max_retries");      jb_int(&jb,st->max_retries);
+        jb_key(&jb,"retry_delay_sec");  jb_int(&jb,st->retry_delay_sec);
         jb_key(&jb,"status");           jb_int(&jb,(int)st->status);
         jb_key(&jb,"deps"); jb_arr_begin(&jb);
         for(int j=0;j<st->ndeps;j++) jb_int(&jb,st->deps[j]);

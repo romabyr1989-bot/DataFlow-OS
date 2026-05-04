@@ -130,6 +130,32 @@
           </label>
         </div>
       </div>
+      <div class="builder-settings-row">
+        <div class="bsr-field">
+          <label>Макс. попыток retry</label>
+          <input id="pb-max-retries" type="number" min="0" value="3">
+        </div>
+        <div class="bsr-field">
+          <label>Базовый backoff, сек</label>
+          <input id="pb-retry-delay" type="number" min="1" value="30">
+        </div>
+        <div class="bsr-field" style="flex:2">
+          <label>Webhook URL</label>
+          <input id="pb-webhook-url" type="text" placeholder="https://hooks.slack.com/services/...">
+        </div>
+        <div class="bsr-field">
+          <label>Алерт при</label>
+          <select id="pb-webhook-on">
+            <option value="failure">только при ошибке</option>
+            <option value="success">только при успехе</option>
+            <option value="all">всегда</option>
+          </select>
+        </div>
+        <div class="bsr-field">
+          <label>Cooldown, сек</label>
+          <input id="pb-alert-cooldown" type="number" min="0" value="300">
+        </div>
+      </div>
 
       <!-- Карточки шагов -->
       <div id="pb-steps">

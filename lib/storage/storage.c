@@ -277,7 +277,7 @@ static const char *CATALOG_SCHEMA =
     "CREATE TABLE IF NOT EXISTS pipeline_runs("
     "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
     "  pipeline_id TEXT, started_at INTEGER, finished_at INTEGER,"
-    "  status INTEGER, error_msg TEXT);"
+    "  status INTEGER, error_msg TEXT, retry_count INTEGER DEFAULT 0);"
     "CREATE INDEX IF NOT EXISTS idx_runs_pipeline ON pipeline_runs(pipeline_id);"
     "CREATE TABLE IF NOT EXISTS saved_results("
     "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
@@ -304,6 +304,7 @@ Catalog *catalog_open(const char *path) {
     /* migrate: add columns if they don't exist yet */
     sqlite3_exec(c->db, "ALTER TABLE tables ADD COLUMN source TEXT DEFAULT 'ingest';", NULL, NULL, NULL);
     sqlite3_exec(c->db, "ALTER TABLE tables ADD COLUMN row_count INTEGER DEFAULT 0;", NULL, NULL, NULL);
+    sqlite3_exec(c->db, "ALTER TABLE pipeline_runs ADD COLUMN retry_count INTEGER DEFAULT 0;", NULL, NULL, NULL);
     return c;
 }
 
@@ -485,15 +486,16 @@ int catalog_delete_pipeline(Catalog *c, const char *id) {
     return rc==SQLITE_DONE?0:-1;
 }
 
-int catalog_log_run(Catalog *c, const char *pid, int64_t s, int64_t f, int status, const char *err) {
+int catalog_log_run(Catalog *c, const char *pid, int64_t s, int64_t f, int status, const char *err, int retry_count) {
     sqlite3_stmt *st;
     sqlite3_prepare_v2(c->db,
-        "INSERT INTO pipeline_runs(pipeline_id,started_at,finished_at,status,error_msg) VALUES(?,?,?,?,?)",
+        "INSERT INTO pipeline_runs(pipeline_id,started_at,finished_at,status,error_msg,retry_count) VALUES(?,?,?,?,?,?)",
         -1,&st,NULL);
     sqlite3_bind_text(st,1,pid,-1,SQLITE_STATIC);
     sqlite3_bind_int64(st,2,s); sqlite3_bind_int64(st,3,f);
     sqlite3_bind_int(st,4,status);
     sqlite3_bind_text(st,5,err?err:"",-1,SQLITE_STATIC);
+    sqlite3_bind_int(st,6,retry_count);
     int rc=sqlite3_step(st); sqlite3_finalize(st);
     return rc==SQLITE_DONE?0:-1;
 }
@@ -501,17 +503,18 @@ int catalog_log_run(Catalog *c, const char *pid, int64_t s, int64_t f, int statu
 int catalog_list_runs(Catalog *c, const char *pid, char **out, Arena *a) {
     sqlite3_stmt *st;
     sqlite3_prepare_v2(c->db,
-        "SELECT id,started_at,finished_at,status,error_msg FROM pipeline_runs "
+        "SELECT id,started_at,finished_at,status,error_msg,retry_count FROM pipeline_runs "
         "WHERE pipeline_id=? ORDER BY started_at DESC LIMIT 50",-1,&st,NULL);
     sqlite3_bind_text(st,1,pid,-1,SQLITE_STATIC);
     JBuf jb; jb_init(&jb,a,1024); jb_arr_begin(&jb);
     while(sqlite3_step(st)==SQLITE_ROW){
         jb_obj_begin(&jb);
-        jb_key(&jb,"id");     jb_int(&jb,sqlite3_column_int64(st,0));
-        jb_key(&jb,"started");jb_int(&jb,sqlite3_column_int64(st,1));
-        jb_key(&jb,"finished");jb_int(&jb,sqlite3_column_int64(st,2));
-        jb_key(&jb,"status"); jb_int(&jb,sqlite3_column_int(st,3));
-        jb_key(&jb,"error");  jb_str(&jb,(const char*)sqlite3_column_text(st,4));
+        jb_key(&jb,"id");         jb_int(&jb,sqlite3_column_int64(st,0));
+        jb_key(&jb,"started");    jb_int(&jb,sqlite3_column_int64(st,1));
+        jb_key(&jb,"finished");   jb_int(&jb,sqlite3_column_int64(st,2));
+        jb_key(&jb,"status");     jb_int(&jb,sqlite3_column_int(st,3));
+        jb_key(&jb,"error");      jb_str(&jb,(const char*)sqlite3_column_text(st,4));
+        jb_key(&jb,"retry_count"); jb_int(&jb,sqlite3_column_int(st,5));
         jb_obj_end(&jb);
     }
     jb_arr_end(&jb); sqlite3_finalize(st);

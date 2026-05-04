@@ -83,7 +83,7 @@ int catalog_delete_pipeline(Catalog *c, const char *id);
 /* Run history */
 int catalog_log_run(Catalog *c, const char *pipeline_id,
                     int64_t started_at, int64_t finished_at,
-                    int status, const char *error_msg);
+                    int status, const char *error_msg, int retry_count);
 int catalog_list_runs(Catalog *c, const char *pipeline_id,
                       char **json_out, Arena *a);
 

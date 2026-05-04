@@ -2328,6 +2328,33 @@ static int write_rs_to_table(App *app, Arena *a, const char *tname, RS *rs) {
     return total;
 }
 
+static void send_pipeline_alert(Pipeline *p, const char *message, bool success) {
+    if (!p || !p->webhook_url[0]) return;
+    if (p->alert_cooldown > 0 && time(NULL) - p->last_alert_at < p->alert_cooldown) return;
+
+    bool should_send = false;
+    if (strcmp(p->webhook_on, "all") == 0) should_send = true;
+    else if (strcmp(p->webhook_on, "success") == 0) should_send = success;
+    else should_send = !success;
+    if (!should_send) return;
+
+    char body[1024];
+    if (success) {
+        snprintf(body, sizeof(body), "{\"text\":\"Pipeline *%s* succeeded\"}", p->name[0] ? p->name : p->id);
+    } else {
+        snprintf(body, sizeof(body), "{\"text\":\"Pipeline *%s* failed: %s\"}",
+                 p->name[0] ? p->name : p->id,
+                 message ? message : "unknown error");
+    }
+
+    bool sent = http_post_json(p->webhook_url, body, 5000) == 0;
+    if (!sent) {
+        LOG_WARN("alert webhook failed for pipeline %s", p->id);
+    } else {
+        p->last_alert_at = time(NULL);
+    }
+}
+
 /* ── Run one connector step: pull all batches into target_table ── */
 static int run_connector_step(App *app, Arena *a, PipelineStep *st, char *errbuf, size_t errsz) {
     char so_path[1024];
@@ -2410,56 +2437,71 @@ void pipeline_execute_steps(Pipeline *p, App *app) {
     int64_t started = (int64_t)time(NULL);
     int total_rows = 0;
     const char *run_error = NULL;
+    int total_retries = 0;
 
     for (int si = 0; si < p->nsteps; si++) {
         PipelineStep *st = &p->steps[si];
-        st->status = STEP_RUNNING;
+        st->retry_count = 0;
+        st->retry_after = 0;
 
-        if (st->connector_type[0]) {
-            /* ── Connector step: pull from external source ── */
-            int n = run_connector_step(app, a, st, p->error_msg, sizeof(p->error_msg));
-            if (n < 0) {
-                st->status = STEP_FAILED;
-                run_error  = p->error_msg;
+        while (true) {
+            st->status = STEP_RUNNING;
+
+            if (st->connector_type[0]) {
+                int n = run_connector_step(app, a, st, p->error_msg, sizeof(p->error_msg));
+                if (n < 0) {
+                    st->status = STEP_FAILED;
+                } else {
+                    total_rows += n;
+                    st->status = STEP_SUCCESS;
+                }
+            } else if (!st->transform_sql[0]) {
+                st->status = STEP_SUCCESS;
+            } else {
+                Stmt *stmt = sql_parse(a, st->transform_sql, strlen(st->transform_sql));
+                if (stmt->error) {
+                    st->status = STEP_FAILED;
+                    snprintf(p->error_msg, sizeof(p->error_msg), "step[%d] parse: %s", si, stmt->error);
+                } else {
+                    RS *rs = exec_stmt(a, stmt, NULL);
+                    if (!rs) {
+                        st->status = STEP_FAILED;
+                        snprintf(p->error_msg, sizeof(p->error_msg), "step[%d]: execution returned null", si);
+                    } else {
+                        if (st->target_table[0])
+                            total_rows += write_rs_to_table(app, a, st->target_table, rs);
+                        st->status = STEP_SUCCESS;
+                    }
+                }
+            }
+
+            if (st->status == STEP_SUCCESS) {
+                st->retry_count = 0;
+                st->retry_after = 0;
+                break;
+            }
+
+            if (st->retry_count >= st->max_retries) {
                 p->run_status = RUN_FAILED;
+                run_error = p->error_msg[0] ? p->error_msg : "step failed";
                 goto done;
             }
-            total_rows += n;
-            st->status = STEP_SUCCESS;
-            continue;
+
+            st->retry_count++;
+            total_retries += 1;
+            int delay = st->retry_delay_sec * (1 << (st->retry_count - 1));
+            st->retry_after = (int64_t)time(NULL) + delay;
+            st->status = STEP_PENDING;
+            LOG_WARN("step %s: retry %d/%d in %ds", st->id, st->retry_count, st->max_retries, delay);
+            sleep(delay);
         }
-
-        if (!st->transform_sql[0]) { st->status = STEP_SUCCESS; continue; }
-
-        /* ── SQL transform step ── */
-        Stmt *stmt = sql_parse(a, st->transform_sql, strlen(st->transform_sql));
-        if (stmt->error) {
-            st->status = STEP_FAILED;
-            snprintf(p->error_msg, sizeof(p->error_msg), "step[%d] parse: %s", si, stmt->error);
-            run_error = p->error_msg;
-            p->run_status = RUN_FAILED;
-            goto done;
-        }
-
-        RS *rs = exec_stmt(a, stmt, NULL);
-        if (!rs) {
-            st->status = STEP_FAILED;
-            snprintf(p->error_msg, sizeof(p->error_msg), "step[%d]: execution returned null", si);
-            run_error = p->error_msg;
-            p->run_status = RUN_FAILED;
-            goto done;
-        }
-
-        if (st->target_table[0])
-            total_rows += write_rs_to_table(app, a, st->target_table, rs);
-
-        st->status = STEP_SUCCESS;
     }
     p->run_status = RUN_SUCCESS;
 
 done:
     catalog_log_run(app->catalog, p->id, started, (int64_t)time(NULL),
-                    p->run_status == RUN_SUCCESS ? 0 : 1, run_error);
+                    p->run_status == RUN_SUCCESS ? 0 : 1, run_error, total_retries);
+    send_pipeline_alert(p, run_error, p->run_status == RUN_SUCCESS);
     Arena *ba = arena_create(512);
     app_ws_broadcast(app, arena_sprintf(ba,
         "{\"event\":\"pipeline_done\",\"id\":\"%s\",\"status\":\"%s\",\"rows_written\":%d}",

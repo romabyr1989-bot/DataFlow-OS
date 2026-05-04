@@ -20,6 +20,12 @@ typedef struct {
     int         deps[MAX_STEPS];
     int         ndeps;
     StepStatus  status;
+
+    /* NEW: retry policy */
+    int         max_retries;       /* default: 3 */
+    int         retry_count;       /* current retry counter */
+    int         retry_delay_sec;   /* base delay, doubles on each retry */
+    int64_t     retry_after;       /* unix ts — when to retry */
 } PipelineStep;
 
 typedef struct {
@@ -33,6 +39,12 @@ typedef struct {
     int64_t       next_run;
     RunStatus     run_status;
     char          error_msg[512];
+
+    /* NEW: alerting */
+    char          webhook_url[512];  /* Slack/Telegram/custom webhook */
+    char          webhook_on[32];    /* "failure", "success", "all" */
+    int           alert_cooldown;    /* seconds between alerts */
+    int64_t       last_alert_at;
 } Pipeline;
 
 /* Callback invoked in scheduler thread when a pipeline should run */

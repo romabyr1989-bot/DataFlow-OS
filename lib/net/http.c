@@ -11,6 +11,7 @@
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <signal.h>
+#include <curl/curl.h>
 #ifdef __APPLE__
 #  include <sys/event.h>
 #  include <sys/time.h>
@@ -168,7 +169,38 @@ static void send_response(int fd, HttpResp *resp) {
 #endif
 }
 
-/* ── WebSocket handshake (SHA-1 + base64 inline) ── */
+int http_post_json(const char *url, const char *body, int timeout_ms) {
+    if (!url) return -1;
+    CURL *curl = curl_easy_init();
+    if (!curl) return -1;
+
+    struct curl_slist *headers = NULL;
+    headers = curl_slist_append(headers, "Content-Type: application/json");
+    headers = curl_slist_append(headers, "Accept: application/json");
+
+    curl_easy_setopt(curl, CURLOPT_URL, url);
+    curl_easy_setopt(curl, CURLOPT_POST, 1L);
+    curl_easy_setopt(curl, CURLOPT_POSTFIELDS, body ? body : "{}");
+    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, timeout_ms);
+    curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
+    curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 1L);
+    curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 2L);
+
+    long http_code = 0;
+    CURLcode res = curl_easy_perform(curl);
+    if (res == CURLE_OK) {
+        curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
+    } else {
+        LOG_WARN("http_post_json curl failed: %s", curl_easy_strerror(res));
+    }
+
+    curl_slist_free_all(headers);
+    curl_easy_cleanup(curl);
+
+    return (res == CURLE_OK && http_code >= 200 && http_code < 300) ? 0 : -1;
+}
+
 #include <stdint.h>
 
 /* Helper: compress one 64-byte block into hash state */
@@ -177,7 +209,10 @@ static void sha1_compress(uint32_t h[5], const uint8_t blk[64]) {
     for (int i = 0; i < 16; i++)
         w[i] = ((uint32_t)blk[i*4]<<24)|((uint32_t)blk[i*4+1]<<16)|
                ((uint32_t)blk[i*4+2]<<8)|(uint32_t)blk[i*4+3];
-    for (int i=16;i<80;i++){uint32_t x=w[i-3]^w[i-8]^w[i-14]^w[i-16];w[i]=(x<<1)|(x>>31);}
+    for (int i=16;i<80;i++){
+        uint32_t x=w[i-3]^w[i-8]^w[i-14]^w[i-16];
+        w[i]=(x<<1)|(x>>31);
+    }
     uint32_t a=h[0],b=h[1],c=h[2],d=h[3],e=h[4];
     #define ROL(v,n) (((v)<<(n))|((v)>>(32-(n))))
     for (int i=0;i<80;i++){

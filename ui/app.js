@@ -12,7 +12,7 @@ let analyticsState = { tables: [], currentRows: [], currentCols: [], charts: [] 
 let lastStatsReport = null;
 
 /* Pipeline builder */
-const pb = { steps: [], editId: null };
+const pb = { steps: [], editId: null, max_retries: 3, retry_delay_sec: 30, webhook_url: '', webhook_on: 'failure', alert_cooldown: 300 };
 
 /* Ingest */
 let ingestContent  = null;
@@ -462,7 +462,7 @@ async function showPipelineRuns(id, name) {
     const runs = await apiFetch(`/api/pipelines/${id}/runs`);
     const list = Array.isArray(runs) ? runs : [];
     if (!list.length) { body.innerHTML = '<div style="color:var(--muted);padding:.5rem">Запусков пока нет.</div>'; return; }
-    let html = '<table class="runs-table"><thead><tr><th>#</th><th>Начало</th><th>Окончание</th><th>Статус</th><th>Ошибка</th></tr></thead><tbody>';
+    let html = '<table class="runs-table"><thead><tr><th>#</th><th>Начало</th><th>Окончание</th><th>Статус</th><th>Повторы</th><th>Ошибка</th></tr></thead><tbody>';
     list.forEach(r => {
       const statusLabel = r.status === 0 ? '<span class="badge badge-ok">успех</span>'
         : '<span class="badge badge-err">ошибка</span>';
@@ -471,6 +471,7 @@ async function showPipelineRuns(id, name) {
         <td>${r.started ? new Date(r.started*1000).toLocaleString() : '—'}</td>
         <td>${r.finished ? new Date(r.finished*1000).toLocaleString() : '—'}</td>
         <td>${statusLabel}</td>
+        <td>${typeof r.retries === 'number' ? r.retries : 0}</td>
         <td>${escHtml(r.error || '')}</td>
       </tr>`;
     });
@@ -510,10 +511,20 @@ function cronDescription(expr) {
 function openPipelineBuilder(pipeline) {
   pb.editId = pipeline ? (pipeline.id || null) : null;
   pb.steps  = pipeline ? (pipeline.steps || []).map(s => ({...s, deps: s.deps || []})) : [];
+  pb.max_retries     = pipeline ? (pipeline.max_retries || 3) : 3;
+  pb.retry_delay_sec = pipeline ? (pipeline.retry_delay_sec || 30) : 30;
+  pb.webhook_url     = pipeline ? (pipeline.webhook_url || '') : '';
+  pb.webhook_on      = pipeline ? (pipeline.webhook_on || 'failure') : 'failure';
+  pb.alert_cooldown  = pipeline ? (pipeline.alert_cooldown || 300) : 300;
 
   document.getElementById('pb-name').value      = pipeline ? (pipeline.name || '') : '';
   document.getElementById('pb-enabled').checked = pipeline ? !!pipeline.enabled : true;
   document.getElementById('pb-cron').value       = pipeline ? (pipeline.cron || '') : '';
+  document.getElementById('pb-max-retries').value = pb.max_retries;
+  document.getElementById('pb-retry-delay').value = pb.retry_delay_sec;
+  document.getElementById('pb-webhook-url').value = pb.webhook_url;
+  document.getElementById('pb-webhook-on').value = pb.webhook_on;
+  document.getElementById('pb-alert-cooldown').value = pb.alert_cooldown;
   document.getElementById('pb-cron-preset').value = '';
   syncCronPreset();
 
@@ -563,6 +574,8 @@ function pbAddStep() {
     transform_sql: '',
     target_table: '',
     deps: [],
+    max_retries: 3,
+    retry_delay_sec: 30,
   });
   renderBuilderSteps();
   /* scroll to bottom */
@@ -721,12 +734,18 @@ function makeStepCard(step, idx) {
                  value="${escAttr(step.target_table)}"
                  oninput="pbUpdateStep(${idx},'target_table',this.value);renderFlowGraph()">
         </div>
+      <div class="step-row-2" style="margin-top:0.75rem">
+        <div class="form-group" style="margin:0">
+          <label>Max retries</label>
+          <input type="number" min="0" value="${escAttr(step.max_retries != null ? step.max_retries : 3)}"
+                 oninput="pbUpdateStep(${idx},'max_retries',parseInt(this.value,10) || 0)">
+        </div>
+        <div class="form-group" style="margin:0">
+          <label>Backoff (сек)</label>
+          <input type="number" min="1" value="${escAttr(step.retry_delay_sec != null ? step.retry_delay_sec : 30)}"
+                 oninput="pbUpdateStep(${idx},'retry_delay_sec',parseInt(this.value,10) || 30)">
+        </div>
       </div>
-
-      <div class="conn-config-wrap" id="step-conn-cfg-${idx}">
-        ${makeConnectorConfigHTML(step, idx)}
-      </div>
-
       <div class="form-group" style="margin:0">
         <label>SQL-трансформация <span class="label-hint">выполняется после загрузки данных</span></label>
         <textarea class="mono-textarea" rows="4"
@@ -867,6 +886,11 @@ async function savePipeline() {
   const name    = document.getElementById('pb-name').value.trim();
   const cron    = document.getElementById('pb-cron').value.trim();
   const enabled = document.getElementById('pb-enabled').checked;
+  const maxRetries = parseInt(document.getElementById('pb-max-retries').value, 10) || 3;
+  const retryDelay = parseInt(document.getElementById('pb-retry-delay').value, 10) || 30;
+  const webhookUrl = document.getElementById('pb-webhook-url').value.trim();
+  const webhookOn  = document.getElementById('pb-webhook-on').value || 'failure';
+  const alertCooldown = parseInt(document.getElementById('pb-alert-cooldown').value, 10);
 
   if (!name) { showToast('Необходимо указать название конвейера', 'error'); return; }
 
@@ -877,11 +901,18 @@ async function savePipeline() {
     connector_config: s.connector_config || '',
     transform_sql:    s.transform_sql    || '',
     target_table:     s.target_table     || '',
+    max_retries:      s.max_retries != null ? s.max_retries : 3,
+    retry_delay_sec:  s.retry_delay_sec != null ? s.retry_delay_sec : 30,
     deps:             s.deps             || [],
     ndeps:            (s.deps || []).length,
   }));
 
-  const body = { name, cron, enabled, steps };
+  const body = { name, cron, enabled, steps,
+                 max_retries: maxRetries,
+                 retry_delay_sec: retryDelay,
+                 webhook_url: webhookUrl,
+                 webhook_on: webhookOn,
+                 alert_cooldown: isNaN(alertCooldown) ? 300 : alertCooldown };
   if (pb.editId) body.id = pb.editId;
 
   try {
