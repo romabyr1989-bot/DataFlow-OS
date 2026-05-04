@@ -43,9 +43,11 @@ GW_SRCS   = src/gateway/main.c src/gateway/api.c
 # convert .c to .o in OUTDIR
 ALL_OBJS  = $(patsubst %.c,$(OUTDIR)/%.o,$(ALL_LIB_SRCS) $(GW_SRCS))
 
-GATEWAY   = $(BINDIR)/dfo_gateway
-CSV_PLUGIN= $(LIBDIR)/csv_connector.so
-PG_PLUGIN = $(LIBDIR)/pg_connector.so
+GATEWAY        = $(BINDIR)/dfo_gateway
+CSV_PLUGIN     = $(LIBDIR)/csv_connector.so
+PG_PLUGIN      = $(LIBDIR)/pg_connector.so
+PARQUET_PLUGIN = $(LIBDIR)/parquet_connector.so
+JSONHTTP_PLUGIN= $(LIBDIR)/json_http_connector.so
 
 # Detect libpq — homebrew keg-only or pkg-config
 _LIBPQ_LOCAL := $(shell test -d /usr/local/opt/libpq/include && echo /usr/local/opt/libpq)
@@ -64,9 +66,9 @@ endif
 .PHONY: all clean run test dirs release debug
 
 ifeq ($(HAS_PQ),yes)
-all: dirs $(GATEWAY) $(CSV_PLUGIN) $(PG_PLUGIN)
+all: dirs $(GATEWAY) $(CSV_PLUGIN) $(PG_PLUGIN) $(PARQUET_PLUGIN) $(JSONHTTP_PLUGIN)
 else
-all: dirs $(GATEWAY) $(CSV_PLUGIN)
+all: dirs $(GATEWAY) $(CSV_PLUGIN) $(PARQUET_PLUGIN) $(JSONHTTP_PLUGIN)
 endif
 
 release:
@@ -108,6 +110,25 @@ $(PG_PLUGIN): lib/connector/plugins/pg/pg_connector.c \
               $(OUTDIR)/lib/core/log.o
 	@echo "  SO  $@"
 	@$(CC) $(CFLAGS) $(PGCFLAGS) -shared -fPIC $^ -o $@ $(LDFLAGS) $(PGLDFLAGS) \
+	    $(if $(filter Darwin,$(shell uname)),-undefined dynamic_lookup,)
+
+# Parquet connector (requires zlib)
+$(PARQUET_PLUGIN): lib/connector/plugins/parquet/parquet_connector.c \
+                   $(OUTDIR)/lib/core/arena.o \
+                   $(OUTDIR)/lib/storage/storage.o \
+                   $(OUTDIR)/lib/core/log.o
+	@echo "  SO  $@"
+	@$(CC) $(CFLAGS) -shared -fPIC $^ -o $@ $(LDFLAGS) -lz \
+	    $(if $(filter Darwin,$(shell uname)),-undefined dynamic_lookup,)
+
+# JSON HTTP connector (requires libcurl)
+$(JSONHTTP_PLUGIN): lib/connector/plugins/json_http/json_http_connector.c \
+                    $(OUTDIR)/lib/core/arena.o \
+                    $(OUTDIR)/lib/storage/storage.o \
+                    $(OUTDIR)/lib/core/log.o \
+                    $(OUTDIR)/lib/core/json.o
+	@echo "  SO  $@"
+	@$(CC) $(CFLAGS) -shared -fPIC $^ -o $@ $(LDFLAGS) -lcurl \
 	    $(if $(filter Darwin,$(shell uname)),-undefined dynamic_lookup,)
 
 # ── Tests ──

@@ -18,6 +18,8 @@ const pb = { steps: [], editId: null };
 let ingestContent  = null;
 let ingestColumns  = [];
 let ingestDelimiter = ',';
+let ingestMode = 'csv'; // 'csv' | 'parquet'
+let ingestFile = null;  // raw File object (for parquet binary upload)
 
 /* User preferences */
 let prefs = {};
@@ -210,13 +212,15 @@ function makeTableCard(t) {
   }).join('');
   const sourceBadge = t.source === 'pipeline'
     ? '<span class="source-badge pipeline">конвейер</span>'
-    : '<span class="source-badge ingest">CSV</span>';
+    : t.source === 'parquet'
+      ? '<span class="source-badge parquet">Parquet</span>'
+      : '<span class="source-badge ingest">CSV</span>';
   card.innerHTML = `
     <div class="table-card-head">
       <h3>${escHtml(t.name)}${sourceBadge}</h3>
       <button class="btn btn-sm btn-danger" title="Удалить таблицу">Удалить</button>
     </div>
-    <div class="meta">${fmtNum(t.rows || 0)} строк · ${(t.columns || []).length} столбцов</div>
+    <div class="meta">${fmtNum(t.rows || 0)} строк · ${(t.columns || []).length} столбцов <button class="btn btn-sm idx-btn" onclick="openIndexManager('${escAttr(t.name)}', event)" title="Индексы">⚡ Индексы</button></div>
     <div class="col-list">${cols || '<span class="col-pill">—</span>'}</div>
   `;
   const delBtn = card.querySelector('button');
@@ -230,6 +234,43 @@ function makeTableCard(t) {
     runQuery();
   };
   return card;
+}
+
+async function openIndexManager(tableName, ev) {
+  ev.stopPropagation();
+  const modal = document.getElementById('index-modal');
+  document.getElementById('index-modal-title').textContent = `Индексы: ${tableName}`;
+  document.getElementById('index-modal-table').value = tableName;
+  document.getElementById('index-modal-col').value = '';
+  document.getElementById('index-modal-status').textContent = '';
+  modal.classList.remove('hidden');
+  await loadTableIndexes(tableName);
+}
+
+async function loadTableIndexes(tableName) {
+  const list = document.getElementById('index-modal-list');
+  list.innerHTML = '<span style="color:var(--muted)">Загрузка…</span>';
+  try {
+    const data = await apiFetch(`/api/tables/${encodeURIComponent(tableName)}/indexes`);
+    if (!data.length) { list.innerHTML = '<span style="color:var(--muted)">Индексов нет</span>'; return; }
+    list.innerHTML = data.map(ix => `<span class="col-pill int">⚡ ${escHtml(ix.column)}</span>`).join(' ');
+  } catch (_) { list.innerHTML = '<span style="color:var(--muted)">—</span>'; }
+}
+
+async function createIndex() {
+  const table = document.getElementById('index-modal-table').value;
+  const col   = document.getElementById('index-modal-col').value.trim();
+  if (!col) { showToast('Укажите колонку', 'warn'); return; }
+  const status = document.getElementById('index-modal-status');
+  status.textContent = '…';
+  try {
+    await apiPost(`/api/tables/${encodeURIComponent(table)}/indexes`, { column: col });
+    status.innerHTML = '<span style="color:var(--green)">Индекс создан</span>';
+    await loadTableIndexes(table);
+    showToast(`Индекс по ${col} создан`, 'ok');
+  } catch (err) {
+    status.innerHTML = `<span style="color:var(--red)">${escHtml(String(err))}</span>`;
+  }
 }
 
 async function deleteTable(name) {
@@ -667,11 +708,11 @@ function makeStepCard(step, idx) {
         <div class="form-group" style="margin:0">
           <label>Источник данных</label>
           <select onchange="pbChangeConnType(${idx}, this.value)">
-            <option value=""        ${!step.connector_type                                                         ?'selected':''}>— только SQL-трансформация —</option>
-            <option value="csv"     ${step.connector_type==='csv'                                                  ?'selected':''}>CSV файл</option>
-            <option value="http"    ${step.connector_type==='http'                                                 ?'selected':''}>HTTP endpoint</option>
-            <option value="postgres"${step.connector_type==='postgres'                                             ?'selected':''}>PostgreSQL</option>
-            <option value="mysql"   ${step.connector_type==='mysql'                                                ?'selected':''}>MySQL</option>
+            <option value=""           ${!step.connector_type                      ?'selected':''}>— только SQL-трансформация —</option>
+            <option value="csv"        ${step.connector_type==='csv'               ?'selected':''}>CSV файл</option>
+            <option value="parquet"    ${step.connector_type==='parquet'           ?'selected':''}>Parquet файл</option>
+            <option value="json_http"  ${step.connector_type==='json_http'         ?'selected':''}>HTTP / REST API (JSON)</option>
+            <option value="postgresql" ${step.connector_type==='postgresql'        ?'selected':''}>PostgreSQL</option>
           </select>
         </div>
         <div class="form-group" style="margin:0">
@@ -721,13 +762,23 @@ function makeConnectorConfigHTML(step, idx) {
       </div>
     </div>`;
 
-  if (type === 'http') return `
+  if (type === 'parquet') return `
+    <div class="step-row-2">
+      <div class="form-group" style="margin:0;flex:3">
+        <label>Путь или glob-паттерн</label>
+        <input type="text" value="${escAttr(cfg.path || '')}"
+               oninput="pbUpdateConnConfig(${idx},'path',this.value)"
+               placeholder="/data/exports/*.parquet">
+      </div>
+    </div>`;
+
+  if (type === 'json_http') return `
     <div class="step-row-2">
       <div class="form-group" style="margin:0;flex:3">
         <label>Адрес (URL)</label>
         <input type="text" value="${escAttr(cfg.url || '')}"
                oninput="pbUpdateConnConfig(${idx},'url',this.value)"
-               placeholder="https://api.example.com/data.json">
+               placeholder="https://api.example.com/data">
       </div>
       <div class="form-group" style="margin:0;flex:1">
         <label>Метод</label>
@@ -736,21 +787,49 @@ function makeConnectorConfigHTML(step, idx) {
           <option ${cfg.method==='POST'?'selected':''}>POST</option>
         </select>
       </div>
-    </div>`;
-
-  if (type === 'postgres' || type === 'mysql') return `
+    </div>
     <div class="step-row-2">
       <div class="form-group" style="margin:0">
-        <label>Хост:Порт</label>
+        <label>Авторизация</label>
+        <select onchange="pbUpdateConnConfig(${idx},'auth_type',this.value)">
+          <option value="none"    ${(cfg.auth_type||'none')==='none'   ?'selected':''}>Нет</option>
+          <option value="bearer"  ${cfg.auth_type==='bearer'           ?'selected':''}>Bearer Token</option>
+          <option value="api_key" ${cfg.auth_type==='api_key'          ?'selected':''}>API Key</option>
+        </select>
+      </div>
+      <div class="form-group" style="margin:0;flex:2" ${(cfg.auth_type||'none')==='none'?'style="display:none"':''}>
+        <label>Токен / ключ</label>
+        <input type="text" value="${escAttr(cfg.auth_token || '')}"
+               oninput="pbUpdateConnConfig(${idx},'auth_token',this.value)"
+               placeholder="sk-...">
+      </div>
+      <div class="form-group" style="margin:0;flex:2">
+        <label>Путь к массиву (data_path)</label>
+        <input type="text" value="${escAttr(cfg.data_path || '')}"
+               oninput="pbUpdateConnConfig(${idx},'data_path',this.value)"
+               placeholder="data.items">
+      </div>
+    </div>`;
+
+  if (type === 'postgresql') return `
+    <div class="step-row-2">
+      <div class="form-group" style="margin:0">
+        <label>Хост</label>
         <input type="text" value="${escAttr(cfg.host || '')}"
                oninput="pbUpdateConnConfig(${idx},'host',this.value)"
-               placeholder="localhost:5432">
+               placeholder="localhost">
+      </div>
+      <div class="form-group" style="margin:0" style="max-width:100px">
+        <label>Порт</label>
+        <input type="text" value="${escAttr(cfg.port || '5432')}"
+               oninput="pbUpdateConnConfig(${idx},'port',this.value)"
+               placeholder="5432">
       </div>
       <div class="form-group" style="margin:0">
         <label>База данных</label>
-        <input type="text" value="${escAttr(cfg.database || '')}"
-               oninput="pbUpdateConnConfig(${idx},'database',this.value)"
-               placeholder="mydb">
+        <input type="text" value="${escAttr(cfg.dbname || '')}"
+               oninput="pbUpdateConnConfig(${idx},'dbname',this.value)"
+               placeholder="postgres">
       </div>
     </div>
     <div class="step-row-2">
@@ -758,13 +837,19 @@ function makeConnectorConfigHTML(step, idx) {
         <label>Пользователь</label>
         <input type="text" value="${escAttr(cfg.user || '')}"
                oninput="pbUpdateConnConfig(${idx},'user',this.value)"
-               placeholder="dbuser">
+               placeholder="postgres">
       </div>
       <div class="form-group" style="margin:0">
-        <label>Запрос / таблица источника</label>
-        <input type="text" value="${escAttr(cfg.query || '')}"
-               oninput="pbUpdateConnConfig(${idx},'query',this.value)"
-               placeholder="SELECT * FROM orders">
+        <label>Пароль</label>
+        <input type="password" value="${escAttr(cfg.password || '')}"
+               oninput="pbUpdateConnConfig(${idx},'password',this.value)"
+               placeholder="">
+      </div>
+      <div class="form-group" style="margin:0;flex:2">
+        <label>Таблица / SQL-запрос источника</label>
+        <input type="text" value="${escAttr(cfg.query || cfg.table || '')}"
+               oninput="pbUpdateConnConfig(${idx},'table',this.value)"
+               placeholder="orders или SELECT * FROM orders WHERE active=true">
       </div>
     </div>`;
 
@@ -835,31 +920,44 @@ const DROP_ZONE_DEFAULT_HTML = `
     <path d="M16 22l8-8 8 8M24 14v16" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/>
     <path d="M14 34h20" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"/>
   </svg>
-  <div class="drop-hint">Перетащите CSV / TSV файл сюда</div>
+  <div class="drop-hint">Перетащите файл сюда</div>
   <div class="drop-or">или</div>
   <button class="btn" onclick="document.getElementById('file-input').click()">Выбрать файл</button>
 `;
 
 function handleFile(file) {
-  const reader = new FileReader();
-  reader.onload = e => {
-    ingestContent = e.target.result;
-    const tableName = file.name.replace(/\.[^.]+$/, '').replace(/[^a-z0-9_]/gi, '_').toLowerCase();
-    document.getElementById('ingest-table').value = tableName;
-    document.getElementById('upload-btn').disabled = false;
-    dropZone.innerHTML = `
-      <svg class="drop-svg" style="color:var(--green)" viewBox="0 0 48 48" fill="none" xmlns="http://www.w3.org/2000/svg">
-        <circle cx="24" cy="24" r="18" stroke="currentColor" stroke-width="2.2" fill="none"/>
-        <path d="M16 24l6 6 10-10" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/>
-      </svg>
-      <div class="drop-hint">${escHtml(file.name)}</div>
-      <div class="drop-or">${fmtBytes(file.size)}</div>
-      <button class="btn btn-sm" onclick="document.getElementById('file-input').click()">Заменить файл</button>
-    `;
-    processIngestCSV(ingestContent);
-    document.getElementById('file-input').value = '';
-  };
-  reader.readAsText(file);
+  const isParquet = /\.parquet$/i.test(file.name);
+  if (isParquet) switchIngestMode('parquet');
+
+  ingestFile = file;
+  const tableName = file.name.replace(/\.[^.]+$/, '').replace(/[^a-z0-9_]/gi, '_').toLowerCase();
+  document.getElementById('ingest-table').value = tableName;
+  document.getElementById('upload-btn').disabled = false;
+  dropZone.innerHTML = `
+    <svg class="drop-svg" style="color:var(--green)" viewBox="0 0 48 48" fill="none" xmlns="http://www.w3.org/2000/svg">
+      <circle cx="24" cy="24" r="18" stroke="currentColor" stroke-width="2.2" fill="none"/>
+      <path d="M16 24l6 6 10-10" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/>
+    </svg>
+    <div class="drop-hint">${escHtml(file.name)}</div>
+    <div class="drop-or">${fmtBytes(file.size)}</div>
+    <button class="btn btn-sm" onclick="document.getElementById('file-input').click()">Заменить файл</button>
+  `;
+  if (!isParquet) {
+    const reader = new FileReader();
+    reader.onload = e => { ingestContent = e.target.result; processIngestCSV(ingestContent); };
+    reader.readAsText(file);
+  } else {
+    document.getElementById('ingest-right').style.display = 'none';
+  }
+  document.getElementById('file-input').value = '';
+}
+
+function switchIngestMode(mode) {
+  ingestMode = mode;
+  document.getElementById('tab-csv')?.classList.toggle('active', mode === 'csv');
+  document.getElementById('tab-parquet')?.classList.toggle('active', mode === 'parquet');
+  const hint = document.querySelector('.drop-hint');
+  if (hint && !ingestFile) hint.textContent = mode === 'parquet' ? 'Перетащите .parquet файл сюда' : 'Перетащите файл сюда';
 }
 
 function detectDelimiterStr(line) {
@@ -911,6 +1009,7 @@ function showPreview(csv) {
 }
 
 async function uploadCSV() {
+  if (ingestMode === 'parquet') { uploadParquet(); return; }
   const table = document.getElementById('ingest-table').value.trim() || 'upload';
   if (!ingestContent) { showToast('Файл не выбран', 'warn'); return; }
   const status = document.getElementById('ingest-status');
@@ -922,6 +1021,29 @@ async function uploadCSV() {
     logActivity(`загружено ${resp.rows} строк → ${resp.table}`);
     document.getElementById('upload-btn').disabled = true;
     ingestContent = null; ingestColumns = [];
+    dropZone.innerHTML = DROP_ZONE_DEFAULT_HTML;
+    document.getElementById('ingest-right').style.display = 'none';
+    document.getElementById('ingest-table').value = '';
+    document.getElementById('file-input').value = '';
+  } catch (err) {
+    status.innerHTML = `<span style="color:var(--red)">Error: ${escHtml(String(err))}</span>`;
+    showToast(String(err), 'error');
+  }
+}
+
+
+async function uploadParquet() {
+  const table = document.getElementById('ingest-table').value.trim() || 'upload';
+  if (!ingestFile) { showToast('Файл не выбран', 'warn'); return; }
+  const status = document.getElementById('ingest-status');
+  status.textContent = 'Загрузка…';
+  try {
+    const resp = await apiPostRaw(`/api/ingest/parquet?table=${encodeURIComponent(table)}`, ingestFile, 'application/octet-stream');
+    status.innerHTML = `<span style="color:var(--green)">✓ ${fmtNum(resp.rows)} строк → <strong>${resp.table}</strong></span>`;
+    showToast(`Импортировано ${fmtNum(resp.rows)} строк в "${resp.table}"`, 'ok');
+    logActivity(`загружено ${resp.rows} строк (parquet) → ${resp.table}`);
+    document.getElementById('upload-btn').disabled = true;
+    ingestContent = null; ingestFile = null;
     dropZone.innerHTML = DROP_ZONE_DEFAULT_HTML;
     document.getElementById('ingest-right').style.display = 'none';
     document.getElementById('ingest-table').value = '';

@@ -1702,6 +1702,9 @@ static void h_table_delete(HttpReq *req, HttpResp *resp) {
     http_resp_json(resp, 200, "{\"status\":\"deleted\"}");
 }
 
+/* forward declaration — определение ниже */
+static Table *recreate_table(App *app, Arena *a, const char *tname, Schema *schema);
+
 /* ── POST /api/ingest/csv ── */
 static void h_ingest_csv(HttpReq *req, HttpResp *resp) {
     const char *table_name=hm_get(&req->params,"table");
@@ -1794,6 +1797,69 @@ static void h_ingest_csv(HttpReq *req, HttpResp *resp) {
     jb_key(&jb,"table");  jb_str(&jb,tname);
     jb_key(&jb,"rows");   jb_int(&jb,row_count);
     jb_key(&jb,"columns");jb_int(&jb,ncols);
+    jb_key(&jb,"status"); jb_str(&jb,"ok");
+    jb_obj_end(&jb);
+    http_resp_json(resp,200,jb_done(&jb));
+}
+
+/* ── POST /api/ingest/parquet?table=X ── */
+static void h_ingest_parquet(HttpReq *req, HttpResp *resp) {
+    const char *qs=req->query;
+    char tname[128]="uploaded";
+    if (qs) { const char *p=strstr(qs,"table="); if(p) sscanf(p+6,"%127[^&]",tname); }
+
+    if (!valid_table_name(tname)) { http_resp_error(resp,400,"invalid table name"); return; }
+    if (!req->body||req->body_len==0) { http_resp_error(resp,400,"empty body"); return; }
+
+    /* Сохраняем тело во временный файл */
+    char tmp_path[256];
+    snprintf(tmp_path,sizeof(tmp_path),"/tmp/dfo_pq_%lld.parquet",(long long)time(NULL));
+    FILE *f=fopen(tmp_path,"wb");
+    if (!f) { http_resp_error(resp,500,"can't write tmp"); return; }
+    fwrite(req->body,1,req->body_len,f); fclose(f);
+
+    /* Конфиг коннектора: путь к только что записанному файлу */
+    char cfg[600]; snprintf(cfg,sizeof(cfg),"{\"path\":\"%s\"}",tmp_path);
+    char so_path[512];
+    snprintf(so_path,sizeof(so_path),"%s/parquet_connector.so",g_app.plugins_dir);
+
+    Arena *a=arena_create(4194304);
+    ConnectorInst *inst=connector_load(so_path,cfg,a);
+    if (!inst) {
+        remove(tmp_path); arena_destroy(a);
+        http_resp_error(resp,500,"parquet connector not found"); return;
+    }
+    const DfoConnector *api=connector_api(inst);
+    void *ctx=connector_ctx(inst);
+
+    int total_rows=0; Table *t=NULL; bool table_created=false;
+    char cursor_buf[32]="0";
+
+    for (;;) {
+        DfoReadReq rreq={ .cursor=cursor_buf, .limit=BATCH_SIZE };
+        ColBatch *batch=NULL;
+        if (api->read_batch(ctx,a,&rreq,"",&batch)!=0||!batch||batch->nrows==0) break;
+
+        if (!table_created) {
+            t=recreate_table(&g_app,a,tname,batch->schema);
+            catalog_register_table(g_app.catalog,tname,batch->schema);
+            table_created=true;
+        }
+        table_append(t,batch);
+        total_rows+=batch->nrows;
+        snprintf(cursor_buf,sizeof(cursor_buf),"%d",total_rows);
+        if (batch->nrows<BATCH_SIZE) break;
+    }
+
+    connector_unload(inst);
+    arena_destroy(a);
+    remove(tmp_path);
+
+    Arena *ra=arena_create(256);
+    JBuf jb; jb_init(&jb,ra,256);
+    jb_obj_begin(&jb);
+    jb_key(&jb,"table");  jb_str(&jb,tname);
+    jb_key(&jb,"rows");   jb_int(&jb,total_rows);
     jb_key(&jb,"status"); jb_str(&jb,"ok");
     jb_obj_end(&jb);
     http_resp_json(resp,200,jb_done(&jb));
@@ -2373,7 +2439,8 @@ void api_register_routes(Router *r) {
     router_add(r,"POST", "/api/tables/query",        h_query);
     router_add(r,"GET",  "/api/tables/:name/schema", h_table_schema);
     router_add(r,"DELETE","/api/tables/:name",       h_table_delete);
-    router_add(r,"POST", "/api/ingest/csv",          h_ingest_csv);
+    router_add(r,"POST", "/api/ingest/csv",            h_ingest_csv);
+    router_add(r,"POST", "/api/ingest/parquet",        h_ingest_parquet);
     router_add(r,"GET",  "/api/pipelines",           h_pipelines_list);
     router_add(r,"POST", "/api/pipelines",           h_pipeline_create);
     router_add(r,"GET",  "/api/pipelines/:id",       h_pipeline_get);

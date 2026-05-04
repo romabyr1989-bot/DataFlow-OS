@@ -1387,3 +1387,26 @@ details[open] .st-summary::before { content: '▼ '; }
 .modal-overlay { position:fixed; inset:0; background:rgba(0,0,0,0.45); display:flex; align-items:center; justify-content:center; z-index:1000; }
 .modal-overlay .modal-box { min-width:360px; max-width:520px; width:100%; }
 .modal-box h3 { margin:0 0 1rem; font-size:1.1rem; }
+
+/* ── Ingest tabs ── */
+.ingest-tabs { display: flex; gap: .25rem; margin-bottom: .75rem; }
+.ingest-tab {
+  padding: .35rem .9rem;
+  border-radius: var(--radius);
+  border: 1px solid var(--border);
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+  font-size: .82rem;
+  font-weight: 500;
+  transition: all .15s;
+}
+.ingest-tab:hover { color: var(--text); border-color: var(--accent2); }
+.ingest-tab.active { background: var(--accent); border-color: var(--accent); color: #fff; }
+
+/* ── Source badge: parquet ── */
+.source-badge.parquet { background: rgba(251,191,36,.15); color: #fbbf24; border-color: rgba(251,191,36,.3); }
+
+/* ── Index button in table card ── */
+.idx-btn { font-size: .7rem; padding: .1rem .45rem; margin-left: .4rem; vertical-align: middle; opacity: .7; }
+.idx-btn:hover { opacity: 1; }

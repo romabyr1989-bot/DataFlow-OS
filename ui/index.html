@@ -144,7 +144,7 @@
     <section id="view-ingest" class="view">
       <h1>Загрузка данных</h1>
 
-      <input id="file-input" type="file" accept=".csv,.tsv,.txt"
+      <input id="file-input" type="file" accept=".csv,.tsv,.txt,.parquet"
              style="display:none" onchange="handleFileSelect(this)">
 
       <div class="ingest-layout">
@@ -156,13 +156,17 @@
             <input id="ingest-table" type="text" placeholder="my_table">
           </div>
 
+          <div class="ingest-tabs" id="ingest-tabs">
+            <button class="ingest-tab active" id="tab-csv" onclick="switchIngestMode('csv')">CSV / TSV</button>
+            <button class="ingest-tab" id="tab-parquet" onclick="switchIngestMode('parquet')">Parquet</button>
+          </div>
           <div id="drop-zone" class="drop-zone">
             <svg class="drop-svg" viewBox="0 0 48 48" fill="none" xmlns="http://www.w3.org/2000/svg">
               <rect x="6" y="10" width="36" height="28" rx="4" stroke="currentColor" stroke-width="2.2" fill="none"/>
               <path d="M16 22l8-8 8 8M24 14v16" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/>
               <path d="M14 34h20" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"/>
             </svg>
-            <div class="drop-hint">Перетащите CSV / TSV файл сюда</div>
+            <div class="drop-hint">Перетащите файл сюда</div>
             <div class="drop-or">или</div>
             <button class="btn" onclick="document.getElementById('file-input').click()">Выбрать файл</button>
           </div>
@@ -516,6 +520,28 @@
     <div style="display:flex;gap:0.5rem;margin-top:1rem;justify-content:flex-end">
       <button class="btn" onclick="closeSaveModal()">Отмена</button>
       <button class="btn btn-primary" onclick="confirmSaveResult()">Сохранить</button>
+    </div>
+  </div>
+</div>
+<!-- Index manager modal -->
+<div id="index-modal" class="modal hidden">
+  <div class="modal-box">
+    <h2 id="index-modal-title">Индексы</h2>
+    <input type="hidden" id="index-modal-table">
+    <div style="margin:.75rem 0">
+      <div style="font-size:.8rem;color:var(--muted);margin-bottom:.4rem">Существующие индексы:</div>
+      <div id="index-modal-list"></div>
+    </div>
+    <div class="form-group" style="margin-top:1rem">
+      <label>Создать индекс по колонке (INT64)</label>
+      <div style="display:flex;gap:.5rem">
+        <input id="index-modal-col" type="text" placeholder="column_name" style="flex:1">
+        <button class="btn btn-primary" onclick="createIndex()">Создать</button>
+      </div>
+      <div id="index-modal-status" style="margin-top:.4rem;font-size:.8rem"></div>
+    </div>
+    <div class="modal-actions">
+      <button class="btn" onclick="document.getElementById('index-modal').classList.add('hidden')">Закрыть</button>
     </div>
   </div>
 </div>
