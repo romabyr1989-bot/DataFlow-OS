@@ -1,0 +1,141 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>DataFlow OS</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div id="app">
+  <!-- Sidebar -->
+  <aside id="sidebar">
+    <div class="logo">
+      <span class="logo-icon">⬡</span>
+      <span class="logo-text">DataFlow OS</span>
+    </div>
+    <nav>
+      <a class="nav-item active" data-view="overview"   href="#">Overview</a>
+      <a class="nav-item"        data-view="tables"     href="#">Tables</a>
+      <a class="nav-item"        data-view="query"      href="#">Query</a>
+      <a class="nav-item"        data-view="pipelines"  href="#">Pipelines</a>
+      <a class="nav-item"        data-view="ingest"     href="#">Ingest</a>
+      <a class="nav-item"        data-view="metrics"    href="#">Metrics</a>
+    </nav>
+    <div class="sidebar-footer">
+      <span id="ws-status" class="badge badge-warn">connecting…</span>
+    </div>
+  </aside>
+
+  <!-- Main content -->
+  <main id="main">
+    <!-- ── Overview ── -->
+    <section id="view-overview" class="view active">
+      <h1>Overview</h1>
+      <div class="stat-grid" id="stat-grid">
+        <div class="stat-card"><div class="stat-val" id="stat-tables">—</div><div class="stat-label">Tables</div></div>
+        <div class="stat-card"><div class="stat-val" id="stat-rows">—</div><div class="stat-label">Total rows</div></div>
+        <div class="stat-card"><div class="stat-val" id="stat-pipelines">—</div><div class="stat-label">Pipelines</div></div>
+        <div class="stat-card"><div class="stat-val" id="stat-uptime">—</div><div class="stat-label">Uptime</div></div>
+      </div>
+      <h2>Recent activity</h2>
+      <div id="activity-log" class="log-box">No events yet.</div>
+    </section>
+
+    <!-- ── Tables ── -->
+    <section id="view-tables" class="view">
+      <h1>Tables <button class="btn btn-sm" onclick="loadTables()">↻ Refresh</button></h1>
+      <div id="tables-list" class="card-grid"></div>
+    </section>
+
+    <!-- ── Query ── -->
+    <section id="view-query" class="view">
+      <h1>SQL Query</h1>
+      <div class="query-panel">
+        <textarea id="sql-input" spellcheck="false" placeholder="SELECT * FROM my_table LIMIT 100"></textarea>
+        <div class="query-toolbar">
+          <button class="btn btn-primary" onclick="runQuery()">▶ Run</button>
+          <button class="btn" onclick="document.getElementById('sql-input').value=''">Clear</button>
+          <span id="query-status" class="query-stat"></span>
+        </div>
+      </div>
+      <div id="query-result"></div>
+    </section>
+
+    <!-- ── Pipelines ── -->
+    <section id="view-pipelines" class="view">
+      <h1>Pipelines
+        <button class="btn btn-primary btn-sm" onclick="showPipelineEditor()">+ New</button>
+        <button class="btn btn-sm" onclick="loadPipelines()">↻ Refresh</button>
+      </h1>
+      <div id="pipelines-list"></div>
+      <!-- Pipeline editor modal -->
+      <div id="pipeline-modal" class="modal hidden">
+        <div class="modal-box">
+          <h2>New Pipeline</h2>
+          <div class="form-group">
+            <label>Name</label>
+            <input id="p-name" type="text" placeholder="My ETL Pipeline">
+          </div>
+          <div class="form-group">
+            <label>Schedule (cron or @daily)</label>
+            <input id="p-cron" type="text" placeholder="0 * * * *">
+          </div>
+          <div class="form-group">
+            <label>Pipeline JSON (steps)</label>
+            <textarea id="p-json" rows="10" placeholder='{"steps":[{"id":"s1","name":"Load CSV","connector_type":"csv","target_table":"my_table"}]}'></textarea>
+          </div>
+          <div class="modal-actions">
+            <button class="btn btn-primary" onclick="createPipeline()">Create</button>
+            <button class="btn" onclick="hidePipelineEditor()">Cancel</button>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ── Ingest ── -->
+    <section id="view-ingest" class="view">
+      <h1>Ingest Data</h1>
+      <div class="card">
+        <h2>Upload CSV</h2>
+        <div class="form-group">
+          <label>Target table name</label>
+          <input id="ingest-table" type="text" placeholder="my_table">
+        </div>
+        <div class="form-group">
+          <label>CSV File</label>
+          <div id="drop-zone" class="drop-zone">
+            <span>Drop CSV file here or <label class="link" for="file-input">browse</label></span>
+            <input id="file-input" type="file" accept=".csv,.tsv" style="display:none" onchange="handleFileSelect(this)">
+          </div>
+        </div>
+        <div id="ingest-preview" class="hidden">
+          <h3>Preview</h3>
+          <div id="preview-table"></div>
+        </div>
+        <button class="btn btn-primary" id="upload-btn" onclick="uploadCSV()" disabled>Upload</button>
+        <div id="ingest-status"></div>
+      </div>
+      <div class="card" style="margin-top:1.5rem">
+        <h2>Paste CSV</h2>
+        <textarea id="paste-csv" rows="8" placeholder="paste,your,csv,here&#10;1,foo,bar&#10;2,baz,qux"></textarea>
+        <div class="form-group" style="margin-top:.75rem">
+          <label>Table name</label>
+          <input id="paste-table" type="text" placeholder="pasted_data">
+        </div>
+        <button class="btn btn-primary" onclick="uploadPasted()">Upload pasted CSV</button>
+        <div id="paste-status"></div>
+      </div>
+    </section>
+
+    <!-- ── Metrics ── -->
+    <section id="view-metrics" class="view">
+      <h1>Metrics</h1>
+      <div class="stat-grid" id="metrics-detail"></div>
+      <canvas id="metrics-chart" height="200"></canvas>
+    </section>
+  </main>
+</div>
+<script src="app.js"></script>
+</body>
+</html>
