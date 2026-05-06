@@ -5,6 +5,7 @@
 #include "../../lib/observ/observ.h"
 #include "../../lib/core/hashmap.h"
 #include "../../lib/core/threadpool.h"
+#include "../../lib/auth/auth.h"
 #include <pthread.h>
 
 #define DATA_DIR_DEFAULT "./data"
@@ -33,6 +34,12 @@ typedef struct {
     char        db_path[512];
     char        plugins_dir[512];  /* directory containing *_connector.so files */
     int         port;
+
+    /* auth */
+    AuthStore  *auth_store;
+    char        jwt_secret[AUTH_JWT_SECRET_LEN + 1];
+    bool        auth_enabled;
+    char        admin_password[256];
 
     /* server */
     Router      router;

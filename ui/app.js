@@ -11,6 +11,10 @@ let metricsTimer   = null;
 let analyticsState = { tables: [], currentRows: [], currentCols: [], charts: [] };
 let lastStatsReport = null;
 
+/* Auth */
+let jwtToken = sessionStorage.getItem('dfo_jwt') || null;
+let isLoggedIn = !!jwtToken;
+
 /* Pipeline builder */
 const pb = { steps: [], editId: null, max_retries: 3, retry_delay_sec: 30, webhook_url: '', webhook_on: 'failure', alert_cooldown: 300 };
 
@@ -3033,30 +3037,46 @@ async function deleteSavedResult(id) {
 /* ═══════════════════════════════════════════════════
    API HELPERS
 ═══════════════════════════════════════════════════ */
-async function apiFetch(path, method = 'GET') {
-  const resp = await fetch(API + path, { method });
+async function apiFetch(path, method = 'GET', body = null) {
+  const headers = {};
+  if (jwtToken) headers['Authorization'] = `Bearer ${jwtToken}`;
+  const resp = await fetch(API + path, { method, headers, body });
+  if (resp.status === 401) {
+    // Unauthorized, redirect to login
+    logout();
+    return;
+  }
   if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
   return resp.json();
 }
 
 async function apiGet(path) {
-  const resp = await fetch(API + path, { method: 'GET' });
+  const headers = {};
+  if (jwtToken) headers['Authorization'] = `Bearer ${jwtToken}`;
+  const resp = await fetch(API + path, { method: 'GET', headers });
+  if (resp.status === 401) { logout(); return; }
   if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
   return resp.json();
 }
 
 async function apiDelete(url) {
-  const r = await fetch(API + url, { method: 'DELETE' });
+  const headers = {};
+  if (jwtToken) headers['Authorization'] = `Bearer ${jwtToken}`;
+  const r = await fetch(API + url, { method: 'DELETE', headers });
+  if (r.status === 401) { logout(); return; }
   if (!r.ok) throw new Error(await r.text());
   return r.json();
 }
 
 async function apiPost(path, body) {
+  const headers = { 'Content-Type': 'application/json' };
+  if (jwtToken) headers['Authorization'] = `Bearer ${jwtToken}`;
   const resp = await fetch(API + path, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers,
     body: JSON.stringify(body),
   });
+  if (resp.status === 401) { logout(); return; }
   if (!resp.ok) {
     const text = await resp.text();
     throw new Error(text || `HTTP ${resp.status}`);
@@ -3065,11 +3085,14 @@ async function apiPost(path, body) {
 }
 
 async function apiPostRaw(path, body, contentType) {
+  const headers = { 'Content-Type': contentType };
+  if (jwtToken) headers['Authorization'] = `Bearer ${jwtToken}`;
   const resp = await fetch(API + path, {
     method: 'POST',
-    headers: { 'Content-Type': contentType },
+    headers,
     body,
   });
+  if (resp.status === 401) { logout(); return; }
   if (!resp.ok) {
     const text = await resp.text();
     throw new Error(text || `HTTP ${resp.status}`);
@@ -3094,6 +3117,76 @@ function pluralRows(n) {
 function escHtml(s) {
   return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
 }
+
+/* ═══════════════════════════════════════════════════
+   AUTH
+═══════════════════════════════════════════════════ */
+function showLogin() {
+  document.getElementById('login-screen').style.display = 'flex';
+  document.getElementById('main-app').style.display = 'none';
+}
+
+function hideLogin() {
+  document.getElementById('login-screen').style.display = 'none';
+  document.getElementById('main-app').style.display = 'block';
+}
+
+async function login(username, password) {
+  try {
+    const resp = await fetch(API + '/api/auth/token', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username, password }),
+    });
+    if (!resp.ok) throw new Error('Invalid credentials');
+    const data = await resp.json();
+    jwtToken = data.token;
+    sessionStorage.setItem('dfo_jwt', jwtToken);
+    isLoggedIn = true;
+    hideLogin();
+    initApp();
+  } catch (e) {
+    alert('Login failed: ' + e.message);
+  }
+}
+
+function logout() {
+  jwtToken = null;
+  sessionStorage.removeItem('dfo_jwt');
+  isLoggedIn = false;
+  showLogin();
+}
+
+document.getElementById('login-form').addEventListener('submit', e => {
+  e.preventDefault();
+  const username = document.getElementById('login-username').value;
+  const password = document.getElementById('login-password').value;
+  login(username, password);
+});
+
+/* ═══════════════════════════════════════════════════
+   INIT
+═══════════════════════════════════════════════════ */
+function initApp() {
+  loadPrefs();
+  applyPrefs();
+  applyPrefsToSettingsForm();
+
+  const hash = location.hash.replace('#', '') || 'ingest';
+  switchView(hash, { pushState: false });
+
+  connectWS();
+  metricsTimer = setInterval(loadMetrics, prefs.refreshInterval * 1000);
+}
+
+document.addEventListener('DOMContentLoaded', () => {
+  if (isLoggedIn) {
+    hideLogin();
+    initApp();
+  } else {
+    showLogin();
+  }
+});
 function escAttr(s) {
   return String(s).replace(/'/g,'&#39;').replace(/"/g,'&quot;').replace(/\n/g,'').replace(/\r/g,'');
 }

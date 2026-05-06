@@ -4,6 +4,8 @@
 #include "../../lib/sql_parser/sql.h"
 #include "../../lib/storage/storage.h"
 #include "../../lib/connector/connector.h"
+#include "../../lib/auth/auth.h"
+#include <sqlite3.h>
 #include <string.h>
 #include <strings.h>
 #include <stdio.h>
@@ -2827,6 +2829,140 @@ static void h_connector_probe_schema(HttpReq *req, HttpResp *resp) {
     arena_destroy(a);
 }
 
+/* ── Auth handlers ── */
+static void h_auth_token(HttpReq *req, HttpResp *resp) {
+    if (!req->body || req->body_len == 0) {
+        http_resp_error(resp, 400, "missing body");
+        return;
+    }
+    Arena *a = req->arena;  // Use request arena, don't create new one
+    JVal *body = json_parse(a, req->body, req->body_len);
+    if (!body || body->type != JV_OBJECT) {
+        http_resp_error(resp, 400, "invalid json");
+        return;
+    }
+    const char *username = json_str(json_get(body, "username"), NULL);
+    const char *password = json_str(json_get(body, "password"), NULL);
+    if (!username || !password) {
+        http_resp_error(resp, 400, "missing username or password");
+        return;
+    }
+    if (strcmp(username, "admin") != 0 || strcmp(password, g_app.admin_password) != 0) {
+        http_resp_error(resp, 401, "invalid credentials");
+        return;
+    }
+    AuthClaims claims;
+    strncpy(claims.user_id, username, sizeof(claims.user_id) - 1);
+    claims.role = ROLE_ADMIN;
+    claims.exp = (int64_t)time(NULL) + 86400;  // 1 day
+    char token[1024];
+    if (auth_jwt_sign(g_app.jwt_secret, &claims, token, sizeof(token)) != 0) {
+        http_resp_error(resp, 500, "token generation failed");
+        return;
+    }
+    JBuf jb; jb_init(&jb, a, 512);
+    jb_obj_begin(&jb);
+    jb_key(&jb, "token"); jb_str(&jb, token);
+    jb_key(&jb, "expires_in"); jb_int(&jb, 86400);
+    jb_obj_end(&jb);
+    http_resp_json(resp, 200, jb_done(&jb));
+}
+
+static void h_auth_apikey_create(HttpReq *req, HttpResp *resp) {
+    if (req->auth.role != ROLE_ADMIN) {
+        http_resp_error(resp, 403, "admin required");
+        return;
+    }
+    if (!req->body || req->body_len == 0) {
+        http_resp_error(resp, 400, "missing body");
+        return;
+    }
+    Arena *a = req->arena;
+    JVal *body = json_parse(a, req->body, req->body_len);
+    if (!body || body->type != JV_OBJECT) {
+        http_resp_error(resp, 400, "invalid json");
+        return;
+    }
+    const char *user_id = json_str(json_get(body, "user_id"), NULL);
+    const char *role_str = json_str(json_get(body, "role"), NULL);
+    if (!user_id || !role_str) {
+        http_resp_error(resp, 400, "missing user_id or role");
+        return;
+    }
+    AuthRole role;
+    if (strcmp(role_str, "admin") == 0) role = ROLE_ADMIN;
+    else if (strcmp(role_str, "analyst") == 0) role = ROLE_ANALYST;
+    else if (strcmp(role_str, "viewer") == 0) role = ROLE_VIEWER;
+    else {
+        http_resp_error(resp, 400, "invalid role");
+        return;
+    }
+    char key[128];
+    if (auth_apikey_create(g_app.auth_store, user_id, role, key, sizeof(key)) != 0) {
+        http_resp_error(resp, 500, "key creation failed");
+        return;
+    }
+    char *json_resp = arena_sprintf(a, "{\"key\":\"%s\",\"user_id\":\"%s\"}", key, user_id);
+    http_resp_json(resp, 200, json_resp);
+}
+
+static void h_auth_apikey_list(HttpReq *req, HttpResp *resp) {
+    if (req->auth.role != ROLE_ADMIN) {
+        http_resp_error(resp, 403, "admin required");
+        return;
+    }
+    // Simple implementation: query SQLite
+    sqlite3_stmt *stmt;
+    const char *sql = "SELECT key, user_id, role, created_at FROM auth_keys WHERE revoked = 0;";
+    if (sqlite3_prepare_v2(g_app.auth_store->db, sql, -1, &stmt, NULL) != SQLITE_OK) {
+        http_resp_error(resp, 500, "db error");
+        return;
+    }
+    Arena *a = req->arena;
+    JBuf jb; jb_init(&jb, a, 4096);
+    jb_arr_begin(&jb);
+    while (sqlite3_step(stmt) == SQLITE_ROW) {
+        const char *key = (const char *)sqlite3_column_text(stmt, 0);
+        const char *user_id = (const char *)sqlite3_column_text(stmt, 1);
+        int role = sqlite3_column_int(stmt, 2);
+        int64_t created_at = sqlite3_column_int64(stmt, 3);
+        jb_obj_begin(&jb);
+        jb_key(&jb, "key"); jb_str(&jb, key);
+        jb_key(&jb, "user_id"); jb_str(&jb, user_id);
+        jb_key(&jb, "role"); jb_str(&jb, role == ROLE_ADMIN ? "admin" : role == ROLE_ANALYST ? "analyst" : "viewer");
+        jb_key(&jb, "created_at"); jb_int(&jb, created_at);
+        jb_obj_end(&jb);
+    }
+    jb_arr_end(&jb);
+    sqlite3_finalize(stmt);
+    http_resp_json(resp, 200, jb_done(&jb));
+}
+
+static void h_auth_apikey_delete(HttpReq *req, HttpResp *resp) {
+    if (req->auth.role != ROLE_ADMIN) {
+        http_resp_error(resp, 403, "admin required");
+        return;
+    }
+    const char *key = hm_get(&req->params, "key");
+    if (!key) {
+        http_resp_error(resp, 400, "missing key");
+        return;
+    }
+    if (auth_apikey_revoke(g_app.auth_store, key) != 0) {
+        http_resp_error(resp, 404, "key not found");
+        return;
+    }
+    http_resp_json(resp, 200, "{\"ok\":true}");
+}
+
+static void h_auth_me(HttpReq *req, HttpResp *resp) {
+    const char *role_str = req->auth.role == ROLE_ADMIN ? "admin" :
+                           req->auth.role == ROLE_ANALYST ? "analyst" : "viewer";
+    char *json_resp = arena_sprintf(req->arena, "{\"user_id\":\"%s\",\"role\":\"%s\"}",
+                                    req->auth.user_id, role_str);
+    http_resp_json(resp, 200, json_resp);
+}
+
 void api_register_routes(Router *r) {
     router_add(r,"GET",  "/",           h_ui_html);
     router_add(r,"GET",  "/style.css",  h_ui_css);
@@ -2853,4 +2989,10 @@ void api_register_routes(Router *r) {
     router_add(r,"GET",   "/api/tables/:name/indexes",  h_index_list);
     router_add(r,"POST",  "/api/connector/probe/entities", h_connector_probe_entities);
     router_add(r,"POST",  "/api/connector/probe/schema",   h_connector_probe_schema);
+    // Auth endpoints
+    router_add(r,"POST", "/api/auth/token",    h_auth_token);
+    router_add(r,"POST", "/api/auth/apikeys",  h_auth_apikey_create);
+    router_add(r,"GET",  "/api/auth/apikeys",  h_auth_apikey_list);
+    router_add(r,"DELETE","/api/auth/apikeys/:key", h_auth_apikey_delete);
+    router_add(r,"GET",  "/api/auth/me",       h_auth_me);
 }

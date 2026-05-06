@@ -1,5 +1,7 @@
 #include "http.h"
 #include "../core/log.h"
+#include "../auth/auth.h"
+#include "../../src/gateway/app.h"
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
@@ -108,6 +110,37 @@ void router_dispatch(Router *r, HttpReq *req, HttpResp *resp) {
             strcmp(rt->method, "*") != 0) continue;
         hm_init(&req->params, req->arena, 8);
         if (route_match(rt->pattern, path, &req->params)) {
+            // Middleware: auth check
+            App *app = (App *)r->userdata;
+            req->auth.role = ROLE_VIEWER;  // default
+            req->auth_ok = false;
+            static const char *PUBLIC_PATHS[] = {
+                "/",           /* UI index.html */
+                "/style.css",
+                "/app.js",
+                "/api/auth/login",
+                "/api/auth/token",
+                NULL
+            };
+            bool is_public = false;
+            for (const char **pp = PUBLIC_PATHS; *pp; pp++) {
+                if (strcmp(rt->pattern, *pp) == 0) {
+                    is_public = true;
+                    break;
+                }
+            }
+            if (app && app->auth_enabled && !is_public) {
+                int auth_result = auth_check_request(app->auth_store, app->jwt_secret, (void*)req, &req->auth);
+                if (auth_result == 0) {
+                    req->auth_ok = true;
+                } else {
+                    LOG_WARN("unauthorized access to %s", path);
+                    http_resp_error(resp, 401, "unauthorized");
+                    return;
+                }
+            } else {
+                req->auth_ok = true;  // public or auth disabled
+            }
             rt->handler(req, resp);
             return;
         }

@@ -1,9 +1,11 @@
 #include "app.h"
 #include "../../lib/core/log.h"
+#include "../../lib/auth/auth.h"
 #include "../../lib/core/json.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdint.h>
 #include <signal.h>
 #include <unistd.h>
 #include <sys/stat.h>
@@ -67,6 +69,11 @@ void app_init(App *app, const char *config_json) {
             if(pd) strncpy(app->plugins_dir,pd,sizeof(app->plugins_dir)-1);
             int port=(int)json_int(json_get(cfg,"port"),0);
             if(port>0) app->port=port;
+            app->auth_enabled = json_int(json_get(cfg,"auth_enabled"),1);  // default true
+            const char *js=json_str(json_get(cfg,"jwt_secret"),NULL);
+            if(js) strncpy(app->jwt_secret,js,sizeof(app->jwt_secret)-1);
+            const char *ap=json_str(json_get(cfg,"admin_password"),NULL);
+            if(ap) strncpy(app->admin_password,ap,sizeof(app->admin_password)-1);
         }
         arena_destroy(a);
     }
@@ -80,6 +87,30 @@ void app_init(App *app, const char *config_json) {
 
     /* subsystems */
     app->catalog  = catalog_open(app->db_path);
+    app->auth_store = auth_store_create(app->db_path);
+    if (!app->auth_store) {
+        LOG_ERROR("failed to create auth store");
+        exit(1);
+    }
+    if (strlen(app->jwt_secret) == 0) {
+        /* Generate random secret as 64 hex chars (no null bytes in HMAC key) */
+        uint8_t raw[32];
+        FILE *f = fopen("/dev/urandom", "rb");
+        if (!f || fread(raw, 1, sizeof(raw), f) != sizeof(raw)) {
+            LOG_ERROR("failed to generate JWT secret");
+            if (f) fclose(f);
+            exit(1);
+        }
+        fclose(f);
+        for (int i = 0; i < 32; i++)
+            snprintf(app->jwt_secret + i*2, 3, "%02x", raw[i]);
+        app->jwt_secret[64] = '\0';
+        LOG_WARN("jwt_secret not set in config — generated random (tokens won't survive restart)");
+    }
+    if (strlen(app->admin_password) == 0) {
+        strncpy(app->admin_password, "admin", sizeof(app->admin_password)-1);
+        LOG_WARN("admin_password not set in config — using default 'admin'");
+    }
     app->metrics  = calloc(1, sizeof(Metrics)); metrics_init(app->metrics);
     app->workers  = tp_create(WORKER_THREADS, 256);
     app->scheduler= scheduler_create(on_pipeline_run, app);
@@ -114,6 +145,7 @@ void app_init(App *app, const char *config_json) {
 
     /* register routes */
     api_register_routes(&app->router);
+    app->router.userdata = app;
 
     /* create HTTP server */
     app->server = http_server_create(&app->router, app->port, 128);

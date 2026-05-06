@@ -9,6 +9,27 @@
 <body>
 <div id="app">
 
+  <!-- ── Login Screen ── -->
+  <div id="login-screen" style="display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: var(--bg); z-index: 1000; justify-content: center; align-items: center; flex-direction: column;">
+    <div style="background: var(--card-bg); padding: 2rem; border-radius: 8px; box-shadow: 0 4px 12px rgba(0,0,0,0.1); max-width: 400px; width: 100%;">
+      <h2 style="margin: 0 0 1rem 0; text-align: center;">DataFlow OS</h2>
+      <form id="login-form">
+        <div style="margin-bottom: 1rem;">
+          <label for="login-username" style="display: block; margin-bottom: 0.5rem;">Пользователь</label>
+          <input id="login-username" type="text" required style="width: 100%; padding: 0.5rem; border: 1px solid var(--border); border-radius: 4px;">
+        </div>
+        <div style="margin-bottom: 1rem;">
+          <label for="login-password" style="display: block; margin-bottom: 0.5rem;">Пароль</label>
+          <input id="login-password" type="password" required style="width: 100%; padding: 0.5rem; border: 1px solid var(--border); border-radius: 4px;">
+        </div>
+        <button type="submit" class="btn btn-primary" style="width: 100%;">Войти</button>
+      </form>
+    </div>
+  </div>
+
+  <!-- ── Main App ── -->
+  <div id="main-app">
+
   <!-- ── Sidebar ── -->
   <aside id="sidebar">
     <div class="logo">
@@ -570,6 +591,6 @@
       <button class="btn" onclick="document.getElementById('index-modal').classList.add('hidden')">Закрыть</button>
     </div>
   </div>
-</div>
+  </div>
 </body>
 </html>

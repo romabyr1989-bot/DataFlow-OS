@@ -3,5 +3,8 @@
   "data_dir": "./data",
   "log_level": "info",
   "workers": 4,
-  "connector_dir": "./build/debug/lib"
+  "connector_dir": "./build/debug/lib",
+  "auth_enabled": true,
+  "jwt_secret": "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2",
+  "admin_password": "admin"
 }

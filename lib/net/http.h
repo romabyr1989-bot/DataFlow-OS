@@ -1,6 +1,7 @@
 #pragma once
 #include "../core/arena.h"
 #include "../core/hashmap.h"
+#include "../auth/auth.h"
 #include <stddef.h>
 #include <stdbool.h>
 
@@ -19,6 +20,8 @@ typedef struct {
     Arena      *arena;
     int         fd;
     bool        upgrade_ws;
+    AuthClaims  auth;        /* заполняется middleware, role=ROLE_VIEWER по умолчанию */
+    bool        auth_ok;     /* false = не прошёл аутентификацию */
 } HttpReq;
 
 /* ── Response ── */
@@ -46,6 +49,7 @@ typedef struct {
 typedef struct {
     Route routes[HTTP_MAX_ROUTES];
     int   nroutes;
+    void *userdata;  /* pointer to App */
 } Router;
 
 void router_add(Router *r, const char *method, const char *pattern, HttpHandler h);
