@@ -183,6 +183,7 @@ async function loadQuerySidebar() {
   list.innerHTML = '<div class="empty-state" style="padding:1rem;color:var(--muted)">Загрузка…</div>';
   try {
     const tables = await apiFetch('/api/tables');
+    if (!tables) return;
     list.innerHTML = '';
     if (!tables.length) {
       list.innerHTML = '<div class="empty-state">Таблиц пока нет.<br>Перейдите в раздел <strong>Загрузка</strong>, чтобы импортировать CSV.</div>';
@@ -399,6 +400,7 @@ async function loadPipelines() {
   list.innerHTML = '<div style="color:var(--muted);padding:.5rem">Загрузка…</div>';
   try {
     const pipelines = await apiFetch('/api/pipelines');
+    if (!pipelines) return;
     if (!pipelines.length) {
       list.innerHTML = `
         <div class="empty-state">
@@ -1130,11 +1132,13 @@ function splitCSVLineDelim(line, delim) {
 ═══════════════════════════════════════════════════ */
 async function loadMetrics() {
   try {
-    const [m, tables, pipelines] = await Promise.all([
-      apiFetch('/api/metrics'),
+    const [raw, tables, pipelines] = await Promise.all([
+      apiFetch('/api/metrics').catch(() => null),
       apiFetch('/api/tables').catch(() => []),
       apiFetch('/api/pipelines').catch(() => []),
     ]);
+    if (!raw) return; /* logged out or network error */
+    const m = raw.metrics ?? raw; /* /api/metrics wraps in {metrics:{...}} */
 
     /* ── Stat cards ── */
     const grid = document.getElementById('metrics-detail');
@@ -3258,7 +3262,7 @@ function initApp() {
   switchView(hash, { pushState: false });
 
   connectWS();
-  metricsTimer = setInterval(loadMetrics, prefs.refreshInterval * 1000);
+  restartMetricsTimer(); /* clears any existing timer before starting a new one */
 }
 
 document.addEventListener('DOMContentLoaded', () => {
