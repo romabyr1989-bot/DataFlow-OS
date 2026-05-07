@@ -15,6 +15,56 @@
 #define MSG_NOSIGNAL 0
 #endif
 
+static char *expand_env_vars(const char *input) {
+    if (!input) return NULL;
+    size_t len = strlen(input);
+    size_t cap = len + 256;
+    char *out = malloc(cap + 1);
+    if (!out) return NULL;
+
+    const char *src = input;
+    char *dst = out;
+    while (*src) {
+        if (src[0] == '$' && src[1] == '{') {
+            const char *start = src + 2;
+            const char *end = strchr(start, '}');
+            if (end) {
+                size_t name_len = (size_t)(end - start);
+                char name[256];
+                if (name_len >= sizeof(name)) name_len = sizeof(name) - 1;
+                memcpy(name, start, name_len);
+                name[name_len] = '\0';
+                const char *val = getenv(name);
+                if (val) {
+                    size_t vlen = strlen(val);
+                    if ((size_t)(dst - out) + vlen + 1 > cap) {
+                        cap = (size_t)(dst - out) + vlen + 1 + 256;
+                        char *tmp = realloc(out, cap);
+                        if (!tmp) { free(out); return NULL; }
+                        dst = tmp + (dst - out);
+                        out = tmp;
+                    }
+                    memcpy(dst, val, vlen);
+                    dst += vlen;
+                }
+                src = end + 1;
+                continue;
+            }
+        }
+        if ((size_t)(dst - out) + 2 > cap) {
+            cap *= 2;
+            char *tmp = realloc(out, cap);
+            if (!tmp) { free(out); return NULL; }
+            dst = tmp + (dst - out);
+            out = tmp;
+        }
+        *dst++ = *src++;
+    }
+    *dst = '\0';
+    return out;
+}
+
+
 App g_app;
 
 /* WebSocket broadcast to all connected clients */
@@ -70,20 +120,43 @@ void app_init(App *app, const char *config_json) {
         JVal *cfg=json_parse(a,config_json,strlen(config_json));
         if(cfg&&cfg->type==JV_OBJECT){
             const char *dp=json_str(json_get(cfg,"data_dir"),NULL);
-            if(dp) strncpy(app->data_dir,dp,sizeof(app->data_dir)-1);
+            if(dp) {
+                char *expanded = expand_env_vars(dp);
+                if (expanded) { strncpy(app->data_dir,expanded,sizeof(app->data_dir)-1); free(expanded); }
+            }
             const char *pd=json_str(json_get(cfg,"plugins_dir"),NULL);
-            if(pd) strncpy(app->plugins_dir,pd,sizeof(app->plugins_dir)-1);
+            if(pd) {
+                char *expanded = expand_env_vars(pd);
+                if (expanded) { strncpy(app->plugins_dir,expanded,sizeof(app->plugins_dir)-1); free(expanded); }
+            }
             int port=(int)json_int(json_get(cfg,"port"),0);
             if(port>0) app->port=port;
             app->auth_enabled = json_int(json_get(cfg,"auth_enabled"),1);  // default true
             const char *js=json_str(json_get(cfg,"jwt_secret"),NULL);
-            if(js) strncpy(app->jwt_secret,js,sizeof(app->jwt_secret)-1);
+            if(js) {
+                char *expanded = expand_env_vars(js);
+                if (expanded) { strncpy(app->jwt_secret,expanded,sizeof(app->jwt_secret)-1); free(expanded); }
+            }
             const char *ap=json_str(json_get(cfg,"admin_password"),NULL);
-            if(ap) strncpy(app->admin_password,ap,sizeof(app->admin_password)-1);
+            if(ap) {
+                char *expanded = expand_env_vars(ap);
+                if (expanded) { strncpy(app->admin_password,expanded,sizeof(app->admin_password)-1); free(expanded); }
+            }
             const char *tc=json_str(json_get(cfg,"tls_cert"),NULL);
-            if(tc) strncpy(app->tls_cert_path,tc,sizeof(app->tls_cert_path)-1);
+            if(tc) {
+                char *expanded = expand_env_vars(tc);
+                if (expanded) { strncpy(app->tls_cert_path,expanded,sizeof(app->tls_cert_path)-1); free(expanded); }
+            }
             const char *tk=json_str(json_get(cfg,"tls_key"),NULL);
-            if(tk) strncpy(app->tls_key_path,tk,sizeof(app->tls_key_path)-1);
+            if(tk) {
+                char *expanded = expand_env_vars(tk);
+                if (expanded) { strncpy(app->tls_key_path,expanded,sizeof(app->tls_key_path)-1); free(expanded); }
+            }
+            const char *cd=json_str(json_get(cfg,"connector_dir"),NULL);
+            if(cd) {
+                char *expanded = expand_env_vars(cd);
+                if (expanded) { strncpy(app->plugins_dir,expanded,sizeof(app->plugins_dir)-1); free(expanded); }
+            }
         }
         arena_destroy(a);
     }
@@ -170,7 +243,7 @@ void app_init(App *app, const char *config_json) {
         }
     }
 
-    /* create HTTP server */
+    /* create HTTP server (http.c handles HTTPS binding on :8443 + redirect on :port) */
     app->server = http_server_create(&app->router, app->port, 128, tls_ctx);
 
     /* start scheduler */

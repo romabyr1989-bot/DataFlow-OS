@@ -1,0 +1,13 @@
+build/
+data/
+*.o
+*.d
+*.log
+*.jsonl
+.git/
+.gitignore
+Dockerfile
+docker-compose.yml
+README.md
+docs/
+tests/

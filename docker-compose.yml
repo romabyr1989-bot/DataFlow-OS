@@ -1,0 +1,29 @@
+services:
+  dfo:
+    build: .
+    image: dataflow-os:latest
+    container_name: dataflow-os
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+      - "8443:8443"
+    environment:
+      DATA_DIR:       /data
+      PLUGINS_DIR:    /app/lib
+      PORT:           8080
+      JWT_SECRET:     a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2
+      ADMIN_PASSWORD: admin
+      TLS_CERT:       /app/certs/cert.pem
+      TLS_KEY:        /app/certs/key.pem
+    volumes:
+      - dfo_data:/data
+      - ./certs:/app/certs:ro
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsk https://localhost:8443/ || exit 1"]
+      interval: 15s
+      timeout:  5s
+      start_period: 20s
+      retries: 3
+
+volumes:
+  dfo_data:
