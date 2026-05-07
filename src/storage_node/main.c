@@ -2,6 +2,7 @@
 #include "../../lib/storage/storage.h"
 #include "../../lib/core/log.h"
 #include "../../lib/core/arena.h"
+#include "../../lib/core/hashmap.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -19,19 +20,67 @@ static void sig_handler(int sig) { (void)sig; g_shutdown = 1; }
 static char     g_data_dir[512] = "./data_node";
 static Catalog *g_catalog       = NULL;
 
+static HashMap          g_tables;
+static pthread_mutex_t  g_tables_mu = PTHREAD_MUTEX_INITIALIZER;
+static uint64_t         g_last_lsn  = 0;
+
 typedef struct { int fd; } ClientCtx;
 
-static void handle_replicate(int fd, ProtoHeader *hdr, void *body) {
-    if (!body || hdr->body_len < sizeof(ProtoReplicateHdr)) {
-        proto_send(fd, MSG_ACK, hdr->request_id, NULL, 0);
+/* Get or open a table on the standby (create stub if needed) */
+static Table *get_or_open_table(const char *name) {
+    pthread_mutex_lock(&g_tables_mu);
+    Table *t = (Table *)hm_get(&g_tables, name);
+    if (!t) {
+        t = table_open(name, g_data_dir);
+        if (!t) {
+            /* table doesn't exist yet — create with empty schema, will be rebuilt */
+            t = table_create(name, NULL, g_data_dir);
+        }
+        if (t) hm_set(&g_tables, name, t);
+    }
+    pthread_mutex_unlock(&g_tables_mu);
+    return t;
+}
+
+static void handle_replicate(int fd, ProtoHeader *hdr, void *body, size_t blen) {
+    ProtoReplAckBody ack = { .lsn = 0, .result_code = -1 };
+
+    if (!body || blen < sizeof(ProtoReplicateHdr)) {
+        proto_send(fd, MSG_REPL_ACK, hdr->request_id, &ack, sizeof(ack));
         return;
     }
+
     ProtoReplicateHdr *rhdr = (ProtoReplicateHdr *)body;
-    LOG_INFO("storage_node: replicate table=%s offset=%llu nrows=%u",
-             rhdr->table_name,
-             (unsigned long long)rhdr->offset,
-             rhdr->nrows);
-    proto_send(fd, MSG_ACK, hdr->request_id, NULL, 0);
+    ack.lsn = rhdr->lsn;
+
+    void   *wal_payload = (char *)body + sizeof(ProtoReplicateHdr);
+    size_t  wal_len     = blen - sizeof(ProtoReplicateHdr);
+    if (wal_len != rhdr->wal_payload_len) {
+        LOG_WARN("storage_node: payload len mismatch: got=%zu expected=%u",
+                 wal_len, rhdr->wal_payload_len);
+        proto_send(fd, MSG_REPL_ACK, hdr->request_id, &ack, sizeof(ack));
+        return;
+    }
+
+    Table *t = get_or_open_table(rhdr->table_name);
+    if (!t) {
+        LOG_ERROR("storage_node: can't open table '%s'", rhdr->table_name);
+        proto_send(fd, MSG_REPL_ACK, hdr->request_id, &ack, sizeof(ack));
+        return;
+    }
+
+    /* Apply WAL bytes — table_wal_append wraps them in TLV again, matching primary layout */
+    int rc = table_wal_append(t, wal_payload, wal_len);
+    if (rc == 0) {
+        g_last_lsn = rhdr->lsn;
+        ack.result_code = 0;
+        LOG_INFO("storage_node: applied lsn=%llu table=%s bytes=%zu",
+                 (unsigned long long)rhdr->lsn, rhdr->table_name, wal_len);
+    } else {
+        LOG_ERROR("storage_node: wal_append failed for table '%s'", rhdr->table_name);
+    }
+
+    proto_send(fd, MSG_REPL_ACK, hdr->request_id, &ack, sizeof(ack));
 }
 
 static void *client_thread_fn(void *arg) {
@@ -39,22 +88,24 @@ static void *client_thread_fn(void *arg) {
     int fd = ctx->fd;
     free(ctx);
     LOG_INFO("storage_node: client connected fd=%d", fd);
+
     while (!g_shutdown) {
         ProtoHeader hdr;
-        void *body = NULL;
-        if (proto_recv(fd, &hdr, &body, NULL) < 0) break;
+        void *body = NULL; size_t blen = 0;
+        if (proto_recv(fd, &hdr, &body, &blen) < 0) break;
+
         switch ((ProtoMsgType)hdr.msg_type) {
         case MSG_PING:
             proto_send(fd, MSG_PONG, hdr.request_id, NULL, 0);
             break;
         case MSG_REPLICATE:
-            handle_replicate(fd, &hdr, body);
+            handle_replicate(fd, &hdr, body, blen);
             break;
         case MSG_STATUS_REQ: {
             ProtoStatusBody sb;
             memset(&sb, 0, sizeof(sb));
             sb.is_leader     = 0;
-            sb.wal_offset    = 0;
+            sb.wal_offset    = g_last_lsn;
             sb.replica_count = 0;
             proto_send(fd, MSG_STATUS_RESP, hdr.request_id, &sb, sizeof(sb));
             break;
@@ -88,6 +139,7 @@ int main(int argc, char **argv) {
     snprintf(db_path, sizeof(db_path), "%s/catalog.db", g_data_dir);
     mkdir(g_data_dir, 0755);
     g_catalog = catalog_open(db_path);
+    hm_init(&g_tables, NULL, 32);
 
     int srv_fd = socket(AF_INET, SOCK_STREAM, 0);
     int opt = 1;
@@ -100,7 +152,7 @@ int main(int argc, char **argv) {
     addr.sin_port        = htons((uint16_t)port);
 
     if (bind(srv_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-        LOG_ERROR("storage_node: bind failed");
+        LOG_ERROR("storage_node: bind failed on port %d", port);
         return 1;
     }
     listen(srv_fd, 16);

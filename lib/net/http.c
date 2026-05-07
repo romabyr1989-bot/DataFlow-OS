@@ -12,6 +12,7 @@
 #include <errno.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
+#include <arpa/inet.h>
 #include <netinet/tcp.h>
 #include <signal.h>
 #include <curl/curl.h>
@@ -519,9 +520,70 @@ static void handle_conn(HttpServer *srv, int fd) {
     HttpResp resp = {0};
     strncpy(resp.correlation_id, req.correlation_id, 36);
 
+    /* Extract client IP for audit */
+    char client_ip[64] = {0};
+    {
+        struct sockaddr_storage _peer;
+        socklen_t _plen = sizeof(_peer);
+        if (getpeername(fd, (struct sockaddr *)&_peer, &_plen) == 0) {
+            if (_peer.ss_family == AF_INET)
+                inet_ntop(AF_INET,
+                    &((struct sockaddr_in *)&_peer)->sin_addr, client_ip, sizeof(client_ip));
+            else if (_peer.ss_family == AF_INET6)
+                inet_ntop(AF_INET6,
+                    &((struct sockaddr_in6 *)&_peer)->sin6_addr, client_ip, sizeof(client_ip));
+        }
+    }
+
     int64_t t_start = clock_monotonic_ms();
     router_dispatch(srv->router, &req, &resp);
     int64_t elapsed = clock_monotonic_ms() - t_start;
+
+    /* Audit middleware: log significant events */
+    App *audit_app = (App *)srv->router->userdata;
+    if (audit_app && audit_app->audit) {
+        const char *path = req.path ? req.path : "";
+        AuditEventType atype = 0;
+        if (strncmp(path, "/api/tables/query", 17) == 0)         atype = AUDIT_QUERY;
+        else if (strncmp(path, "/api/ingest/", 12) == 0)         atype = AUDIT_INGEST;
+        else if (strstr(path, "/run") || strstr(path, "/pipelines/")) atype = AUDIT_PIPELINE_RUN;
+        else if (strncmp(path, "/api/auth/token", 15) == 0)      atype = AUDIT_AUTH_LOGIN;
+        else if (strncmp(path, "/api/rbac/", 10) == 0)           atype = AUDIT_POLICY_CHANGE;
+        else if (strncmp(path, "/api/tables", 11) == 0 &&
+                 (strcmp(req.method,"POST")==0||strcmp(req.method,"DELETE")==0))
+            atype = AUDIT_SCHEMA_CHANGE;
+
+        if (atype != 0) {
+            /* extract resource name: /api/tables/X → X */
+            char res_buf[128] = {0};
+            const char *rp = strstr(path, "/api/tables/");
+            if (rp) {
+                rp += strlen("/api/tables/");
+                const char *re = strchr(rp, '/');
+                size_t rn = re ? (size_t)(re - rp) : strlen(rp);
+                if (rn >= sizeof(res_buf)) rn = sizeof(res_buf)-1;
+                memcpy(res_buf, rp, rn);
+            }
+            /* truncate body to 512 bytes for action_detail */
+            char detail[513] = {0};
+            if (req.body && req.body_len > 0) {
+                size_t dn = req.body_len < 512 ? req.body_len : 512;
+                memcpy(detail, req.body, dn);
+            }
+            AuditEvent aev = {
+                .type           = atype,
+                .user_id        = req.auth.user_id[0] ? req.auth.user_id : "anonymous",
+                .role           = req.auth.role,
+                .resource       = res_buf,
+                .action_detail  = detail,
+                .correlation_id = req.correlation_id,
+                .client_ip      = client_ip,
+                .result_code    = resp.status,
+                .duration_ms    = elapsed,
+            };
+            audit_log_event(audit_app->audit, &aev);
+        }
+    }
 
     /* HTTP metrics */
     App *metrics_app = (App *)srv->router->userdata;

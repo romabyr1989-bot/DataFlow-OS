@@ -23,7 +23,12 @@
 struct WAL {
     int     fd;
     char    path[512];
-    int64_t write_pos;   /* byte offset of next write = current file size */
+    int64_t write_pos;
+    /* replication callback */
+    WalWriteCallback repl_cb;
+    void            *repl_ud;
+    char             table_name[128];
+    uint64_t         next_lsn;
 };
 
 WAL *wal_open(const char *path) {
@@ -41,6 +46,8 @@ int wal_append(WAL *w, const void *data, size_t len) {
     if (write(w->fd, &l, 4) != 4) return -1;
     if (write(w->fd, data, len) != (ssize_t)len) return -1;
     w->write_pos += 4 + (int64_t)len;
+    if (w->repl_cb)
+        w->repl_cb(w->table_name, w->next_lsn++, data, len, w->repl_ud);
     return 0;
 }
 
@@ -133,6 +140,7 @@ Table *table_create(const char *name, Schema *schema, const char *dir) {
     table_write_schema_file(t->dir, schema);
     char wal_path[600]; snprintf(wal_path, sizeof(wal_path), "%s/wal.bin", t->dir);
     t->wal = wal_open(wal_path);
+    if (t->wal) strncpy(t->wal->table_name, name, sizeof(t->wal->table_name)-1);
     table_load_indexes(t);
     return t;
 }
@@ -143,8 +151,20 @@ Table *table_open(const char *name, const char *dir) {
     snprintf(t->dir, sizeof(t->dir), "%s/%s", dir, name);
     char wal_path[600]; snprintf(wal_path, sizeof(wal_path), "%s/wal.bin", t->dir);
     t->wal = wal_open(wal_path);
+    if (t->wal) strncpy(t->wal->table_name, name, sizeof(t->wal->table_name)-1);
     table_load_indexes(t);
     return t;
+}
+
+void table_set_wal_callback(Table *t, WalWriteCallback cb, void *userdata) {
+    if (!t || !t->wal) return;
+    t->wal->repl_cb = cb;
+    t->wal->repl_ud = userdata;
+}
+
+int table_wal_append(Table *t, const void *data, size_t len) {
+    if (!t || !t->wal) return -1;
+    return wal_append(t->wal, data, len);
 }
 
 /* Write one batch to WAL — row-by-row CSV format (default / debug).

@@ -20,6 +20,9 @@
 #include <sys/stat.h>
 #include <math.h>
 
+/* Thread-local: txn_id active during exec_stmt call (0 = auto-commit) */
+static _Thread_local TxnId g_txn_current = 0;
+
 /* ── Transaction commit callback: applies one buffered entry to a real table ── */
 static int apply_txn_entry(const char *tname, TxnOpType op,
                             ColBatch *batch,
@@ -37,6 +40,63 @@ static int apply_txn_entry(const char *tname, TxnOpType op,
         case TXN_OP_UPDATE: return table_update(t, orig_offset, new_csv, csv_len);
     }
     return -1;
+}
+
+/* ── RBAC helpers ── */
+
+/* Returns true if access is allowed; writes 403 and returns false on denial. */
+static bool check_table_access(HttpReq *req, HttpResp *resp,
+                                const char *table_name, RbacAction action)
+{
+    if (!g_app.rbac_enabled || !g_app.rbac) return true;
+    if (!g_app.auth_enabled) return true;
+    if (rbac_check(g_app.rbac, &req->auth, action, table_name) == 0) return true;
+    http_resp_error(resp, 403,
+        arena_sprintf(req->arena, "access denied to table '%s' (role=%d)",
+                      table_name, (int)req->auth.role));
+    return false;
+}
+
+static void apply_rls_to_select(SelectStmt *sel, const char *rls_sql, Arena *a)
+{
+    if (!rls_sql || !*rls_sql) return;
+    char wrapper[1280];
+    snprintf(wrapper, sizeof(wrapper), "SELECT 1 WHERE %s", rls_sql);
+    Stmt *tmp = sql_parse(a, wrapper, strlen(wrapper));
+    if (!tmp || tmp->error || tmp->type != STMT_SELECT || !tmp->select.where) {
+        LOG_WARN("RLS: failed to parse filter: %s", rls_sql);
+        return;
+    }
+    Expr *rls_expr = tmp->select.where;
+    if (!sel->where) {
+        sel->where = rls_expr;
+    } else {
+        Expr *combined = arena_calloc(a, sizeof(Expr));
+        combined->type  = EXPR_BINOP;
+        combined->op    = OP_AND;
+        combined->left  = sel->where;
+        combined->right = rls_expr;
+        sel->where = combined;
+    }
+}
+
+static bool check_select_access(HttpReq *req, HttpResp *resp, SelectStmt *sel)
+{
+    for (int i = 0; i < sel->nfrom; i++) {
+        const char *t = sel->from[i].table;
+        if (!t || !*t) continue;
+        if (!check_table_access(req, resp, t, ACTION_TABLE_READ)) return false;
+        const char *rls = rbac_row_filter(g_app.rbac, &req->auth, t, req->arena);
+        if (rls && *rls) {
+            apply_rls_to_select(sel, rls, req->arena);
+            LOG_INFO("RLS: applied filter on '%s' for user '%s'", t, req->auth.user_id);
+        }
+    }
+    for (int i = 0; i < sel->nctes; i++) {
+        if (sel->ctes[i].body && !check_select_access(req, resp, sel->ctes[i].body))
+            return false;
+    }
+    return true;
 }
 
 /* ── Table name validation ── */
@@ -2109,9 +2169,13 @@ static RS *exec_stmt(Arena *a, const Stmt *s, VTReg *vt) {
 
             /* Row matches */
             if (s->type == STMT_DELETE) {
-                pthread_mutex_lock(&g_app.tables_mu);
-                table_delete(tbl, rec_off);
-                pthread_mutex_unlock(&g_app.tables_mu);
+                if (g_txn_current != 0) {
+                    txn_buffer_delete(g_app.txn_mgr, g_txn_current, tname, rec_off);
+                } else {
+                    pthread_mutex_lock(&g_app.tables_mu);
+                    table_delete(tbl, rec_off);
+                    pthread_mutex_unlock(&g_app.tables_mu);
+                }
                 affected++;
             } else {
                 /* UPDATE: apply SET assignments to build new CSV row */
@@ -2120,7 +2184,7 @@ static RS *exec_stmt(Arena *a, const Stmt *s, VTReg *vt) {
                 for (int si = 0; si < s->dml.nset; si++) {
                     for (int ci = 0; ci < ncols; ci++) {
                         if (strcasecmp(sc->cols[ci].name, s->dml.set_cols[si]) == 0) {
-                            new_cells[ci] = s->dml.set_vals[si];
+                            new_cells[ci] = (char *)s->dml.set_vals[si];
                             break;
                         }
                     }
@@ -2134,9 +2198,14 @@ static RS *exec_stmt(Arena *a, const Stmt *s, VTReg *vt) {
                     if (n > 0) off += n;
                 }
                 new_csv[off++] = '\n';
-                pthread_mutex_lock(&g_app.tables_mu);
-                table_update(tbl, rec_off, new_csv, (size_t)off);
-                pthread_mutex_unlock(&g_app.tables_mu);
+                if (g_txn_current != 0) {
+                    txn_buffer_update(g_app.txn_mgr, g_txn_current, tname,
+                                      rec_off, new_csv, (size_t)off);
+                } else {
+                    pthread_mutex_lock(&g_app.tables_mu);
+                    table_update(tbl, rec_off, new_csv, (size_t)off);
+                    pthread_mutex_unlock(&g_app.tables_mu);
+                }
                 affected++;
             }
         }
@@ -2196,6 +2265,29 @@ static void h_query(HttpReq *req, HttpResp *resp) {
     Stmt *stmt = sql_parse(a, sql, strlen(sql));
     if (stmt->error) { http_resp_error(resp,400,stmt->error); arena_destroy(a); return; }
 
+    /* RBAC: fine-grained table access control */
+    if (g_app.rbac_enabled && g_app.rbac) {
+        bool rbac_ok = true;
+        switch (stmt->type) {
+        case STMT_SELECT:
+            rbac_ok = check_select_access(req, resp, &stmt->select);
+            break;
+        case STMT_INSERT:
+            rbac_ok = check_table_access(req, resp, stmt->insert.table, ACTION_TABLE_WRITE);
+            break;
+        case STMT_DELETE:
+        case STMT_UPDATE:
+            rbac_ok = check_table_access(req, resp, stmt->dml.table, ACTION_TABLE_WRITE);
+            break;
+        case STMT_SET_OP:
+        case STMT_BEGIN: case STMT_COMMIT: case STMT_ROLLBACK:
+        case STMT_UNKNOWN:
+            rbac_ok = true;
+            break;
+        }
+        if (!rbac_ok) { arena_destroy(a); return; }
+    }
+
     /* DML requires at least ROLE_ANALYST */
     if (stmt->type == STMT_DELETE || stmt->type == STMT_UPDATE) {
         if (g_app.auth_enabled && req->auth.role == ROLE_VIEWER) {
@@ -2254,7 +2346,9 @@ static void h_query(HttpReq *req, HttpResp *resp) {
         if (stmt->select.limit < 0 || stmt->select.limit > cap) stmt->select.limit = cap;
     }
 
+    g_txn_current = req->txn_id;
     RS *rs = exec_stmt(a, stmt, NULL);
+    g_txn_current = 0;
 
     JBuf jb; jb_init(&jb, a, 65536);
     jb_obj_begin(&jb);
@@ -2449,6 +2543,16 @@ static void h_ingest_csv(HttpReq *req, HttpResp *resp) {
     if(qs){const char*p=strstr(qs,"table=");if(p)sscanf(p+6,"%127[^&]",tname);table_name=tname;}
 
     if (!valid_table_name(tname)) { http_resp_error(resp,400,"invalid table name"); return; }
+
+    /* RBAC: CREATE if table is new, else WRITE */
+    if (g_app.rbac_enabled && g_app.rbac) {
+        pthread_mutex_lock(&g_app.tables_mu);
+        bool exists = hm_get(&g_app.tables, tname) != NULL;
+        pthread_mutex_unlock(&g_app.tables_mu);
+        RbacAction act = exists ? ACTION_TABLE_WRITE : ACTION_TABLE_CREATE;
+        if (!check_table_access(req, resp, tname, act)) return;
+    }
+
     if(!req->body||req->body_len==0){http_resp_error(resp,400,"empty body");return;}
 
     char tmp_path[256]; snprintf(tmp_path,sizeof(tmp_path),"/tmp/dfo_upload_%lld.csv",(long long)time(NULL));
@@ -2481,6 +2585,8 @@ static void h_ingest_csv(HttpReq *req, HttpResp *resp) {
     Table *t=hm_get(&g_app.tables,tname);
     if(!t){
         t=table_create(tname,schema,g_app.data_dir);
+        if (t && g_app.cluster_mode && g_app.replicator)
+            table_set_wal_callback(t, replicator_wal_cb, g_app.replicator);
         hm_set(&g_app.tables,tname,t);
         catalog_register_table(g_app.catalog,tname,schema);
         __atomic_fetch_add(&g_app.metrics->tables_count, 1, __ATOMIC_RELAXED);
@@ -2561,6 +2667,16 @@ static void h_ingest_parquet(HttpReq *req, HttpResp *resp) {
     if (qs) { const char *p=strstr(qs,"table="); if(p) sscanf(p+6,"%127[^&]",tname); }
 
     if (!valid_table_name(tname)) { http_resp_error(resp,400,"invalid table name"); return; }
+
+    /* RBAC */
+    if (g_app.rbac_enabled && g_app.rbac) {
+        pthread_mutex_lock(&g_app.tables_mu);
+        bool exists = hm_get(&g_app.tables, tname) != NULL;
+        pthread_mutex_unlock(&g_app.tables_mu);
+        RbacAction act = exists ? ACTION_TABLE_WRITE : ACTION_TABLE_CREATE;
+        if (!check_table_access(req, resp, tname, act)) return;
+    }
+
     if (!req->body||req->body_len==0) { http_resp_error(resp,400,"empty body"); return; }
 
     /* Сохраняем тело во временный файл */
@@ -2597,7 +2713,14 @@ static void h_ingest_parquet(HttpReq *req, HttpResp *resp) {
             catalog_register_table(g_app.catalog,tname,batch->schema);
             table_created=true;
         }
-        table_append(t,batch);
+        if (req->txn_id != 0) {
+            if (txn_buffer_insert(g_app.txn_mgr, req->txn_id, tname, batch) != 0) {
+                connector_unload(inst); arena_destroy(a); remove(tmp_path);
+                http_resp_error(resp, 500, "txn buffer failed"); return;
+            }
+        } else {
+            table_append(t, batch);
+        }
         total_rows+=batch->nrows;
         snprintf(cursor_buf,sizeof(cursor_buf),"%d",total_rows);
         if (batch->nrows<BATCH_SIZE) break;
@@ -2683,6 +2806,8 @@ static Table *recreate_table(App *app, Arena *a, const char *tname, Schema *sche
 
     pthread_mutex_lock(&app->tables_mu);
     Table *t = table_create(tname, schema, app->data_dir);
+    if (t && app->cluster_mode && app->replicator)
+        table_set_wal_callback(t, replicator_wal_cb, app->replicator);
     hm_set(&app->tables, tname, t);
     pthread_mutex_unlock(&app->tables_mu);
     catalog_register_table(app->catalog, tname, schema);
@@ -3367,6 +3492,20 @@ static void h_auth_token(HttpReq *req, HttpResp *resp) {
         return;
     }
     if (strcmp(username, "admin") != 0 || strcmp(password, g_app.admin_password) != 0) {
+        if (g_app.audit) {
+            AuditEvent aev = {
+                .type           = AUDIT_AUTH_FAIL,
+                .user_id        = username,
+                .role           = ROLE_VIEWER,
+                .resource       = "",
+                .action_detail  = "invalid credentials",
+                .correlation_id = req->correlation_id,
+                .client_ip      = "",
+                .result_code    = 401,
+                .duration_ms    = 0,
+            };
+            audit_log_event(g_app.audit, &aev);
+        }
         http_resp_error(resp, 401, "invalid credentials");
         return;
     }

@@ -38,6 +38,10 @@ typedef struct {
 #define WAL_OP_DELETE 0x02   /* [0x02][8-byte BE offset of deleted row] */
 #define WAL_OP_UPDATE 0x03   /* [0x03][8-byte BE offset][new CSV row\n] */
 
+/* ── WAL write callback (for replication) ── */
+typedef void (*WalWriteCallback)(const char *table_name, uint64_t lsn,
+                                  const void *data, size_t len, void *userdata);
+
 /* ── WAL ── */
 typedef struct WAL WAL;
 WAL     *wal_open  (const char *path);
@@ -55,6 +59,8 @@ typedef struct Catalog Catalog;
 typedef struct Table Table;
 Table  *table_create(const char *name, Schema *schema, const char *dir);
 Table  *table_open  (const char *name, const char *dir);
+void    table_set_wal_callback(Table *t, WalWriteCallback cb, void *userdata);
+int     table_wal_append(Table *t, const void *data, size_t len);
 int     table_append(Table *t, ColBatch *batch);
 int     table_scan  (Table *t, ColBatch **out, Arena *a);
 int     table_delete(Table *t, int64_t orig_offset);

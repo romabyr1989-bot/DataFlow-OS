@@ -1,8 +1,8 @@
 #pragma once
-#include "../storage/storage.h"
 #include "proto.h"
 #include <stdbool.h>
 #include <stdint.h>
+#include <stddef.h>
 
 typedef struct {
     int      fd;
@@ -18,5 +18,5 @@ int            storage_client_connect(StorageClient *c);
 void           storage_client_disconnect(StorageClient *c);
 int            storage_client_ping(StorageClient *c);
 int            storage_client_replicate(StorageClient *c, const char *table_name,
-                                        uint64_t offset, ColBatch *batch);
+                                        uint64_t lsn, const void *wal_data, size_t wal_len);
 int            storage_client_status(StorageClient *c, ProtoStatusBody *out);

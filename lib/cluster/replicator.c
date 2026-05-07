@@ -3,22 +3,59 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
-#include <time.h>
 #include <unistd.h>
 
-static void *heartbeat_thread_fn(void *arg) {
+static void send_to_replica(StorageClient *sc, const ReplItem *item) {
+    if (!sc->connected && storage_client_connect(sc) < 0) return;
+
+    size_t total = sizeof(ProtoReplicateHdr) + item->len;
+    void *body = malloc(total);
+    if (!body) return;
+
+    ProtoReplicateHdr hdr;
+    memset(&hdr, 0, sizeof(hdr));
+    strncpy(hdr.table_name, item->table_name, sizeof(hdr.table_name)-1);
+    hdr.lsn             = item->lsn;
+    hdr.wal_payload_len = (uint32_t)item->len;
+    memcpy(body, &hdr, sizeof(hdr));
+    if (item->len > 0) memcpy((char *)body + sizeof(hdr), item->data, item->len);
+
+    uint32_t req_id = (uint32_t)(item->lsn & 0xFFFFFFFF);
+    if (proto_send(sc->fd, MSG_REPLICATE, req_id, body, (uint32_t)total) < 0) {
+        free(body);
+        storage_client_disconnect(sc);
+        return;
+    }
+    free(body);
+
+    /* Wait for ACK */
+    ProtoHeader ahdr; void *abody = NULL; size_t alen = 0;
+    if (proto_recv(sc->fd, &ahdr, &abody, &alen) < 0) {
+        storage_client_disconnect(sc);
+        return;
+    }
+    proto_free_body(abody);
+}
+
+static void *worker_fn(void *arg) {
     Replicator *r = (Replicator *)arg;
-    while (r->running) {
-        struct timespec ts = { .tv_sec = 5, .tv_nsec = 0 };
-        nanosleep(&ts, NULL);
-        if (!r->is_leader || !r->running) continue;
-        pthread_mutex_lock(&r->mu);
-        for (int i = 0; i < r->nreplicas; i++) {
-            if (storage_client_ping(r->replicas[i]) < 0)
-                LOG_WARN("replicator: replica %s:%d unreachable",
-                         r->replicas[i]->host, r->replicas[i]->port);
-        }
-        pthread_mutex_unlock(&r->mu);
+    while (r->running || r->count > 0) {
+        pthread_mutex_lock(&r->q_mu);
+        while (r->count == 0 && r->running)
+            pthread_cond_wait(&r->q_cv, &r->q_mu);
+        if (r->count == 0) { pthread_mutex_unlock(&r->q_mu); break; }
+
+        ReplItem item = r->queue[r->head];
+        r->head = (r->head + 1) % REPL_QUEUE_CAP;
+        r->count--;
+        r->lag_count = r->count;
+        pthread_mutex_unlock(&r->q_mu);
+
+        for (int i = 0; i < r->nreplicas; i++)
+            send_to_replica(r->replicas[i], &item);
+
+        r->last_acked_lsn = item.lsn;
+        free(item.data);
     }
     return NULL;
 }
@@ -26,67 +63,84 @@ static void *heartbeat_thread_fn(void *arg) {
 Replicator *replicator_create(bool is_leader, const char *node_id) {
     Replicator *r = calloc(1, sizeof(Replicator));
     r->is_leader = is_leader;
-    if (node_id) strncpy(r->node_id, node_id, sizeof(r->node_id) - 1);
-    pthread_mutex_init(&r->mu, NULL);
+    if (node_id) strncpy(r->node_id, node_id, sizeof(r->node_id)-1);
+    pthread_mutex_init(&r->q_mu, NULL);
+    pthread_cond_init(&r->q_cv, NULL);
     r->running = 1;
-    pthread_create(&r->hb_thread, NULL, heartbeat_thread_fn, r);
+    pthread_create(&r->worker, NULL, worker_fn, r);
     return r;
 }
 
 void replicator_destroy(Replicator *r) {
     if (!r) return;
+    pthread_mutex_lock(&r->q_mu);
     r->running = 0;
-    pthread_join(r->hb_thread, NULL);
-    pthread_mutex_lock(&r->mu);
+    pthread_cond_signal(&r->q_cv);
+    pthread_mutex_unlock(&r->q_mu);
+    pthread_join(r->worker, NULL);
+    /* free remaining items */
+    while (r->count > 0) {
+        free(r->queue[r->head].data);
+        r->head = (r->head + 1) % REPL_QUEUE_CAP;
+        r->count--;
+    }
     for (int i = 0; i < r->nreplicas; i++)
         storage_client_destroy(r->replicas[i]);
-    pthread_mutex_unlock(&r->mu);
-    pthread_mutex_destroy(&r->mu);
+    pthread_mutex_destroy(&r->q_mu);
+    pthread_cond_destroy(&r->q_cv);
     free(r);
 }
 
 int replicator_add_replica(Replicator *r, const char *host, int port) {
-    pthread_mutex_lock(&r->mu);
-    if (r->nreplicas >= MAX_REPLICAS) {
-        pthread_mutex_unlock(&r->mu);
-        return -1;
-    }
+    if (r->nreplicas >= MAX_REPLICAS) return -1;
     r->replicas[r->nreplicas++] = storage_client_create(host, port);
-    pthread_mutex_unlock(&r->mu);
     return 0;
 }
 
-int replicator_replicate(Replicator *r, const char *table_name,
-                         uint64_t offset, ColBatch *batch) {
-    if (!r->is_leader) return 0;
-    int errors = 0;
-    pthread_mutex_lock(&r->mu);
-    for (int i = 0; i < r->nreplicas; i++) {
-        if (storage_client_replicate(r->replicas[i], table_name, offset, batch) < 0) {
-            LOG_WARN("replicator: failed to replicate to %s:%d",
-                     r->replicas[i]->host, r->replicas[i]->port);
-            errors++;
-        }
+void replicator_enqueue(Replicator *r, const char *table_name,
+                        uint64_t lsn, const void *data, size_t len) {
+    if (!r->is_leader) return;
+    pthread_mutex_lock(&r->q_mu);
+    if (r->count >= REPL_QUEUE_CAP) {
+        LOG_ERROR("replicator: queue full, dropping lsn=%llu", (unsigned long long)lsn);
+        pthread_mutex_unlock(&r->q_mu);
+        return;
     }
-    r->wal_offset = offset;
-    pthread_mutex_unlock(&r->mu);
-    return (r->nreplicas > 0 && errors == r->nreplicas) ? -1 : 0;
+    ReplItem *it = &r->queue[r->tail];
+    strncpy(it->table_name, table_name, sizeof(it->table_name)-1);
+    it->lsn  = lsn;
+    it->len  = len;
+    it->data = NULL;
+    if (len > 0) {
+        it->data = malloc(len);
+        if (it->data) memcpy(it->data, data, len);
+    }
+    r->tail = (r->tail + 1) % REPL_QUEUE_CAP;
+    r->count++;
+    r->lag_count = r->count;
+    pthread_cond_signal(&r->q_cv);
+    pthread_mutex_unlock(&r->q_mu);
+}
+
+void replicator_wal_cb(const char *table_name, uint64_t lsn,
+                       const void *data, size_t len, void *userdata) {
+    replicator_enqueue((Replicator *)userdata, table_name, lsn, data, len);
 }
 
 void replicator_get_status(Replicator *r, char *json_out, size_t len) {
-    pthread_mutex_lock(&r->mu);
+    pthread_mutex_lock(&r->q_mu);
     int off = snprintf(json_out, len,
         "{\"is_leader\":%s,\"node_id\":\"%s\","
-        "\"wal_offset\":%llu,\"replica_count\":%d,\"replicas\":[",
+        "\"last_acked_lsn\":%llu,\"lag_count\":%d,\"replica_count\":%d,\"replicas\":[",
         r->is_leader ? "true" : "false", r->node_id,
-        (unsigned long long)r->wal_offset, r->nreplicas);
+        (unsigned long long)r->last_acked_lsn, r->lag_count, r->nreplicas);
     for (int i = 0; i < r->nreplicas && off < (int)len - 10; i++) {
         StorageClient *sc = r->replicas[i];
-        if (i > 0) off += snprintf(json_out + off, len - (size_t)off, ",");
-        off += snprintf(json_out + off, len - (size_t)off,
+        if (i > 0) off += snprintf(json_out+off, len-(size_t)off, ",");
+        off += snprintf(json_out+off, len-(size_t)off,
             "{\"host\":\"%s\",\"port\":%d,\"connected\":%s}",
             sc->host, sc->port, sc->connected ? "true" : "false");
     }
-    snprintf(json_out + off, len - (size_t)off, "]}");
-    pthread_mutex_unlock(&r->mu);
+    snprintf(json_out+off, len-(size_t)off, "]}");
+    pthread_mutex_unlock(&r->q_mu);
 }

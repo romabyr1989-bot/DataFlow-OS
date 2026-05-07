@@ -13,6 +13,7 @@ typedef enum {
     MSG_PROMOTE     = 5,
     MSG_STATUS_REQ  = 6,
     MSG_STATUS_RESP = 7,
+    MSG_REPL_ACK    = 8,
 } ProtoMsgType;
 
 typedef struct __attribute__((packed)) {
@@ -26,9 +27,16 @@ typedef struct __attribute__((packed)) {
 
 typedef struct __attribute__((packed)) {
     char     table_name[128];
+    uint64_t lsn;
     uint64_t offset;
-    uint32_t nrows;
+    uint32_t wal_payload_len;
+    uint32_t reserved;
 } ProtoReplicateHdr;
+
+typedef struct __attribute__((packed)) {
+    uint64_t lsn;
+    int32_t  result_code; /* 0=ok, -1=error */
+} ProtoReplAckBody;
 
 typedef struct __attribute__((packed)) {
     uint8_t  is_leader;

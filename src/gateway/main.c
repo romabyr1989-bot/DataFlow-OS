@@ -256,6 +256,14 @@ void app_init(App *app, const char *config_json) {
     }
     LOG_INFO("loaded %d tables from catalog", tn);
 
+    /* hook WAL callback for replication on every loaded table */
+    if (app->cluster_mode && app->replicator) {
+        int idx = 0; const char *k; void *v;
+        while ((idx = hm_next(&app->tables, idx, &k, &v)) >= 0)
+            table_set_wal_callback((Table *)v, replicator_wal_cb, app->replicator);
+        LOG_INFO("cluster: WAL callbacks registered on %d tables", tn);
+    }
+
     /* load pipelines */
     char **pids; int pn;
     catalog_list_pipelines(app->catalog,&pids,&pn,la);

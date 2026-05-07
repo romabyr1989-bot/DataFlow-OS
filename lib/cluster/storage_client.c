@@ -66,23 +66,33 @@ int storage_client_ping(StorageClient *c) {
 }
 
 int storage_client_replicate(StorageClient *c, const char *table_name,
-                              uint64_t offset, ColBatch *batch) {
+                              uint64_t lsn, const void *wal_data, size_t wal_len) {
     if (!c->connected && storage_client_connect(c) < 0) return -1;
+
+    size_t total = sizeof(ProtoReplicateHdr) + wal_len;
+    void *body = malloc(total);
+    if (!body) return -1;
+
     ProtoReplicateHdr rhdr;
     memset(&rhdr, 0, sizeof(rhdr));
     strncpy(rhdr.table_name, table_name, sizeof(rhdr.table_name) - 1);
-    rhdr.offset = offset;
-    rhdr.nrows  = batch ? (uint32_t)batch->nrows : 0;
+    rhdr.lsn             = lsn;
+    rhdr.wal_payload_len = (uint32_t)wal_len;
+    memcpy(body, &rhdr, sizeof(rhdr));
+    if (wal_len > 0) memcpy((char *)body + sizeof(rhdr), wal_data, wal_len);
+
     uint32_t id = c->next_req_id++;
-    if (proto_send(c->fd, MSG_REPLICATE, id, &rhdr, (uint32_t)sizeof(rhdr)) < 0) {
-        storage_client_disconnect(c); return -1;
+    if (proto_send(c->fd, MSG_REPLICATE, id, body, (uint32_t)total) < 0) {
+        free(body); storage_client_disconnect(c); return -1;
     }
-    ProtoHeader hdr; void *resp = NULL;
-    if (proto_recv(c->fd, &hdr, &resp, NULL) < 0) {
+    free(body);
+
+    ProtoHeader hdr; void *resp = NULL; size_t rlen = 0;
+    if (proto_recv(c->fd, &hdr, &resp, &rlen) < 0) {
         storage_client_disconnect(c); return -1;
     }
     proto_free_body(resp);
-    return (hdr.msg_type == (uint8_t)MSG_ACK) ? 0 : -1;
+    return (hdr.msg_type == (uint8_t)MSG_REPL_ACK) ? 0 : -1;
 }
 
 int storage_client_status(StorageClient *c, ProtoStatusBody *out) {
