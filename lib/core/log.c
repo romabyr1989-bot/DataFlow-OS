@@ -4,8 +4,20 @@
 #include "log.h"
 #include <stdarg.h>
 #include <string.h>
+#include <stdint.h>
+
+#include <fcntl.h>
+#include <unistd.h>
+static void gen_random_bytes(uint8_t *buf, size_t n) {
+    int fd = open("/dev/urandom", O_RDONLY);
+    if (fd >= 0) { (void)read(fd, buf, n); close(fd); }
+    else { for (size_t i = 0; i < n; i++) buf[i] = (uint8_t)(i ^ 0xA5); }
+}
 
 Logger g_log;
+
+/* Thread-local correlation ID — lives for the lifetime of one worker thread */
+_Thread_local char g_correlation_id[37] = {0};
 
 static const char *level_str[]   = {"DEBUG","INFO","WARN","ERROR"};
 static const char *level_color[] = {"\033[37m","\033[32m","\033[33m","\033[31m"};
@@ -13,6 +25,23 @@ static const char *level_color[] = {"\033[37m","\033[32m","\033[33m","\033[31m"}
 void log_init(Logger *l, FILE *out, LogLevel min_level, int json_mode) {
     l->out = out; l->min_level = min_level; l->json_mode = json_mode;
     pthread_mutex_init(&l->mu, NULL);
+}
+
+void log_set_correlation_id(const char *id) {
+    if (!id) { g_correlation_id[0] = '\0'; return; }
+    strncpy(g_correlation_id, id, 36);
+    g_correlation_id[36] = '\0';
+}
+
+void log_new_correlation_id(void) {
+    uint8_t b[16];
+    gen_random_bytes(b, 16);
+    b[6] = (b[6] & 0x0f) | 0x40;  /* UUID version 4 */
+    b[8] = (b[8] & 0x3f) | 0x80;  /* UUID variant 1 */
+    snprintf(g_correlation_id, 37,
+        "%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
+        b[0],b[1],b[2],b[3], b[4],b[5], b[6],b[7],
+        b[8],b[9], b[10],b[11],b[12],b[13],b[14],b[15]);
 }
 
 void log_write(Logger *l, LogLevel level, const char *file, int line,
@@ -32,9 +61,19 @@ void log_write(Logger *l, LogLevel level, const char *file, int line,
     /* Мьютекс обеспечивает атомарность строки: строки от разных потоков не перемежаются. */
     pthread_mutex_lock(&l->mu);
     if (l->json_mode) {
-        fprintf(l->out, "{\"ts\":\"%s.%03ldZ\",\"level\":\"%s\","
+        if (g_correlation_id[0]) {
+            fprintf(l->out,
+                "{\"ts\":\"%s.%03ldZ\",\"level\":\"%s\","
+                "\"file\":\"%s\",\"line\":%d,"
+                "\"correlation_id\":\"%s\",\"msg\":\"%s\"}\n",
+                tbuf, ts.tv_nsec/1000000, level_str[level],
+                f, line, g_correlation_id, msg);
+        } else {
+            fprintf(l->out,
+                "{\"ts\":\"%s.%03ldZ\",\"level\":\"%s\","
                 "\"file\":\"%s\",\"line\":%d,\"msg\":\"%s\"}\n",
                 tbuf, ts.tv_nsec/1000000, level_str[level], f, line, msg);
+        }
     } else {
         fprintf(l->out, "%s%s.%03ldZ [%5s] %s:%d — %s\033[0m\n",
                 level_color[level], tbuf, ts.tv_nsec/1000000,

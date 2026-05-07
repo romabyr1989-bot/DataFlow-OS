@@ -128,7 +128,11 @@ typedef struct {
 
 typedef enum { SET_UNION, SET_UNION_ALL, SET_INTERSECT, SET_EXCEPT } SetOpType;
 
-typedef enum { STMT_SELECT, STMT_INSERT, STMT_SET_OP, STMT_UPDATE, STMT_DELETE, STMT_UNKNOWN } StmtType;
+typedef enum {
+    STMT_SELECT, STMT_INSERT, STMT_SET_OP, STMT_UPDATE, STMT_DELETE,
+    STMT_BEGIN, STMT_COMMIT, STMT_ROLLBACK,
+    STMT_UNKNOWN
+} StmtType;
 
 struct Stmt {
     StmtType     type;

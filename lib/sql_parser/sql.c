@@ -26,7 +26,8 @@ typedef enum {
     TK_EXISTS, TK_CAST,
     TK_OVER, TK_PARTITION, TK_ROWS, TK_RANGE, TK_UNBOUNDED,
     TK_PRECEDING, TK_FOLLOWING, TK_CURRENT, TK_ROW,
-    TK_UPDATE, TK_SET, TK_DELETE
+    TK_UPDATE, TK_SET, TK_DELETE,
+    TK_BEGIN, TK_COMMIT, TK_ROLLBACK, TK_TRANSACTION
 } TkType;
 
 typedef struct { TkType type; const char *start; size_t len; int64_t ival; double fval; } Token;
@@ -57,6 +58,8 @@ static struct { const char *kw; TkType tk; } KEYWORDS[] = {
     {"UNBOUNDED",TK_UNBOUNDED},{"PRECEDING",TK_PRECEDING},{"FOLLOWING",TK_FOLLOWING},
     {"CURRENT",TK_CURRENT},{"ROW",TK_ROW},
     {"UPDATE",TK_UPDATE},{"SET",TK_SET},{"DELETE",TK_DELETE},
+    {"BEGIN",TK_BEGIN},{"COMMIT",TK_COMMIT},{"ROLLBACK",TK_ROLLBACK},
+    {"TRANSACTION",TK_TRANSACTION},
     {NULL,TK_EOF}
 };
 
@@ -882,6 +885,19 @@ static Stmt *parse_stmt(Lexer *l) {
     } else if (first.type == TK_DELETE) {
         lex_consume(l);
         parse_delete(l, s);
+        return s;
+    } else if (first.type == TK_BEGIN) {
+        lex_consume(l);
+        lex_eat(l, TK_TRANSACTION); /* optional TRANSACTION keyword */
+        s->type = STMT_BEGIN;
+        return s;
+    } else if (first.type == TK_COMMIT) {
+        lex_consume(l);
+        s->type = STMT_COMMIT;
+        return s;
+    } else if (first.type == TK_ROLLBACK) {
+        lex_consume(l);
+        s->type = STMT_ROLLBACK;
         return s;
     } else {
         s->type = STMT_UNKNOWN;

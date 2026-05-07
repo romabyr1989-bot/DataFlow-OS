@@ -1,4 +1,5 @@
 #include "storage.h"
+#include "compress.h"
 #include "../core/log.h"
 #include "../index/btree.h"
 #include <stdlib.h>
@@ -11,6 +12,12 @@
 #include <errno.h>
 #include <sqlite3.h>
 #include <time.h>
+
+/* WAL versioning.
+ * version=0x00 is implicit for old records (first byte is printable ASCII >=0x20).
+ * version=0x01 signals a CompressedBatch record: [0x01][serialized CompressedBatch]. */
+#define WAL_VERSION_PLAIN      0x00  /* prepended to legacy row for explicit labelling */
+#define WAL_VERSION_COMPRESSED 0x01  /* CompressedBatch follows */
 
 /* ── WAL ── */
 struct WAL {
@@ -100,12 +107,30 @@ static void table_load_indexes(Table *t) {
     closedir(d);
 }
 
+static void table_write_schema_file(const char *dir, Schema *sc) {
+    if (!sc) return;
+    char path[600]; snprintf(path, sizeof(path), "%s/schema.json", dir);
+    FILE *f = fopen(path, "w");
+    if (!f) return;
+    fprintf(f, "{\"ncols\":%d,\"cols\":[", sc->ncols);
+    for (int i = 0; i < sc->ncols; i++) {
+        if (i > 0) fputc(',', f);
+        fprintf(f, "{\"name\":\"%s\",\"type\":%d,\"nullable\":%s}",
+                sc->cols[i].name ? sc->cols[i].name : "",
+                (int)sc->cols[i].type,
+                sc->cols[i].nullable ? "true" : "false");
+    }
+    fputs("]}", f);
+    fclose(f);
+}
+
 Table *table_create(const char *name, Schema *schema, const char *dir) {
     Table *t = calloc(1, sizeof(Table));
     strncpy(t->name, name, sizeof(t->name)-1);
     snprintf(t->dir, sizeof(t->dir), "%s/%s", dir, name);
     mkdir(t->dir, 0755);
     t->schema = schema;
+    table_write_schema_file(t->dir, schema);
     char wal_path[600]; snprintf(wal_path, sizeof(wal_path), "%s/wal.bin", t->dir);
     t->wal = wal_open(wal_path);
     table_load_indexes(t);
@@ -122,14 +147,57 @@ Table *table_open(const char *name, const char *dir) {
     return t;
 }
 
+/* Write one batch to WAL — row-by-row CSV format (default / debug).
+   ENABLE_COMPRESSION path: serialize entire batch as one versioned WAL record. */
 int table_append(Table *t, ColBatch *batch) {
     if (!batch || batch->nrows == 0) return 0;
+
+#ifdef ENABLE_COMPRESSION
+    /* Compress the whole batch and write as a single versioned WAL record.
+     * Note: with batch records, tombstone offsets reference the start of the
+     * batch record. DML on compressed tables is handled via full-batch rewrite
+     * during compaction. */
+    Arena *ca = arena_create(65536);
+    CompressedBatch *cb = compress_batch(batch, ca);
+    void *ser = NULL; size_t ser_len = 0;
+    compressed_batch_serialize(cb, &ser, &ser_len, ca);
+
+    /* Record: [uint32_t total_len][uint8_t version=0x01][serialized_data] */
+    size_t rec_len = 1 + ser_len;
+    uint8_t *rec = arena_alloc(ca, rec_len);
+    rec[0] = WAL_VERSION_COMPRESSED;
+    memcpy(rec + 1, ser, ser_len);
+
+    int64_t batch_offset = wal_tell(t->wal);
+    wal_append(t->wal, rec, rec_len);
+    t->row_count += batch->nrows;
+    cb->compressed_bytes = ser_len;
+
+    /* Update B-tree indexes for each row in the batch */
+    if (t->nindexes > 0 && batch->schema) {
+        for (int r = 0; r < batch->nrows; r++) {
+            for (int idx = 0; idx < t->nindexes; idx++) {
+                int ci = t->indexed_cols[idx];
+                if (ci >= batch->ncols) continue;
+                if (batch->schema->cols[ci].type != COL_INT64) continue;
+                bool is_null = batch->null_bitmap[ci] && bit_get(batch->null_bitmap[ci], r);
+                if (is_null) continue;
+                int64_t key = ((int64_t*)batch->values[ci])[r];
+                btree_insert(t->indexes[idx], key, batch_offset);
+            }
+        }
+    }
+
+    arena_destroy(ca);
+    return wal_sync(t->wal);
+#else
     enum { ROW_BUF_CAP = 262144 };
     char *row_buf = malloc(ROW_BUF_CAP);
     if (!row_buf) return -1;
+    int ncols = batch->ncols ? batch->ncols : (batch->schema ? batch->schema->ncols : 0);
     for (int r = 0; r < batch->nrows; r++) {
         int off = 0;
-        for (int c = 0; c < batch->ncols; c++) {
+        for (int c = 0; c < ncols; c++) {
             if (off >= ROW_BUF_CAP - 2) { free(row_buf); return -1; }
             if (c) row_buf[off++] = ',';
             if (batch->null_bitmap[c] && bit_get(batch->null_bitmap[c], r)) {
@@ -163,11 +231,9 @@ int table_append(Table *t, ColBatch *batch) {
         }
         if (off >= ROW_BUF_CAP - 1) { free(row_buf); return -1; }
         row_buf[off++] = '\n';
-        /* record WAL offset BEFORE writing — used for index entries */
         int64_t row_offset = wal_tell(t->wal);
         wal_append(t->wal, row_buf, (size_t)off);
         t->row_count++;
-        /* update all open B-tree indexes (COL_INT64 only) */
         if (t->nindexes > 0 && batch->schema) {
             for (int idx = 0; idx < t->nindexes; idx++) {
                 int ci = t->indexed_cols[idx];
@@ -182,6 +248,7 @@ int table_append(Table *t, ColBatch *batch) {
     }
     free(row_buf);
     return wal_sync(t->wal);
+#endif
 }
 
 int64_t table_row_count(Table *t) { return t->row_count; }

@@ -1,0 +1,80 @@
+name: CI
+
+on:
+  push:
+    branches: [ main, dev ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y \
+            gcc \
+            make \
+            libsqlite3-dev \
+            libssl-dev \
+            libcurl4-openssl-dev \
+            libz-dev \
+            libpq-dev \
+            pkg-config
+
+      - name: Build (debug)
+        run: make BUILD=debug all
+
+      - name: Run unit tests
+        run: make BUILD=debug test
+        env:
+          ASAN_OPTIONS: detect_leaks=0
+
+      - name: Run SQL unit tests
+        run: make BUILD=debug test-sql
+        env:
+          ASAN_OPTIONS: detect_leaks=0
+
+      - name: Build integration test binaries
+        run: make BUILD=debug test-integration
+        env:
+          ASAN_OPTIONS: detect_leaks=0
+
+      - name: Build (release)
+        run: make BUILD=release all
+
+  # Separate job: benchmarks run on release build, results posted as annotation
+  bench:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: build-and-test
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y \
+            gcc make libsqlite3-dev libssl-dev libcurl4-openssl-dev \
+            libz-dev libpq-dev pkg-config
+
+      - name: Build release + bench binaries
+        run: make BUILD=release all bench
+
+      - name: Run ingest benchmark
+        run: |
+          make BUILD=release bench 2>&1 | tee bench_results.txt
+        env:
+          ASAN_OPTIONS: detect_leaks=0
+
+      - name: Upload benchmark results
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-results
+          path: bench_results.txt
+          retention-days: 30

@@ -168,7 +168,18 @@ void app_init(App *app, const char *config_json) {
     /* create data dir */
     mkdir(app->data_dir, 0755);
 
-    log_init(&g_log, stderr, LOG_INFO, 0);
+    /* log_format: "json" or "text" (default text) */
+    int json_mode = 0;
+    if (config_json && *config_json) {
+        Arena *lfa = arena_create(512);
+        JVal *lcfg = json_parse(lfa, config_json, strlen(config_json));
+        if (lcfg && lcfg->type == JV_OBJECT) {
+            const char *lf = json_str(json_get(lcfg, "log_format"), NULL);
+            if (lf && strcmp(lf, "json") == 0) json_mode = 1;
+        }
+        arena_destroy(lfa);
+    }
+    log_init(&g_log, stderr, LOG_INFO, json_mode);
     LOG_INFO("DataFlow OS starting — data_dir=%s port=%d", app->data_dir, app->port);
 
     /* subsystems */
@@ -200,6 +211,7 @@ void app_init(App *app, const char *config_json) {
     app->metrics  = calloc(1, sizeof(Metrics)); metrics_init(app->metrics);
     app->workers  = tp_create(WORKER_THREADS, 256);
     app->scheduler= scheduler_create(on_pipeline_run, app);
+    app->txn_mgr  = txn_manager_create();
 
     pthread_mutex_init(&app->tables_mu, NULL);
     pthread_mutex_init(&app->ws_mu, NULL);
@@ -259,6 +271,7 @@ void app_stop(App *app) {
     scheduler_stop(app->scheduler);
     http_server_stop(app->server);
     tp_destroy(app->workers);
+    txn_manager_destroy(app->txn_mgr);
     catalog_close(app->catalog);
     LOG_INFO("DataFlow OS stopped");
 }
@@ -273,19 +286,46 @@ static void sig_handler(int sig) {
 
 int main(int argc, char **argv) {
     char *config_json = NULL;
-    for(int i=1;i<argc;i++){
-        if(strcmp(argv[i],"-c")==0&&i+1<argc){
-            /* read config file */
-            FILE *f=fopen(argv[++i],"r"); if(!f){fprintf(stderr,"can't open config\n");return 1;}
-            fseek(f,0,SEEK_END); long sz=ftell(f); rewind(f);
-            config_json=malloc((size_t)sz+1);
-            fread(config_json,1,(size_t)sz,f); config_json[sz]='\0'; fclose(f);
+
+    /* Separate passes for -c (file) and inline overrides (-p, -d) */
+    int    cli_port = 0;
+    char   cli_data_dir[512] = {0};
+    char  *file_config = NULL;
+
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "-c") == 0 && i+1 < argc) {
+            FILE *f = fopen(argv[++i], "r");
+            if (!f) { fprintf(stderr, "can't open config '%s'\n", argv[i]); return 1; }
+            fseek(f, 0, SEEK_END); long sz = ftell(f); rewind(f);
+            file_config = malloc((size_t)sz + 1);
+            fread(file_config, 1, (size_t)sz, f);
+            file_config[sz] = '\0';
+            fclose(f);
+        } else if (strcmp(argv[i], "-p") == 0 && i+1 < argc) {
+            cli_port = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "-d") == 0 && i+1 < argc) {
+            strncpy(cli_data_dir, argv[++i], sizeof(cli_data_dir) - 1);
         }
-        if(strcmp(argv[i],"-p")==0&&i+1<argc){
-            /* inline config */
-            char pbuf[64]; snprintf(pbuf,sizeof(pbuf),"{\"port\":%s}",argv[++i]);
-            config_json=strdup(pbuf);
+    }
+
+    if (file_config) {
+        config_json = file_config;
+    } else if (cli_port > 0 || cli_data_dir[0]) {
+        /* Build inline JSON from CLI flags */
+        char buf[800]; int off = 0;
+        off += snprintf(buf, sizeof(buf), "{");
+        bool first = true;
+        if (cli_port > 0) {
+            off += snprintf(buf + off, sizeof(buf) - (size_t)off,
+                            "\"port\":%d", cli_port);
+            first = false;
         }
+        if (cli_data_dir[0]) {
+            off += snprintf(buf + off, sizeof(buf) - (size_t)off,
+                            "%s\"data_dir\":\"%s\"", first ? "" : ",", cli_data_dir);
+        }
+        snprintf(buf + off, sizeof(buf) - (size_t)off, "}");
+        config_json = strdup(buf);
     }
 
     signal(SIGINT,  sig_handler);

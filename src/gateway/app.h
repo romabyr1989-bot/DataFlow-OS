@@ -1,6 +1,7 @@
 #pragma once
 #include "../../lib/net/http.h"
 #include "../../lib/storage/storage.h"
+#include "../../lib/storage/txn.h"
 #include "../../lib/scheduler/scheduler.h"
 #include "../../lib/observ/observ.h"
 #include "../../lib/core/hashmap.h"
@@ -48,6 +49,9 @@ typedef struct {
     char        tls_cert_path[512];
     char        tls_key_path[512];
     bool        tls_enabled;
+
+    /* transactions */
+    TxnManager *txn_mgr;
 
     /* server */
     Router      router;

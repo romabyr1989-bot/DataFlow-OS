@@ -602,7 +602,6 @@ body.compact .result-table th { padding: .35rem .6rem; }
 :root {
   --bg: #f5f5f7;
   --surface: rgba(255, 255, 255, 0.86);
-  --surface2: #ffffff;
   --border: #d2d2d7;
   --accent: #0071e3;
   --accent2: #0066cc;
@@ -615,6 +614,8 @@ body.compact .result-table th { padding: .35rem .6rem; }
   --mono: "SF Mono", ui-monospace, "Menlo", "Consolas", monospace;
   --radius: 18px;
   --sidebar: 244px;
+  --card-bg: #ffffff;
+  --surface2: #f5f5f8;
 }
 
 body {

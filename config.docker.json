@@ -1,0 +1,11 @@
+{
+  "data_dir": "${DATA_DIR}",
+  "plugins_dir": "./build/release/lib",
+  "connector_dir": "./build/release/lib",
+  "port": 8080,
+  "auth_enabled": 1,
+  "jwt_secret": "${JWT_SECRET}",
+  "admin_password": "${ADMIN_PASSWORD}",
+  "tls_cert": "${TLS_CERT}",
+  "tls_key": "${TLS_KEY}"
+}

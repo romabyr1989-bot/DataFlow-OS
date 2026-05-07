@@ -7,9 +7,9 @@ CFLAGS  = -std=c11 -Wall -Wextra -Wpedantic \
            -Ilib/observ -Ilib/connector -Ilib/index
 LDFLAGS = -lpthread -lm -ldl -lsqlite3 -lcurl -lcrypto -lssl
 
-# Release flags
-REL_FLAGS = -O2 -DNDEBUG -flto
-# Debug flags
+# Release flags (compression enabled)
+REL_FLAGS = -O2 -DNDEBUG -flto -DENABLE_COMPRESSION=1
+# Debug flags (compression disabled — упрощает отладку WAL-формата)
 DBG_FLAGS = -O0 -g3 -fsanitize=address,undefined -DDEBUG
 
 BUILD ?= debug
@@ -28,7 +28,7 @@ LIBDIR  = $(OUTDIR)/lib
 CORE_SRCS = lib/core/arena.c lib/core/log.c lib/core/hashmap.c \
             lib/core/threadpool.c lib/core/json.c lib/auth/auth.c
 NET_SRCS  = lib/net/http.c lib/net/tls.c
-STOR_SRCS = lib/storage/storage.c lib/index/btree.c
+STOR_SRCS = lib/storage/storage.c lib/storage/compress.c lib/storage/txn.c lib/index/btree.c
 SQL_SRCS  = lib/sql_parser/sql.c
 QE_SRCS   = lib/qengine/qengine.c
 SCHED_SRCS= lib/scheduler/scheduler.c
@@ -42,6 +42,7 @@ GW_SRCS   = src/gateway/main.c src/gateway/api.c
 
 # convert .c to .o in OUTDIR
 ALL_OBJS  = $(patsubst %.c,$(OUTDIR)/%.o,$(ALL_LIB_SRCS) $(GW_SRCS))
+LIB_OBJS  = $(patsubst %.c,$(OUTDIR)/%.o,$(ALL_LIB_SRCS))
 
 GATEWAY        = $(BINDIR)/dfo_gateway
 CSV_PLUGIN     = $(LIBDIR)/csv_connector.so
@@ -63,7 +64,8 @@ else
   HAS_PQ    := $(if $(PGLDFLAGS),yes,no)
 endif
 
-.PHONY: all clean run test dirs release debug
+.PHONY: all clean run test dirs release debug \
+        test-integration test-sql test-all bench
 
 ifeq ($(HAS_PQ),yes)
 all: dirs $(GATEWAY) $(CSV_PLUGIN) $(PG_PLUGIN) $(PARQUET_PLUGIN) $(JSONHTTP_PLUGIN)
@@ -131,16 +133,64 @@ $(JSONHTTP_PLUGIN): lib/connector/plugins/json_http/json_http_connector.c \
 	@$(CC) $(CFLAGS) -shared -fPIC $^ -o $@ $(LDFLAGS) -lcurl \
 	    $(if $(filter Darwin,$(shell uname)),-undefined dynamic_lookup,)
 
-# ── Tests ──
+# ── Unit tests ──
 TEST_SRCS = $(wildcard tests/unit/*.c)
 TEST_BINS = $(patsubst tests/unit/%.c,$(BINDIR)/test_%,$(TEST_SRCS))
 
-$(BINDIR)/test_%: tests/unit/%.c $(filter-out $(OUTDIR)/src/gateway/main.o, $(ALL_OBJS))
+$(BINDIR)/test_%: tests/unit/%.c $(LIB_OBJS)
 	@echo "  TC  $<"
 	@$(CC) $(CFLAGS) $^ -o $@ $(LDFLAGS)
 
 test: dirs $(TEST_BINS)
 	@for t in $(TEST_BINS); do echo "\n=== $$t ==="; $$t; done
+
+# ── SQL unit tests ──
+SQL_TEST_SRCS = $(wildcard tests/sql/*.c)
+SQL_TEST_BINS = $(patsubst tests/sql/%.c,$(BINDIR)/sql_%,$(SQL_TEST_SRCS))
+
+$(BINDIR)/sql_%: tests/sql/%.c $(LIB_OBJS)
+	@echo "  TC  $<"
+	@$(CC) $(CFLAGS) $^ -o $@ $(LDFLAGS) -lm
+
+test-sql: dirs $(SQL_TEST_BINS)
+	@for t in $(SQL_TEST_BINS); do echo "\n=== $$t ==="; $$t; done
+
+# ── Integration tests (require running gateway) ──
+ITEST_SRCS = $(wildcard tests/integration/test_*.c)
+ITEST_BINS = $(patsubst tests/integration/%.c,$(BINDIR)/itest_%,$(ITEST_SRCS))
+
+$(BINDIR)/itest_%: tests/integration/%.c
+	@echo "  IC  $<"
+	@$(CC) -std=c11 -Wall -Ilib -Ilib/core -Ilib/net -Ilib/storage \
+	    -Ilib/sql_parser -Ilib/qengine -Ilib/scheduler -Ilib/observ \
+	    -Ilib/connector -Ilib/index \
+	    $< -o $@ -lcurl -lpthread -lm
+
+test-integration: dirs all $(ITEST_BINS)
+	@for t in $(ITEST_BINS); do \
+	    echo "\n=== $$t ==="; \
+	    $$t $(GATEWAY); \
+	done
+
+# ── Load benchmarks ──
+BENCH_SRCS = $(wildcard tests/load/*.c)
+BENCH_BINS = $(patsubst tests/load/%.c,$(BINDIR)/bench_%,$(BENCH_SRCS))
+
+$(BINDIR)/bench_%: tests/load/%.c
+	@echo "  BC  $<"
+	@$(CC) -std=c11 -Wall -Ilib -Ilib/core -Ilib/net -Ilib/storage \
+	    -Ilib/sql_parser -Ilib/qengine -Ilib/scheduler -Ilib/observ \
+	    -Ilib/connector -Ilib/index \
+	    $< -o $@ -lcurl -lpthread -lm
+
+bench: dirs all $(BENCH_BINS)
+	@for b in $(BENCH_BINS); do \
+	    echo "\n=== $$b ==="; \
+	    $$b $(GATEWAY); \
+	done
+
+# ── All tests combined ──
+test-all: test test-sql test-integration
 
 # ── Run ──
 run: all

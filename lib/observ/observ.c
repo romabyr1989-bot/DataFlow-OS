@@ -10,6 +10,7 @@ void metrics_init(Metrics *m) {
     pthread_mutex_init(&m->rows_failed.mu, NULL);
     pthread_mutex_init(&m->pipeline_latency_ms.mu, NULL);
     pthread_mutex_init(&m->query_latency_ms.mu, NULL);
+    pthread_mutex_init(&m->http_request_duration_ms.mu, NULL);
     m->uptime_start = (int64_t)time(NULL);
 }
 

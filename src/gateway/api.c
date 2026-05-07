@@ -3,6 +3,8 @@
 #include "../../lib/core/log.h"
 #include "../../lib/sql_parser/sql.h"
 #include "../../lib/storage/storage.h"
+#include "../../lib/storage/compress.h"
+#include "../../lib/storage/txn.h"
 #include "../../lib/connector/connector.h"
 #include "../../lib/auth/auth.h"
 #include <sqlite3.h>
@@ -14,6 +16,25 @@
 #include <unistd.h>
 #include <sys/stat.h>
 #include <math.h>
+
+/* ── Transaction commit callback: applies one buffered entry to a real table ── */
+static int apply_txn_entry(const char *tname, TxnOpType op,
+                            ColBatch *batch,
+                            int64_t orig_offset,
+                            const char *new_csv, size_t csv_len,
+                            void *ud) {
+    (void)ud;
+    pthread_mutex_lock(&g_app.tables_mu);
+    Table *t = hm_get(&g_app.tables, tname);
+    pthread_mutex_unlock(&g_app.tables_mu);
+    if (!t) { LOG_ERROR("txn commit: table '%s' not found", tname); return -1; }
+    switch (op) {
+        case TXN_OP_INSERT: return table_append(t, batch);
+        case TXN_OP_DELETE: return table_delete(t, orig_offset);
+        case TXN_OP_UPDATE: return table_update(t, orig_offset, new_csv, csv_len);
+    }
+    return -1;
+}
 
 /* ── Table name validation ── */
 static bool valid_table_name(const char *s) {
@@ -999,13 +1020,44 @@ static int load_tbl(Arena *a, const char *tname, const char *alias,
         uint32_t l=0;
         if (fread(&l,1,4,wf)!=4) break;
         int64_t rec_off=file_off; file_off+=4+(int64_t)l;
-        if (l==0||l>262144) { fseek(wf,(long)l,SEEK_CUR); continue; }
+        if (l==0||l>16777216) { fseek(wf,(long)l,SEEK_CUR); continue; } /* max 16 MiB record */
         char *line = arena_alloc(a,(size_t)l+1);
         if (fread(line,1,l,wf)!=l) break;
         line[l]='\0';
 
         uint8_t op=(uint8_t)(unsigned char)line[0];
         if (op==WAL_OP_DELETE||op==WAL_OP_UPDATE) continue; /* skip tombstone records */
+
+        /* Compressed batch record (version byte 0x01) */
+        if (op == 0x01 && l > 1) {
+            CompressedBatch *cb = compressed_batch_deserialize(line+1, (size_t)(l-1), a);
+            if (cb) {
+                ColBatch *batch = decompress_batch(cb, a);
+                if (batch) {
+                    for (int r = 0; r < batch->nrows; r++) {
+                        /* Convert batch row to char** cells */
+                        char **row = arena_alloc(a, (size_t)ncols * sizeof(char*));
+                        for (int c = 0; c < ncols; c++) {
+                            if (c >= batch->ncols) { row[c] = ""; continue; }
+                            if (batch->null_bitmap[c]) {
+                                int bi=r/8; if (batch->null_bitmap[c][bi] & (1u<<(r%8))) { row[c]=""; continue; }
+                            }
+                            ColType t = (batch->schema && c < batch->schema->ncols) ? batch->schema->cols[c].type : COL_TEXT;
+                            switch (t) {
+                                case COL_INT64: row[c]=arena_sprintf(a,"%lld",(long long)((int64_t*)batch->values[c])[r]); break;
+                                case COL_DOUBLE: row[c]=arena_sprintf(a,"%.10g",((double*)batch->values[c])[r]); break;
+                                case COL_BOOL:  row[c]=((int64_t*)batch->values[c])[r]?"true":"false"; break;
+                                case COL_TEXT:  row[c]=((char**)batch->values[c])[r]?:""; break;
+                                default:        row[c]=""; break;
+                            }
+                        }
+                        if(n==cap){cap*=2;char***nb=arena_alloc(a,(size_t)cap*sizeof(char**));memcpy(nb,rows,(size_t)n*sizeof(char**));rows=nb;}
+                        rows[n++]=row;
+                    }
+                }
+            }
+            continue;
+        }
 
         size_t rl=strlen(line);
         while(rl>0&&(line[rl-1]=='\n'||line[rl-1]=='\r')) line[--rl]='\0';
@@ -2149,6 +2201,50 @@ static void h_query(HttpReq *req, HttpResp *resp) {
         }
     }
 
+    /* ── Transaction control statements ── */
+    if (stmt->type == STMT_BEGIN) {
+        if (req->txn_id != 0) {
+            http_resp_error(resp, 400, "transaction already active");
+            arena_destroy(a); return;
+        }
+        TxnId id = txn_begin(g_app.txn_mgr);
+        if (id == TXN_ID_NONE) {
+            http_resp_error(resp, 503, "no free transaction slots");
+            arena_destroy(a); return;
+        }
+        __atomic_fetch_add(&g_app.metrics->txn_begin_total, 1, __ATOMIC_RELAXED);
+        __atomic_fetch_add(&g_app.metrics->txn_active, 1, __ATOMIC_RELAXED);
+        http_resp_json(resp, 200,
+            arena_sprintf(a, "{\"txn_id\":%llu}", (unsigned long long)id));
+        arena_destroy(a); return;
+    }
+
+    if (stmt->type == STMT_COMMIT) {
+        if (req->txn_id == 0) {
+            http_resp_error(resp, 400, "no active transaction");
+            arena_destroy(a); return;
+        }
+        int rc = txn_commit(g_app.txn_mgr, req->txn_id, apply_txn_entry, NULL);
+        if (rc != 0) {
+            http_resp_error(resp, 500, "commit failed");
+            arena_destroy(a); return;
+        }
+        __atomic_fetch_add(&g_app.metrics->txn_commit_total, 1, __ATOMIC_RELAXED);
+        __atomic_fetch_sub(&g_app.metrics->txn_active, 1, __ATOMIC_RELAXED);
+        http_resp_json(resp, 200, "{\"ok\":true,\"committed\":true}");
+        arena_destroy(a); return;
+    }
+
+    if (stmt->type == STMT_ROLLBACK) {
+        if (req->txn_id != 0) {
+            txn_rollback(g_app.txn_mgr, req->txn_id);
+            __atomic_fetch_add(&g_app.metrics->txn_rollback_total, 1, __ATOMIC_RELAXED);
+            __atomic_fetch_sub(&g_app.metrics->txn_active, 1, __ATOMIC_RELAXED);
+        }
+        http_resp_json(resp, 200, "{\"ok\":true,\"rolled_back\":true}");
+        arena_destroy(a); return;
+    }
+
     /* Apply request-level limit cap */
     if (stmt->type == STMT_SELECT) {
         int64_t cap = (req_limit > 0 && req_limit < 10000) ? req_limit : 10000;
@@ -2222,6 +2318,96 @@ static void h_table_schema(HttpReq *req, HttpResp *resp) {
     http_resp_json(resp,200,jb_done(&jb));
 }
 
+/* ── GET /api/tables/:name/compression ── */
+static void h_table_compression(HttpReq *req, HttpResp *resp) {
+    const char *name = hm_get(&req->params, "name");
+    if (!name) { http_resp_error(resp, 400, "missing name"); return; }
+
+    Arena *a = arena_create(32768);
+    Schema *schema = NULL;
+    if (catalog_get_schema(g_app.catalog, name, &schema, a) < 0) {
+        http_resp_error(resp, 404, "table not found"); arena_destroy(a); return;
+    }
+
+    char wal_path[1024];
+    snprintf(wal_path, sizeof(wal_path), "%s/%s/wal.bin", g_app.data_dir, name);
+    FILE *wf = fopen(wal_path, "rb");
+
+    /* Scan WAL to find compression stats */
+    size_t total_raw = 0, total_compressed = 0;
+    int64_t batch_count = 0;
+    /* Per-column encoding stats (last batch seen) */
+    Encoding col_encs[MAX_COLS] = {0};
+    float    col_ratios[MAX_COLS] = {0};
+    int      ncols = schema ? schema->ncols : 0;
+    for (int i = 0; i < ncols; i++) { col_encs[i]=ENC_PLAIN; col_ratios[i]=1.0f; }
+
+    if (wf) {
+        char *buf = malloc(16777216); /* 16 MiB */
+        while (buf) {
+            uint32_t l = 0;
+            if (fread(&l, 4, 1, wf) != 1) break;
+            if (l == 0 || l > 16777216) { fseek(wf, (long)l, SEEK_CUR); continue; }
+            if (fread(buf, 1, l, wf) != l) break;
+            uint8_t op = (uint8_t)buf[0];
+            if (op == 0x01 && l > 1) {
+                CompressedBatch *cb = compressed_batch_deserialize(buf+1, (size_t)(l-1), a);
+                if (cb) {
+                    batch_count++;
+                    total_compressed += (size_t)l;
+                    /* Estimate original size as nrows * avg_bytes_per_row */
+                    for (int c = 0; c < cb->ncols && c < ncols; c++) {
+                        col_encs[c] = cb->cols[c].enc;
+                        /* Rough original size per column */
+                        size_t col_orig = (size_t)cb->nrows * 8; /* assume 8B per value */
+                        size_t col_comp = 0;
+                        switch (cb->cols[c].enc) {
+                            case ENC_RLE:   col_comp=(size_t)cb->cols[c].nruns*10; break;
+                            case ENC_DICT:  col_comp=(size_t)cb->cols[c].dict_size*8+(size_t)cb->nrows*(cb->cols[c].dict_is_u8?1:2); break;
+                            case ENC_DELTA: col_comp=8+(size_t)cb->nrows*4; break;
+                            default: col_comp=col_orig; break;
+                        }
+                        col_ratios[c] = col_orig > 0 ? (float)col_orig / (float)(col_comp+1) : 1.0f;
+                        total_raw += col_orig;
+                    }
+                }
+            } else if (op >= 0x20) {
+                /* Legacy CSV row */
+                total_raw += l;
+                total_compressed += l;
+            }
+        }
+        free(buf);
+        fclose(wf);
+    }
+
+    JBuf jb; jb_init(&jb, a, 2048);
+    jb_obj_begin(&jb);
+    jb_key(&jb, "table"); jb_str(&jb, name);
+
+    static const char *enc_names[] = {"plain","rle","dict","delta"};
+
+    jb_key(&jb, "encoding_by_column"); jb_arr_begin(&jb);
+    for (int c = 0; c < ncols; c++) {
+        jb_obj_begin(&jb);
+        jb_key(&jb, "column"); jb_str(&jb, schema->cols[c].name ? schema->cols[c].name : "");
+        jb_key(&jb, "encoding"); jb_str(&jb, enc_names[col_encs[c] < 4 ? col_encs[c] : 0]);
+        jb_key(&jb, "ratio"); jb_double(&jb, col_ratios[c]);
+        jb_obj_end(&jb);
+    }
+    jb_arr_end(&jb);
+
+    float overall = total_compressed > 0 ? (float)total_raw / (float)total_compressed : 1.0f;
+    jb_key(&jb, "overall_ratio");      jb_double(&jb, overall);
+    jb_key(&jb, "original_bytes");     jb_int(&jb, (int64_t)total_raw);
+    jb_key(&jb, "compressed_bytes");   jb_int(&jb, (int64_t)total_compressed);
+    jb_key(&jb, "batch_count");        jb_int(&jb, batch_count);
+    jb_obj_end(&jb);
+
+    http_resp_json(resp, 200, jb_done(&jb));
+    /* arena 'a' is intentionally not destroyed here — resp->body points into it */
+}
+
 /* ── DELETE /api/tables/:name ── */
 static void h_table_delete(HttpReq *req, HttpResp *resp) {
     const char *name = hm_get(&req->params, "name");
@@ -2238,6 +2424,8 @@ static void h_table_delete(HttpReq *req, HttpResp *resp) {
     snprintf(dir_path, sizeof(dir_path), "%s/%s", g_app.data_dir, name);
     snprintf(wal_path, sizeof(wal_path), "%s/wal.bin", dir_path);
     unlink(wal_path); rmdir(dir_path);
+
+    if (t) __atomic_fetch_sub(&g_app.metrics->tables_count, 1, __ATOMIC_RELAXED);
 
     Arena *ba = arena_create(256);
     char *msg = arena_sprintf(ba, "{\"event\":\"table_deleted\",\"table\":\"%s\"}", name);
@@ -2292,6 +2480,7 @@ static void h_ingest_csv(HttpReq *req, HttpResp *resp) {
         t=table_create(tname,schema,g_app.data_dir);
         hm_set(&g_app.tables,tname,t);
         catalog_register_table(g_app.catalog,tname,schema);
+        __atomic_fetch_add(&g_app.metrics->tables_count, 1, __ATOMIC_RELAXED);
     }
     pthread_mutex_unlock(&g_app.tables_mu);
 
@@ -2317,13 +2506,29 @@ static void h_ingest_csv(HttpReq *req, HttpResp *resp) {
         for (; col < ncols; col++) col_vals[col][batch.nrows] = arena_strdup(a, "");
         batch.nrows++; row_count++;
         if (batch.nrows == BATCH_SIZE) {
-            if (table_append(t, &batch) != 0) { arena_destroy(a); http_resp_error(resp, 500, "ingest write failed"); return; }
+            if (req->txn_id != 0) {
+                if (txn_buffer_insert(g_app.txn_mgr, req->txn_id, tname, &batch) != 0) {
+                    arena_destroy(a); http_resp_error(resp, 500, "txn buffer failed"); return;
+                }
+            } else {
+                if (table_append(t, &batch) != 0) {
+                    arena_destroy(a); http_resp_error(resp, 500, "ingest write failed"); return;
+                }
+            }
             batch.nrows = 0;
         }
         p = ne + 1;
     }
     if (batch.nrows > 0) {
-        if (table_append(t, &batch) != 0) { arena_destroy(a); http_resp_error(resp, 500, "ingest write failed"); return; }
+        if (req->txn_id != 0) {
+            if (txn_buffer_insert(g_app.txn_mgr, req->txn_id, tname, &batch) != 0) {
+                arena_destroy(a); http_resp_error(resp, 500, "txn buffer failed"); return;
+            }
+        } else {
+            if (table_append(t, &batch) != 0) {
+                arena_destroy(a); http_resp_error(resp, 500, "ingest write failed"); return;
+            }
+        }
     }
 
     metrics_push(&g_app.metrics->rows_ingested,(double)row_count);
@@ -2737,6 +2942,130 @@ static void h_metrics(HttpReq *req, HttpResp *resp) {
     (void)req;
     Arena *a=arena_create(2048);
     http_resp_json(resp,200,metrics_to_json(g_app.metrics,a));
+}
+
+/* ── GET /metrics  (Prometheus text format) ── */
+static void h_metrics_prometheus(HttpReq *req, HttpResp *resp) {
+    (void)req;
+    Metrics *m = g_app.metrics;
+    int64_t now = (int64_t)time(NULL);
+    int64_t uptime = now - m->uptime_start;
+
+    Arena *a = arena_create(8192);
+
+    /* Helper: append text to a growable buffer in arena */
+#define PM(buf, buflen, used, ...) \
+    do { \
+        int _n = snprintf((buf)+(used), (buflen)-(used), __VA_ARGS__); \
+        if (_n > 0) (used) += (size_t)_n; \
+    } while(0)
+
+    size_t cap = 8192;
+    char *buf = arena_alloc(a, cap);
+    size_t used = 0;
+
+    PM(buf,cap,used,
+        "# HELP dfo_uptime_seconds Time since process start\n"
+        "# TYPE dfo_uptime_seconds gauge\n"
+        "dfo_uptime_seconds %lld\n", (long long)uptime);
+
+    PM(buf,cap,used,
+        "# HELP dfo_queries_total Total SQL queries executed\n"
+        "# TYPE dfo_queries_total counter\n"
+        "dfo_queries_total %lld\n", (long long)m->total_queries);
+
+    PM(buf,cap,used,
+        "# HELP dfo_rows_total Total rows ingested\n"
+        "# TYPE dfo_rows_total counter\n"
+        "dfo_rows_total %lld\n", (long long)m->total_rows);
+
+    PM(buf,cap,used,
+        "# HELP dfo_pipelines_run_total Total pipeline runs\n"
+        "# TYPE dfo_pipelines_run_total counter\n"
+        "dfo_pipelines_run_total %lld\n", (long long)m->total_pipelines_run);
+
+    PM(buf,cap,used,
+        "# HELP dfo_query_latency_ms_avg Average query latency (last 60s)\n"
+        "# TYPE dfo_query_latency_ms_avg gauge\n"
+        "dfo_query_latency_ms_avg %.3f\n", metrics_avg(&m->query_latency_ms, 60));
+
+    PM(buf,cap,used,
+        "# HELP dfo_pipeline_latency_ms_avg Average pipeline latency (last 60s)\n"
+        "# TYPE dfo_pipeline_latency_ms_avg gauge\n"
+        "dfo_pipeline_latency_ms_avg %.3f\n", metrics_avg(&m->pipeline_latency_ms, 60));
+
+    PM(buf,cap,used,
+        "# HELP dfo_ingest_rows_per_sec Average ingest rate (last 60s)\n"
+        "# TYPE dfo_ingest_rows_per_sec gauge\n"
+        "dfo_ingest_rows_per_sec %.3f\n", metrics_avg(&m->rows_ingested, 60));
+
+    PM(buf,cap,used,
+        "# HELP dfo_http_requests_total Total HTTP requests\n"
+        "# TYPE dfo_http_requests_total counter\n"
+        "dfo_http_requests_total %lld\n", (long long)m->http_requests_total);
+
+    PM(buf,cap,used,
+        "# HELP dfo_http_errors_4xx_total HTTP 4xx responses\n"
+        "# TYPE dfo_http_errors_4xx_total counter\n"
+        "dfo_http_errors_4xx_total %lld\n", (long long)m->http_errors_4xx);
+
+    PM(buf,cap,used,
+        "# HELP dfo_http_errors_5xx_total HTTP 5xx responses\n"
+        "# TYPE dfo_http_errors_5xx_total counter\n"
+        "dfo_http_errors_5xx_total %lld\n", (long long)m->http_errors_5xx);
+
+    PM(buf,cap,used,
+        "# HELP dfo_http_request_duration_ms_avg Average HTTP request duration (last 60s)\n"
+        "# TYPE dfo_http_request_duration_ms_avg gauge\n"
+        "dfo_http_request_duration_ms_avg %.3f\n",
+        metrics_avg(&m->http_request_duration_ms, 60));
+
+    PM(buf,cap,used,
+        "# HELP dfo_wal_bytes_written_total Bytes written to WAL\n"
+        "# TYPE dfo_wal_bytes_written_total counter\n"
+        "dfo_wal_bytes_written_total %lld\n", (long long)m->wal_bytes_written);
+
+    PM(buf,cap,used,
+        "# HELP dfo_wal_bytes_compressed_total Bytes after WAL compression\n"
+        "# TYPE dfo_wal_bytes_compressed_total counter\n"
+        "dfo_wal_bytes_compressed_total %lld\n", (long long)m->wal_bytes_compressed);
+
+    PM(buf,cap,used,
+        "# HELP dfo_tables_count Current number of tables\n"
+        "# TYPE dfo_tables_count gauge\n"
+        "dfo_tables_count %lld\n", (long long)m->tables_count);
+
+    PM(buf,cap,used,
+        "# HELP dfo_txn_begin_total Transactions started\n"
+        "# TYPE dfo_txn_begin_total counter\n"
+        "dfo_txn_begin_total %lld\n", (long long)m->txn_begin_total);
+
+    PM(buf,cap,used,
+        "# HELP dfo_txn_commit_total Transactions committed\n"
+        "# TYPE dfo_txn_commit_total counter\n"
+        "dfo_txn_commit_total %lld\n", (long long)m->txn_commit_total);
+
+    PM(buf,cap,used,
+        "# HELP dfo_txn_rollback_total Transactions rolled back\n"
+        "# TYPE dfo_txn_rollback_total counter\n"
+        "dfo_txn_rollback_total %lld\n", (long long)m->txn_rollback_total);
+
+    PM(buf,cap,used,
+        "# HELP dfo_txn_timeout_total Transactions timed out\n"
+        "# TYPE dfo_txn_timeout_total counter\n"
+        "dfo_txn_timeout_total %lld\n", (long long)m->txn_timeout_total);
+
+    PM(buf,cap,used,
+        "# HELP dfo_txn_active Currently open transactions\n"
+        "# TYPE dfo_txn_active gauge\n"
+        "dfo_txn_active %lld\n", (long long)m->txn_active);
+
+#undef PM
+
+    resp->status = 200;
+    resp->content_type = "text/plain; version=0.0.4; charset=utf-8";
+    resp->body = buf;
+    resp->body_len = used;
 }
 
 /* ── JVal serializer helper ── */
@@ -3157,7 +3486,8 @@ void api_register_routes(Router *r) {
     router_add(r,"GET",  "/health",                  h_health);
     router_add(r,"GET",  "/api/tables",              h_tables_list);
     router_add(r,"POST", "/api/tables/query",        h_query);
-    router_add(r,"GET",  "/api/tables/:name/schema", h_table_schema);
+    router_add(r,"GET",  "/api/tables/:name/schema",      h_table_schema);
+    router_add(r,"GET",  "/api/tables/:name/compression", h_table_compression);
     router_add(r,"DELETE","/api/tables/:name",       h_table_delete);
     router_add(r,"POST", "/api/ingest/csv",            h_ingest_csv);
     router_add(r,"POST", "/api/ingest/parquet",        h_ingest_parquet);
@@ -3168,6 +3498,7 @@ void api_register_routes(Router *r) {
     router_add(r,"DELETE","/api/pipelines/:id",      h_pipeline_delete);
     router_add(r,"GET",  "/api/pipelines/:id/runs",  h_pipeline_runs);
     router_add(r,"GET",  "/api/metrics",             h_metrics);
+    router_add(r,"GET",  "/metrics",                 h_metrics_prometheus);
     router_add(r,"POST",   "/api/analytics/results",     h_result_save);
     router_add(r,"GET",    "/api/analytics/results",     h_result_list);
     router_add(r,"GET",    "/api/analytics/results/:id", h_result_get);

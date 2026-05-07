@@ -15,6 +15,7 @@ typedef struct {
 } MetricRing;
 
 typedef struct {
+    /* Оригинальные метрики */
     MetricRing rows_ingested;
     MetricRing rows_failed;
     MetricRing pipeline_latency_ms;
@@ -23,6 +24,24 @@ typedef struct {
     int64_t    total_pipelines_run;
     int64_t    total_queries;
     int64_t    uptime_start;
+
+    /* HTTP метрики */
+    int64_t    http_requests_total;
+    int64_t    http_errors_4xx;
+    int64_t    http_errors_5xx;
+    MetricRing http_request_duration_ms;
+
+    /* Storage метрики */
+    int64_t    wal_bytes_written;
+    int64_t    wal_bytes_compressed;
+    int64_t    tables_count;
+
+    /* Транзакции (заполняются Шагом 2) */
+    int64_t    txn_begin_total;
+    int64_t    txn_commit_total;
+    int64_t    txn_rollback_total;
+    int64_t    txn_timeout_total;
+    int64_t    txn_active;
 } Metrics;
 
 void metrics_init(Metrics *m);

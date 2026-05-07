@@ -1,10 +1,14 @@
 #include "qengine.h"
 #include "../core/log.h"
+#include "../core/json.h"
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
 #include <stdio.h>
 #include <math.h>
+
+/* ── Forward declarations ── */
+static bool is_agg_func(Expr *e, const char **fn_out, Expr **arg_out);
 
 /* ── Expression evaluator ── */
 static bool bit_is_null(uint8_t *bm, int i) {
@@ -38,8 +42,25 @@ Scalar eval_expr(Expr *e, EvalCtx *ctx, Arena *a) {
         return s;
     }
     case EXPR_FUNC: {
-        /* aggregate functions return 0/null in scalar context */
         const char *fn = e->func_name;
+        /* In post-agg context (HAVING): look up pre-computed value as a column */
+        if (ctx && ctx->schema && ctx->batch && is_agg_func(e, NULL, NULL)) {
+            for (int c = 0; c < ctx->schema->ncols; c++) {
+                if (!strcasecmp(ctx->schema->cols[c].name, fn)) {
+                    if (ctx->batch->null_bitmap[c] &&
+                        bit_is_null(ctx->batch->null_bitmap[c], ctx->row))
+                        return s;
+                    switch (ctx->schema->cols[c].type) {
+                    case COL_INT64:  s.type=SV_INT;    s.val.ival=((int64_t*)ctx->batch->values[c])[ctx->row]; break;
+                    case COL_DOUBLE: s.type=SV_DOUBLE; s.val.fval=((double*)ctx->batch->values[c])[ctx->row];  break;
+                    case COL_TEXT:   s.type=SV_TEXT;   s.val.sval=((char**)ctx->batch->values[c])[ctx->row];   break;
+                    default: break;
+                    }
+                    return s;
+                }
+            }
+        }
+        /* aggregate functions return 0/null in scalar context */
         if (!strcasecmp(fn,"count")) { s.type=SV_INT; s.val.ival=0; return s; }
         if (!strcasecmp(fn,"now"))   { s.type=SV_INT; s.val.ival=(int64_t)time(NULL); return s; }
         if (e->nargs > 0) {
@@ -181,8 +202,39 @@ typedef struct {
     int    ncols;
 } ScanState;
 
+static Schema *scan_load_schema(Arena *a, const char *data_dir, const char *table_name) {
+    char path[700];
+    snprintf(path, sizeof(path), "%s/%s/schema.json", data_dir, table_name);
+    FILE *f = fopen(path, "r");
+    if (!f) return NULL;
+    fseek(f, 0, SEEK_END); long sz = ftell(f); rewind(f);
+    if (sz <= 0 || sz > 65536) { fclose(f); return NULL; }
+    char *buf = arena_alloc(a, (size_t)sz + 1);
+    fread(buf, 1, (size_t)sz, f);
+    fclose(f);
+    buf[sz] = '\0';
+    JVal *root = json_parse(a, buf, (size_t)sz);
+    if (!root || root->type != JV_OBJECT) return NULL;
+    JVal *cols_arr = json_get(root, "cols");
+    if (!cols_arr || cols_arr->type != JV_ARRAY) return NULL;
+    int ncols = (int)json_int(json_get(root, "ncols"), 0);
+    if (ncols <= 0 || ncols > MAX_COLS) return NULL;
+    Schema *sc = arena_calloc(a, sizeof(Schema));
+    sc->cols = arena_calloc(a, sizeof(ColDef) * (size_t)ncols);
+    sc->ncols = ncols;
+    for (int i = 0; i < ncols && i < (int)cols_arr->nitems; i++) {
+        JVal *col = cols_arr->items[i];
+        sc->cols[i].name     = arena_strdup(a, json_str(json_get(col, "name"), ""));
+        sc->cols[i].type     = (ColType)(int)json_int(json_get(col, "type"), 0);
+        sc->cols[i].nullable = json_bool(json_get(col, "nullable"), false);
+    }
+    return sc;
+}
+
 static int scan_open(Operator *op) {
     ScanState *st = op->state;
+    if (!op->output_schema)
+        op->output_schema = scan_load_schema(op->arena, st->data_dir, st->table_name);
     char path[700];
     snprintf(path, sizeof(path), "%s/%s/wal.bin", st->data_dir, st->table_name);
     st->wal_file = fopen(path, "r");
@@ -504,12 +556,641 @@ Operator *op_window(Arena *a, Operator *src, Expr **window_exprs, int nwexprs) {
     return op;
 }
 
+/* ── Aggregate / sort / project helpers ── */
+
+static bool is_agg_func(Expr *e, const char **fn_out, Expr **arg_out) {
+    if (!e) return false;
+    if (e->type == EXPR_ALIAS) return is_agg_func(e->expr, fn_out, arg_out);
+    if (e->type != EXPR_FUNC) return false;
+    const char *fn = e->func_name;
+    if (!strcasecmp(fn,"count")||!strcasecmp(fn,"sum")||
+        !strcasecmp(fn,"avg")||!strcasecmp(fn,"min")||!strcasecmp(fn,"max")) {
+        if (fn_out) *fn_out = fn;
+        if (arg_out) *arg_out = (e->nargs > 0) ? e->args[0] : NULL;
+        return true;
+    }
+    return false;
+}
+
+static const char *expr_col_name(Expr *e) {
+    if (!e) return "?";
+    if (e->type == EXPR_ALIAS) return e->alias;
+    if (e->type == EXPR_COL) return e->name;
+    if (e->type == EXPR_FUNC) return e->func_name;
+    return "expr";
+}
+
+static bool scalar_eq(Scalar a, Scalar b) {
+    if (a.type != b.type) return false;
+    switch (a.type) {
+    case SV_INT:    return a.val.ival == b.val.ival;
+    case SV_DOUBLE: return a.val.fval == b.val.fval;
+    case SV_TEXT:   return a.val.sval && b.val.sval && strcmp(a.val.sval, b.val.sval)==0;
+    case SV_BOOL:   return a.val.bval == b.val.bval;
+    default:        return true;
+    }
+}
+
+/* ── Hash-agg operator ── */
+#define AGG_MAX_GROUPS 4096
+#define AGG_MAX_EXPRS  64
+
+typedef struct {
+    Expr   **group_keys;  int ngroup;
+    Expr   **out_exprs;   int nout;
+    int      ngroups;
+    /* [ngroups][ngroup] group key values */
+    Scalar  *gkeys;       /* flat: [g*ngroup + k] */
+    /* [ngroups][nout] accumulators */
+    double  *sum_acc;     /* numeric sum */
+    int64_t *cnt_acc;     /* row count per group per expr */
+    Scalar  *min_acc;
+    Scalar  *max_acc;
+    int8_t  *has_val;     /* for min/max init */
+    bool     built;
+    int      emit_pos;
+    Schema  *out_schema;
+} AggState;
+
+static int agg_find_group(AggState *st, Scalar *keys, Arena *a) {
+    for (int g = 0; g < st->ngroups; g++) {
+        bool match = true;
+        for (int k = 0; k < st->ngroup && match; k++)
+            match = scalar_eq(st->gkeys[g * st->ngroup + k], keys[k]);
+        if (match) return g;
+    }
+    /* new group */
+    if (st->ngroups >= AGG_MAX_GROUPS) return -1;
+    int g = st->ngroups++;
+    for (int k = 0; k < st->ngroup; k++) {
+        Scalar s = keys[k];
+        if (s.type == SV_TEXT && s.val.sval)
+            s.val.sval = arena_strdup(a, s.val.sval);
+        st->gkeys[g * st->ngroup + k] = s;
+    }
+    return g;
+}
+
+static void agg_accumulate(AggState *st, int g, int oi, const char *fn, Scalar val, Arena *a) {
+    int idx = g * st->nout + oi;
+    st->cnt_acc[idx]++;
+    if (!strcasecmp(fn,"count")) return;
+    if (val.type == SV_NULL) return;
+    if (!strcasecmp(fn,"sum") || !strcasecmp(fn,"avg")) {
+        double v = (val.type==SV_INT) ? (double)val.val.ival : val.val.fval;
+        st->sum_acc[idx] += v;
+    }
+    if (!strcasecmp(fn,"min")) {
+        if (!st->has_val[idx]) {
+            st->min_acc[idx] = val;
+            if (val.type==SV_TEXT && val.val.sval)
+                st->min_acc[idx].val.sval = arena_strdup(a, val.val.sval);
+            st->has_val[idx] = 1;
+        } else {
+            Scalar cur = st->min_acc[idx];
+            bool less = false;
+            if (val.type==SV_INT)    less = val.val.ival < cur.val.ival;
+            else if (val.type==SV_DOUBLE) less = val.val.fval < cur.val.fval;
+            else if (val.type==SV_TEXT && val.val.sval && cur.val.sval)
+                less = strcmp(val.val.sval, cur.val.sval) < 0;
+            if (less) {
+                st->min_acc[idx] = val;
+                if (val.type==SV_TEXT && val.val.sval)
+                    st->min_acc[idx].val.sval = arena_strdup(a, val.val.sval);
+            }
+        }
+    }
+    if (!strcasecmp(fn,"max")) {
+        if (!st->has_val[idx]) {
+            st->max_acc[idx] = val;
+            if (val.type==SV_TEXT && val.val.sval)
+                st->max_acc[idx].val.sval = arena_strdup(a, val.val.sval);
+            st->has_val[idx] = 1;
+        } else {
+            Scalar cur = st->max_acc[idx];
+            bool more = false;
+            if (val.type==SV_INT)    more = val.val.ival > cur.val.ival;
+            else if (val.type==SV_DOUBLE) more = val.val.fval > cur.val.fval;
+            else if (val.type==SV_TEXT && val.val.sval && cur.val.sval)
+                more = strcmp(val.val.sval, cur.val.sval) > 0;
+            if (more) {
+                st->max_acc[idx] = val;
+                if (val.type==SV_TEXT && val.val.sval)
+                    st->max_acc[idx].val.sval = arena_strdup(a, val.val.sval);
+            }
+        }
+    }
+}
+
+static int agg_open(Operator *op) { return op->left->vt->open(op->left); }
+
+static int agg_next(Operator *op, ColBatch **out_batch) {
+    AggState *st = op->state;
+    Arena *a = op->arena;
+
+    if (!st->built) {
+        /* allocate accumulators */
+        int ng = AGG_MAX_GROUPS, no = st->nout;
+        st->gkeys   = calloc((size_t)(ng * st->ngroup + 1), sizeof(Scalar));
+        st->sum_acc = calloc((size_t)(ng * no + 1), sizeof(double));
+        st->cnt_acc = calloc((size_t)(ng * no + 1), sizeof(int64_t));
+        st->min_acc = calloc((size_t)(ng * no + 1), sizeof(Scalar));
+        st->max_acc = calloc((size_t)(ng * no + 1), sizeof(Scalar));
+        st->has_val = calloc((size_t)(ng * no + 1), sizeof(int8_t));
+
+        /* drain child and accumulate */
+        ColBatch *src = NULL;
+        while (op->left->vt->next(op->left, &src) == 0 && src && src->nrows > 0) {
+            Schema *sc = src->schema;
+            EvalCtx ctx = {sc, src, 0};
+            for (int r = 0; r < src->nrows; r++) {
+                ctx.row = r;
+                /* evaluate group keys */
+                Scalar keys[16]; /* ngroup <= 16 */
+                for (int k = 0; k < st->ngroup && k < 16; k++)
+                    keys[k] = eval_expr(st->group_keys[k], &ctx, a);
+                int g = agg_find_group(st, keys, a);
+                if (g < 0) continue;
+                /* accumulate each output expression */
+                for (int oi = 0; oi < st->nout; oi++) {
+                    Expr *e = st->out_exprs[oi];
+                    const char *fn = NULL; Expr *arg = NULL;
+                    if (is_agg_func(e, &fn, &arg)) {
+                        Scalar val = (arg && strcasecmp(fn,"count")!=0)
+                            ? eval_expr(arg, &ctx, a)
+                            : (Scalar){SV_INT, {.ival=1}};
+                        agg_accumulate(st, g, oi, fn, val, a);
+                    } else {
+                        /* non-agg: store value from first row in group */
+                        int idx = g * st->nout + oi;
+                        if (!st->has_val[idx]) {
+                            Scalar v = eval_expr(e, &ctx, a);
+                            if (v.type==SV_TEXT && v.val.sval)
+                                v.val.sval = arena_strdup(a, v.val.sval);
+                            st->min_acc[idx] = v; /* reuse min_acc for passthrough */
+                            st->has_val[idx] = 1;
+                        }
+                    }
+                }
+            }
+            src = NULL;
+        }
+        st->built = true;
+
+        /* build output schema */
+        Schema *sc = arena_calloc(a, sizeof(Schema));
+        sc->ncols = st->nout;
+        sc->cols  = arena_calloc(a, sizeof(ColDef) * (size_t)st->nout);
+        for (int oi = 0; oi < st->nout; oi++) {
+            sc->cols[oi].name = arena_strdup(a, expr_col_name(st->out_exprs[oi]));
+            const char *fn = NULL; Expr *arg = NULL;
+            if (is_agg_func(st->out_exprs[oi], &fn, NULL)) {
+                if (!strcasecmp(fn,"count")) sc->cols[oi].type = COL_INT64;
+                else if (!strcasecmp(fn,"min")||!strcasecmp(fn,"max")) {
+                    /* infer from min/max_acc if available */
+                    Scalar s = st->min_acc[oi]; /* use first group */
+                    if (!strcasecmp(fn,"max")) s = st->max_acc[oi];
+                    sc->cols[oi].type = (s.type==SV_TEXT) ? COL_TEXT : COL_DOUBLE;
+                    (void)arg;
+                } else sc->cols[oi].type = COL_DOUBLE;
+            } else {
+                /* passthrough: infer from stored value */
+                Scalar s = st->min_acc[oi];
+                sc->cols[oi].type = (s.type==SV_INT) ? COL_INT64 :
+                                    (s.type==SV_DOUBLE) ? COL_DOUBLE : COL_TEXT;
+            }
+        }
+        op->output_schema = sc;
+        st->out_schema = sc;
+    }
+
+    if (st->emit_pos >= st->ngroups) {
+        free(st->gkeys); free(st->sum_acc); free(st->cnt_acc);
+        free(st->min_acc); free(st->max_acc); free(st->has_val);
+        st->gkeys = NULL;
+        return 1;
+    }
+
+    /* emit one row per group per call */
+    int g = st->emit_pos++;
+    Schema *sc = st->out_schema;
+    ColBatch *b = arena_calloc(a, sizeof(ColBatch));
+    b->schema = sc; b->ncols = st->nout; b->nrows = 1;
+    for (int oi = 0; oi < st->nout; oi++) {
+        const char *fn = NULL;
+        bool is_agg = is_agg_func(st->out_exprs[oi], &fn, NULL);
+        int idx = g * st->nout + oi;
+        Scalar val = {SV_NULL};
+        if (!is_agg) {
+            val = st->min_acc[idx]; /* passthrough value */
+        } else if (!strcasecmp(fn,"count")) {
+            val.type = SV_INT; val.val.ival = st->cnt_acc[idx];
+        } else if (!strcasecmp(fn,"avg")) {
+            val.type = SV_DOUBLE;
+            val.val.fval = st->cnt_acc[idx] ? st->sum_acc[idx]/(double)st->cnt_acc[idx] : 0.0;
+        } else if (!strcasecmp(fn,"sum")) {
+            val.type = SV_DOUBLE; val.val.fval = st->sum_acc[idx];
+        } else if (!strcasecmp(fn,"min")) {
+            val = st->has_val[idx] ? st->min_acc[idx] : (Scalar){SV_NULL};
+        } else if (!strcasecmp(fn,"max")) {
+            val = st->has_val[idx] ? st->max_acc[idx] : (Scalar){SV_NULL};
+        }
+        switch (sc->cols[oi].type) {
+        case COL_INT64: {
+            int64_t *arr = arena_alloc(a, sizeof(int64_t));
+            *arr = (val.type==SV_DOUBLE) ? (int64_t)val.val.fval : val.val.ival;
+            b->values[oi] = arr; break;
+        }
+        case COL_DOUBLE: {
+            double *arr = arena_alloc(a, sizeof(double));
+            *arr = (val.type==SV_INT) ? (double)val.val.ival : val.val.fval;
+            b->values[oi] = arr; break;
+        }
+        default: {
+            char **arr = arena_alloc(a, sizeof(char*));
+            *arr = val.type==SV_TEXT && val.val.sval
+                   ? arena_strdup(a, val.val.sval) : arena_strdup(a, "");
+            b->values[oi] = arr; break;
+        }
+        }
+        b->null_bitmap[oi] = arena_calloc(a, 1);
+        if (val.type == SV_NULL) b->null_bitmap[oi][0] = 1;
+    }
+    *out_batch = b;
+    return 0;
+}
+
+static void agg_close(Operator *op) { op->left->vt->close(op->left); }
+static const OpVtable AGG_VT = {agg_open, agg_next, agg_close};
+
+Operator *op_hash_agg(Arena *a, Operator *src,
+                      Expr **group_keys, int ngroup,
+                      Expr **agg_exprs, int nagg) {
+    Operator *op = arena_calloc(a, sizeof(Operator));
+    op->vt = &AGG_VT; op->left = src; op->arena = a;
+    AggState *st = arena_calloc(a, sizeof(AggState));
+    st->group_keys = group_keys; st->ngroup = ngroup;
+    st->out_exprs  = agg_exprs;  st->nout   = nagg;
+    /* for scalar agg (no group keys) start with 1 group */
+    if (ngroup == 0) { st->ngroups = 1; }
+    op->state = st;
+    return op;
+}
+
+/* ── Sort operator (blocking) ── */
+typedef struct {
+    OrderItem *order;   int norder;
+    ColBatch  *result;
+    int        total_rows;
+    int        emit_pos;
+    bool       built;
+    Arena     *a;
+    Schema    *sc;
+} SortState;
+
+/* qsort context (not thread-safe, but single-threaded here) */
+static SortState *g_sort_ctx = NULL;
+
+static int sort_cmp(const void *va, const void *vb) {
+    int ia = *(const int*)va, ib = *(const int*)vb;
+    SortState *st = g_sort_ctx;
+    ColBatch *b = st->result;
+    Schema *sc = st->sc;
+    for (int o = 0; o < st->norder; o++) {
+        Scalar la = {SV_NULL}, lb = {SV_NULL};
+        EvalCtx ca = {sc, b, ia}, cb = {sc, b, ib};
+        la = eval_expr(st->order[o].expr, &ca, st->a);
+        lb = eval_expr(st->order[o].expr, &cb, st->a);
+        int cmp = 0;
+        if (la.type == SV_INT && lb.type == SV_INT)
+            cmp = (la.val.ival > lb.val.ival) - (la.val.ival < lb.val.ival);
+        else if ((la.type==SV_INT||la.type==SV_DOUBLE) && (lb.type==SV_INT||lb.type==SV_DOUBLE)) {
+            double da = la.type==SV_INT?(double)la.val.ival:la.val.fval;
+            double db = lb.type==SV_INT?(double)lb.val.ival:lb.val.fval;
+            cmp = (da > db) - (da < db);
+        } else if (la.type == SV_TEXT && lb.type == SV_TEXT && la.val.sval && lb.val.sval)
+            cmp = strcmp(la.val.sval, lb.val.sval);
+        if (cmp != 0) return st->order[o].desc ? -cmp : cmp;
+    }
+    return 0;
+}
+
+static int sort_open(Operator *op) { return op->left->vt->open(op->left); }
+
+static int sort_next(Operator *op, ColBatch **out) {
+    SortState *st = op->state;
+    Arena *a = op->arena;
+
+    if (!st->built) {
+        /* materialise all rows — schema may not be set yet (e.g., from agg), read from first batch */
+        Schema *sc = op->left->output_schema;
+        int ncols = 0;
+        int cap = 256, nrows = 0;
+        void **cols = NULL;
+
+        ColBatch *src = NULL;
+        while (op->left->vt->next(op->left, &src) == 0 && src && src->nrows > 0) {
+            /* initialise col buffers on first batch */
+            if (!sc && src->schema) sc = src->schema;
+            if (!cols && sc) {
+                ncols = sc->ncols;
+                cols = calloc((size_t)ncols, sizeof(void*));
+                for (int c = 0; c < ncols; c++) {
+                    size_t esz = sc->cols[c].type==COL_INT64 ? sizeof(int64_t) :
+                                 sc->cols[c].type==COL_DOUBLE ? sizeof(double) : sizeof(char*);
+                    cols[c] = malloc((size_t)cap * esz);
+                }
+            }
+            if (!cols) { src=NULL; continue; }
+            if (nrows + src->nrows > cap) {
+                int nc2 = (nrows + src->nrows) * 2;
+                for (int c = 0; c < ncols; c++) {
+                    size_t esz = sc->cols[c].type==COL_INT64 ? sizeof(int64_t) :
+                                 sc->cols[c].type==COL_DOUBLE ? sizeof(double) : sizeof(char*);
+                    cols[c] = realloc(cols[c], (size_t)nc2 * esz);
+                }
+                cap = nc2;
+            }
+            for (int r = 0; r < src->nrows; r++) {
+                int dr = nrows + r;
+                for (int c = 0; c < ncols; c++) {
+                    switch (sc->cols[c].type) {
+                    case COL_INT64:  ((int64_t*)cols[c])[dr]=((int64_t*)src->values[c])[r]; break;
+                    case COL_DOUBLE: ((double* )cols[c])[dr]=((double* )src->values[c])[r]; break;
+                    default:         ((char**  )cols[c])[dr]=((char**  )src->values[c])[r]; break;
+                    }
+                }
+            }
+            nrows += src->nrows;
+        }
+
+        if (!cols || !sc || nrows == 0) {
+            if (cols) { for (int c=0;c<ncols;c++) free(cols[c]); free(cols); }
+            st->built = true; return 1;
+        }
+
+        /* build a flat ColBatch with nrows rows for sort comparisons */
+        ColBatch *rb = arena_calloc(a, sizeof(ColBatch));
+        rb->schema = sc; rb->ncols = ncols; rb->nrows = nrows;
+        for (int c = 0; c < ncols; c++) {
+            size_t esz = sc->cols[c].type==COL_INT64 ? sizeof(int64_t) :
+                         sc->cols[c].type==COL_DOUBLE ? sizeof(double) : sizeof(char*);
+            void *arr = arena_alloc(a, (size_t)nrows * esz + 1);
+            memcpy(arr, cols[c], (size_t)nrows * esz);
+            rb->values[c] = arr;
+            free(cols[c]);
+        }
+        free(cols);
+
+        /* build index array and sort */
+        int *idx = malloc((size_t)nrows * sizeof(int));
+        for (int i = 0; i < nrows; i++) idx[i] = i;
+        st->result = rb; st->sc = sc; st->a = a;
+        g_sort_ctx = st;
+        qsort(idx, (size_t)nrows, sizeof(int), sort_cmp);
+
+        /* reorder columns by sorted index */
+        ColBatch *sorted = arena_calloc(a, sizeof(ColBatch));
+        sorted->schema = sc; sorted->ncols = ncols; sorted->nrows = nrows;
+        for (int c = 0; c < ncols; c++) {
+            size_t esz = sc->cols[c].type==COL_INT64 ? sizeof(int64_t) :
+                         sc->cols[c].type==COL_DOUBLE ? sizeof(double) : sizeof(char*);
+            void *arr = arena_alloc(a, (size_t)nrows * esz + 1);
+            for (int r = 0; r < nrows; r++) {
+                int sr = idx[r];
+                switch (sc->cols[c].type) {
+                case COL_INT64:  ((int64_t*)arr)[r]=((int64_t*)rb->values[c])[sr]; break;
+                case COL_DOUBLE: ((double* )arr)[r]=((double* )rb->values[c])[sr]; break;
+                default:         ((char**  )arr)[r]=((char**  )rb->values[c])[sr]; break;
+                }
+            }
+            sorted->values[c] = arr;
+            sorted->null_bitmap[c] = arena_calloc(a, ((size_t)nrows+7)/8);
+        }
+        free(idx);
+        st->result = sorted; st->total_rows = nrows;
+        st->built = true;
+    }
+
+    if (st->emit_pos >= st->total_rows) return 1;
+    *out = st->result;
+    st->emit_pos = st->total_rows; /* emit all at once */
+    return 0;
+}
+
+static void sort_close(Operator *op) { op->left->vt->close(op->left); }
+static const OpVtable SORT_VT = {sort_open, sort_next, sort_close};
+
+Operator *op_sort(Arena *a, Operator *src, OrderItem *order, int norder) {
+    Operator *op = arena_calloc(a, sizeof(Operator));
+    op->vt = &SORT_VT; op->left = src; op->arena = a;
+    op->output_schema = src ? src->output_schema : NULL;
+    SortState *st = arena_calloc(a, sizeof(SortState));
+    st->order = order; st->norder = norder;
+    op->state = st;
+    return op;
+}
+
+/* ── Project operator ── */
+Operator *op_project(Arena *a, Operator *src, Expr **exprs, int nexprs, Schema *out_schema) {
+    /* For now: if any expr is an agg func and no group-by was done → scalar agg */
+    bool has_agg = false;
+    for (int i = 0; i < nexprs; i++)
+        if (is_agg_func(exprs[i], NULL, NULL)) { has_agg = true; break; }
+    if (has_agg) {
+        /* treat as scalar aggregate: 1 group, 0 group keys */
+        return op_hash_agg(a, src, NULL, 0, exprs, nexprs);
+    }
+    /* no-op projection: just return src (schema from child is sufficient) */
+    (void)out_schema;
+    return src;
+}
+
+static bool plan_has_agg(PlanNode *p) {
+    if (!p) return false;
+    if (p->type == PLAN_AGG) return true;
+    return plan_has_agg(p->left);
+}
+
+/* ── Hash join (nested-loop fallback) ── */
+typedef struct {
+    Expr    *on;
+    JoinType jtype;
+    /* materialised right side */
+    ColBatch *right_batch;
+    bool      built;
+    /* current left batch and position */
+    ColBatch *left_batch;
+    int       left_pos;
+    int       right_pos;
+    Schema   *out_schema;
+} JoinState;
+
+static Schema *join_schema(Arena *a, Schema *ls, Schema *rs) {
+    if (!ls || !rs) return ls ? ls : rs;
+    int nc = ls->ncols + rs->ncols;
+    Schema *sc = arena_calloc(a, sizeof(Schema));
+    sc->ncols = nc;
+    sc->cols  = arena_calloc(a, sizeof(ColDef) * (size_t)nc);
+    for (int i=0;i<ls->ncols;i++) sc->cols[i]=ls->cols[i];
+    for (int i=0;i<rs->ncols;i++) sc->cols[ls->ncols+i]=rs->cols[i];
+    return sc;
+}
+
+static int join_open(Operator *op) {
+    op->left->vt->open(op->left);
+    if (op->right) op->right->vt->open(op->right);
+    return 0;
+}
+
+static int join_next(Operator *op, ColBatch **out) {
+    JoinState *st = op->state;
+    Arena *a = op->arena;
+
+    /* materialise right side once */
+    if (!st->built && op->right) {
+        Schema *rsc = op->right->output_schema;
+        if (rsc) {
+            int ncols=rsc->ncols, cap=256, nrows=0;
+            void **cols = calloc((size_t)ncols, sizeof(void*));
+            for(int c=0;c<ncols;c++){
+                size_t esz=rsc->cols[c].type==COL_INT64?sizeof(int64_t):
+                           rsc->cols[c].type==COL_DOUBLE?sizeof(double):sizeof(char*);
+                cols[c]=malloc((size_t)cap*esz);
+            }
+            ColBatch *src=NULL;
+            while(op->right->vt->next(op->right,&src)==0&&src&&src->nrows>0){
+                if(nrows+src->nrows>cap){ cap=(nrows+src->nrows)*2;
+                    for(int c=0;c<ncols;c++){
+                        size_t esz=rsc->cols[c].type==COL_INT64?sizeof(int64_t):
+                                   rsc->cols[c].type==COL_DOUBLE?sizeof(double):sizeof(char*);
+                        cols[c]=realloc(cols[c],(size_t)cap*esz);
+                    }
+                }
+                for(int r=0;r<src->nrows;r++){int dr=nrows+r;
+                    for(int c=0;c<ncols;c++){
+                        switch(rsc->cols[c].type){
+                        case COL_INT64:((int64_t*)cols[c])[dr]=((int64_t*)src->values[c])[r];break;
+                        case COL_DOUBLE:((double*)cols[c])[dr]=((double*)src->values[c])[r];break;
+                        default:((char**)cols[c])[dr]=((char**)src->values[c])[r];break;
+                        }
+                    }
+                }
+                nrows+=src->nrows;
+            }
+            ColBatch *rb=arena_calloc(a,sizeof(ColBatch));
+            rb->schema=rsc;rb->ncols=ncols;rb->nrows=nrows;
+            for(int c=0;c<ncols;c++){
+                size_t esz=rsc->cols[c].type==COL_INT64?sizeof(int64_t):
+                           rsc->cols[c].type==COL_DOUBLE?sizeof(double):sizeof(char*);
+                void *arr=arena_alloc(a,(size_t)nrows*esz+1);
+                if(nrows>0)memcpy(arr,cols[c],(size_t)nrows*esz);
+                rb->values[c]=arr; free(cols[c]);
+                rb->null_bitmap[c]=arena_calloc(a,((size_t)nrows+7)/8);
+            }
+            free(cols);
+            st->right_batch=rb;
+        }
+        st->built=true;
+    }
+
+    if (!op->right || !st->right_batch || st->right_batch->nrows==0) {
+        /* no right side or empty: just pass left through */
+        return op->left->vt->next(op->left, out);
+    }
+
+    Schema *lsc = op->left->output_schema;
+    Schema *rsc = st->right_batch->schema;
+    if (!st->out_schema)
+        st->out_schema = join_schema(a, lsc, rsc);
+
+    /* nested loop: get next left batch */
+    for (;;) {
+        if (!st->left_batch || st->left_pos >= st->left_batch->nrows) {
+            ColBatch *lb=NULL;
+            if(op->left->vt->next(op->left,&lb)!=0||!lb||lb->nrows==0) return 1;
+            st->left_batch=lb; st->left_pos=0; st->right_pos=0;
+        }
+        /* find a matching right row */
+        ColBatch *rb=st->right_batch;
+        int lp=st->left_pos, rp=st->right_pos;
+        while(rp<rb->nrows){
+            /* check ON condition if present */
+            bool match=true;
+            if(st->on){
+                /* build merged row for eval */
+                int lnc=lsc?lsc->ncols:0, rnc=rsc?rsc->ncols:0;
+                int nc=lnc+rnc;
+                Schema *msc=st->out_schema;
+                ColBatch mb={0}; mb.schema=msc; mb.ncols=nc; mb.nrows=1;
+                for(int c=0;c<lnc&&lsc;c++){mb.values[c]=&((char**)st->left_batch->values[c])[lp];}
+                for(int c=0;c<rnc&&rsc;c++){mb.values[lnc+c]=&((char**)rb->values[c])[rp];}
+                EvalCtx ctx={msc,&mb,0};
+                match=eval_bool(st->on,&ctx,a);
+            }
+            rp++;
+            if(match){
+                st->right_pos=rp;
+                /* emit 1 merged row */
+                int lnc=lsc?lsc->ncols:0, rnc=rsc?rsc->ncols:0;
+                int nc=lnc+rnc;
+                Schema *msc=st->out_schema;
+                ColBatch *b=arena_calloc(a,sizeof(ColBatch));
+                b->schema=msc; b->ncols=nc; b->nrows=1;
+                for(int c=0;c<lnc&&lsc;c++){
+                    size_t esz=lsc->cols[c].type==COL_INT64?sizeof(int64_t):
+                               lsc->cols[c].type==COL_DOUBLE?sizeof(double):sizeof(char*);
+                    void *arr=arena_alloc(a,esz);
+                    switch(lsc->cols[c].type){
+                    case COL_INT64:*(int64_t*)arr=((int64_t*)st->left_batch->values[c])[lp];break;
+                    case COL_DOUBLE:*(double*)arr=((double*)st->left_batch->values[c])[lp];break;
+                    default:*(char**)arr=((char**)st->left_batch->values[c])[lp];break;
+                    }
+                    b->values[c]=arr; b->null_bitmap[c]=arena_calloc(a,1);
+                }
+                for(int c=0;c<rnc&&rsc;c++){
+                    size_t esz=rsc->cols[c].type==COL_INT64?sizeof(int64_t):
+                               rsc->cols[c].type==COL_DOUBLE?sizeof(double):sizeof(char*);
+                    void *arr=arena_alloc(a,esz);
+                    switch(rsc->cols[c].type){
+                    case COL_INT64:*(int64_t*)arr=((int64_t*)rb->values[c])[rp-1];break;
+                    case COL_DOUBLE:*(double*)arr=((double*)rb->values[c])[rp-1];break;
+                    default:*(char**)arr=((char**)rb->values[c])[rp-1];break;
+                    }
+                    b->values[lnc+c]=arr; b->null_bitmap[lnc+c]=arena_calloc(a,1);
+                }
+                *out=b; return 0;
+            }
+        }
+        /* exhausted right side for this left row → advance left */
+        st->left_pos++; st->right_pos=0;
+    }
+}
+
+static void join_close(Operator *op) {
+    op->left->vt->close(op->left);
+    if (op->right) op->right->vt->close(op->right);
+}
+static const OpVtable JOIN_VT = {join_open, join_next, join_close};
+
+Operator *op_hash_join(Arena *a, Operator *left, Operator *right,
+                       Expr *on, JoinType jtype) {
+    Operator *op = arena_calloc(a, sizeof(Operator));
+    op->vt = &JOIN_VT; op->left = left; op->right = right; op->arena = a;
+    JoinState *st = arena_calloc(a, sizeof(JoinState));
+    st->on = on; st->jtype = jtype;
+    op->state = st;
+    Schema *lsc = left ? left->output_schema : NULL;
+    Schema *rsc = right ? right->output_schema : NULL;
+    op->output_schema = join_schema(a, lsc, rsc);
+    return op;
+}
+
 /* ── Build from logical plan ── */
 Operator *qengine_build(Arena *a, PlanNode *plan, const char *data_dir) {
     if (!plan) return NULL;
     switch (plan->type) {
     case PLAN_SCAN: {
-        /* schema would be fetched from catalog in full impl */
         return op_scan(a, plan->table, NULL, data_dir);
     }
     case PLAN_FILTER: {
@@ -524,11 +1205,27 @@ Operator *qengine_build(Arena *a, PlanNode *plan, const char *data_dir) {
         Operator *src = qengine_build(a, plan->left, data_dir);
         return op_window(a, src, plan->window_exprs, plan->nwindow_exprs);
     }
-    case PLAN_PROJECT:
-    case PLAN_SORT:
-    case PLAN_AGG:
-    case PLAN_JOIN:
-        return qengine_build(a, plan->left, data_dir);
+    case PLAN_AGG: {
+        Operator *src = qengine_build(a, plan->left, data_dir);
+        return op_hash_agg(a, src,
+                           plan->group_keys, plan->ngroup_keys,
+                           plan->agg_exprs, plan->nagg_exprs);
+    }
+    case PLAN_SORT: {
+        Operator *src = qengine_build(a, plan->left, data_dir);
+        return op_sort(a, src, plan->order, plan->norder);
+    }
+    case PLAN_PROJECT: {
+        Operator *src = qengine_build(a, plan->left, data_dir);
+        /* If an AGG is anywhere below, it already produced aggregated rows — just pass through */
+        if (plan_has_agg(plan->left)) return src;
+        return op_project(a, src, plan->exprs, plan->nexprs, NULL);
+    }
+    case PLAN_JOIN: {
+        Operator *left  = qengine_build(a, plan->left,  data_dir);
+        Operator *right = qengine_build(a, plan->right, data_dir);
+        return op_hash_join(a, left, right, plan->join_on, plan->join_type);
+    }
     default:
         return NULL;
     }

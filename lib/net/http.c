@@ -1,5 +1,6 @@
 #include "http.h"
 #include "../core/log.h"
+#include "../observ/observ.h"
 #include "../auth/auth.h"
 #include "../../src/gateway/app.h"
 #include <stdlib.h>
@@ -14,6 +15,13 @@
 #include <netinet/tcp.h>
 #include <signal.h>
 #include <curl/curl.h>
+#include <time.h>
+
+static int64_t clock_monotonic_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
 #ifdef __APPLE__
 #  include <sys/event.h>
 #  include <sys/time.h>
@@ -120,6 +128,8 @@ void router_dispatch(Router *r, HttpReq *req, HttpResp *resp) {
                 "/app.js",
                 "/api/auth/login",
                 "/api/auth/token",
+                "/metrics",    /* Prometheus scraper не передаёт Authorization */
+                "/health",
                 NULL
             };
             bool is_public = false;
@@ -181,16 +191,30 @@ static int parse_request(Arena *a, char *buf, size_t len, HttpReq *req) {
 }
 
 static void send_response(int fd, HttpResp *resp) {
-    char header[512];
+    char header[640];
     const char *ct = resp->content_type ? resp->content_type : "application/octet-stream";
-    int hlen = snprintf(header, sizeof(header),
-        "HTTP/1.1 %d %s\r\n"
-        "Content-Type: %s\r\n"
-        "Content-Length: %zu\r\n"
-        "Access-Control-Allow-Origin: *\r\n"
-        "Connection: keep-alive\r\n"
-        "\r\n",
-        resp->status, http_status_text(resp->status), ct, resp->body_len);
+    int hlen;
+    if (resp->correlation_id[0]) {
+        hlen = snprintf(header, sizeof(header),
+            "HTTP/1.1 %d %s\r\n"
+            "Content-Type: %s\r\n"
+            "Content-Length: %zu\r\n"
+            "Access-Control-Allow-Origin: *\r\n"
+            "Connection: keep-alive\r\n"
+            "X-Correlation-Id: %s\r\n"
+            "\r\n",
+            resp->status, http_status_text(resp->status), ct,
+            resp->body_len, resp->correlation_id);
+    } else {
+        hlen = snprintf(header, sizeof(header),
+            "HTTP/1.1 %d %s\r\n"
+            "Content-Type: %s\r\n"
+            "Content-Length: %zu\r\n"
+            "Access-Control-Allow-Origin: *\r\n"
+            "Connection: keep-alive\r\n"
+            "\r\n",
+            resp->status, http_status_text(resp->status), ct, resp->body_len);
+    }
 #ifdef MSG_NOSIGNAL
     send(fd, header, (size_t)hlen, MSG_NOSIGNAL);
     if (resp->body && resp->body_len > 0)
@@ -431,16 +455,36 @@ static void handle_conn(HttpServer *srv, int fd) {
     Arena *a = arena_create(32768);
     HttpReq req = {0}; req.arena = a; req.fd = fd;
 
-    if (parse_request(a, buf, used, &req) < 0) { 
+    if (parse_request(a, buf, used, &req) < 0) {
         if (tls) tls_conn_destroy(tls);
-        free(buf); close(fd); arena_destroy(a); return; 
+        free(buf); close(fd); arena_destroy(a); return;
+    }
+
+    /* Correlation ID: echo from client or generate fresh UUID4 */
+    char *cid_hdr = hm_get(&req.headers, "x-correlation-id");
+    if (cid_hdr && *cid_hdr) {
+        log_set_correlation_id(cid_hdr);
+    } else {
+        log_new_correlation_id();
+    }
+    strncpy(req.correlation_id, g_correlation_id, 36);
+    req.correlation_id[36] = '\0';
+
+    /* X-Txn-Id header for future transaction support (Step 2) */
+    char *txn_hdr = hm_get(&req.headers, "x-txn-id");
+    if (txn_hdr && *txn_hdr) {
+        req.txn_id = (uint64_t)strtoull(txn_hdr, NULL, 10);
     }
 
     /* OPTIONS preflight */
     if (strcmp(req.method,"OPTIONS")==0) {
-        const char *hdrs = "HTTP/1.1 204 No Content\r\nAccess-Control-Allow-Origin: *\r\n"
-                           "Access-Control-Allow-Methods: GET,POST,DELETE,PUT\r\n"
-                           "Access-Control-Allow-Headers: Content-Type,Authorization\r\n\r\n";
+        char hdrs[256];
+        snprintf(hdrs, sizeof(hdrs),
+            "HTTP/1.1 204 No Content\r\n"
+            "Access-Control-Allow-Origin: *\r\n"
+            "Access-Control-Allow-Methods: GET,POST,DELETE,PUT\r\n"
+            "Access-Control-Allow-Headers: Content-Type,Authorization,X-Correlation-Id,X-Txn-Id\r\n"
+            "X-Correlation-Id: %s\r\n\r\n", req.correlation_id);
         if (tls) {
             tls_write(tls, hdrs, strlen(hdrs));
         } else {
@@ -473,15 +517,41 @@ static void handle_conn(HttpServer *srv, int fd) {
     }
 
     HttpResp resp = {0};
+    strncpy(resp.correlation_id, req.correlation_id, 36);
+
+    int64_t t_start = clock_monotonic_ms();
     router_dispatch(srv->router, &req, &resp);
-    
+    int64_t elapsed = clock_monotonic_ms() - t_start;
+
+    /* HTTP metrics */
+    App *metrics_app = (App *)srv->router->userdata;
+    if (metrics_app && metrics_app->metrics) {
+        Metrics *m = metrics_app->metrics;
+        __atomic_fetch_add(&m->http_requests_total, 1, __ATOMIC_RELAXED);
+        if (resp.status >= 500)
+            __atomic_fetch_add(&m->http_errors_5xx, 1, __ATOMIC_RELAXED);
+        else if (resp.status >= 400)
+            __atomic_fetch_add(&m->http_errors_4xx, 1, __ATOMIC_RELAXED);
+        metrics_push(&m->http_request_duration_ms, (double)elapsed);
+    }
+
     if (tls) {
         /* Build response and send via TLS */
         char resp_buf[16384];
-        snprintf(resp_buf, sizeof(resp_buf),
+        if (resp.correlation_id[0]) {
+            snprintf(resp_buf, sizeof(resp_buf),
+                "HTTP/1.1 %d %s\r\nContent-Type: %s\r\nContent-Length: %zu\r\n"
+                "Access-Control-Allow-Origin: *\r\nConnection: keep-alive\r\n"
+                "X-Correlation-Id: %s\r\n\r\n",
+                resp.status, http_status_text(resp.status),
+                resp.content_type, resp.body_len, resp.correlation_id);
+        } else {
+            snprintf(resp_buf, sizeof(resp_buf),
                 "HTTP/1.1 %d %s\r\nContent-Type: %s\r\nContent-Length: %zu\r\n"
                 "Access-Control-Allow-Origin: *\r\nConnection: keep-alive\r\n\r\n",
-                resp.status, http_status_text(resp.status), resp.content_type, resp.body_len);
+                resp.status, http_status_text(resp.status),
+                resp.content_type, resp.body_len);
+        }
         tls_write(tls, resp_buf, strlen(resp_buf));
         if (resp.body_len > 0) {
             tls_write(tls, resp.body, resp.body_len);
@@ -490,7 +560,7 @@ static void handle_conn(HttpServer *srv, int fd) {
     } else {
         send_response(fd, &resp);
     }
-    
+
     free(buf);
     arena_destroy(a);
     close(fd);

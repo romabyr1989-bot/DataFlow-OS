@@ -23,6 +23,8 @@ typedef struct {
     bool        upgrade_ws;
     AuthClaims  auth;        /* заполняется middleware, role=ROLE_VIEWER по умолчанию */
     bool        auth_ok;     /* false = не прошёл аутентификацию */
+    char        correlation_id[37]; /* UUID4, копируется из X-Correlation-Id или генерируется */
+    uint64_t    txn_id;             /* 0 = нет активной транзакции (Шаг 2) */
 } HttpReq;
 
 /* ── Response ── */
@@ -32,6 +34,7 @@ typedef struct {
     const char *body;
     size_t      body_len;
     bool        is_ws;
+    char        correlation_id[37]; /* эхо из req, возвращается в X-Correlation-Id */
 } HttpResp;
 
 /* ── Router ── */
