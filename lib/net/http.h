@@ -2,6 +2,7 @@
 #include "../core/arena.h"
 #include "../core/hashmap.h"
 #include "../auth/auth.h"
+#include "tls.h"
 #include <stddef.h>
 #include <stdbool.h>
 
@@ -61,6 +62,6 @@ int http_post_json(const char *url, const char *body, int timeout_ms);
 /* ── Server ── */
 typedef struct HttpServer HttpServer;
 
-HttpServer *http_server_create(Router *r, int port, int backlog);
+HttpServer *http_server_create(Router *r, int port, int backlog, TlsCtx *tls_ctx);
 void        http_server_run(HttpServer *s);   /* blocks */
 void        http_server_stop(HttpServer *s);

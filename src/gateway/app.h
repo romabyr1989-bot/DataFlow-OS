@@ -13,6 +13,9 @@
 #define DEFAULT_PORT     8080
 #define WORKER_THREADS   4
 
+/* WebSocket client: plain WS (tls=NULL) or WSS */
+typedef struct { int fd; TlsConn *tls; } WsClient;
+
 typedef struct {
     /* subsystems */
     Catalog    *catalog;
@@ -24,8 +27,8 @@ typedef struct {
     HashMap     tables;
     pthread_mutex_t tables_mu;
 
-    /* WebSocket client fds for live push */
-    int         ws_clients[256];
+    /* WebSocket clients (plain WS + WSS) */
+    WsClient    ws_clients[256];
     int         nws_clients;
     pthread_mutex_t ws_mu;
 
@@ -40,6 +43,11 @@ typedef struct {
     char        jwt_secret[AUTH_JWT_SECRET_LEN + 1];
     bool        auth_enabled;
     char        admin_password[256];
+
+    /* TLS/HTTPS */
+    char        tls_cert_path[512];
+    char        tls_key_path[512];
+    bool        tls_enabled;
 
     /* server */
     Router      router;

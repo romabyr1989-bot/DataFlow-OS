@@ -5,7 +5,7 @@ CFLAGS  = -std=c11 -Wall -Wextra -Wpedantic \
            -Ilib -Ilib/core -Ilib/net -Ilib/storage \
            -Ilib/sql_parser -Ilib/qengine -Ilib/scheduler \
            -Ilib/observ -Ilib/connector -Ilib/index
-LDFLAGS = -lpthread -lm -ldl -lsqlite3 -lcurl -lcrypto
+LDFLAGS = -lpthread -lm -ldl -lsqlite3 -lcurl -lcrypto -lssl
 
 # Release flags
 REL_FLAGS = -O2 -DNDEBUG -flto
@@ -27,7 +27,7 @@ LIBDIR  = $(OUTDIR)/lib
 # ── Core library objects ──
 CORE_SRCS = lib/core/arena.c lib/core/log.c lib/core/hashmap.c \
             lib/core/threadpool.c lib/core/json.c lib/auth/auth.c
-NET_SRCS  = lib/net/http.c
+NET_SRCS  = lib/net/http.c lib/net/tls.c
 STOR_SRCS = lib/storage/storage.c lib/index/btree.c
 SQL_SRCS  = lib/sql_parser/sql.c
 QE_SRCS   = lib/qengine/qengine.c

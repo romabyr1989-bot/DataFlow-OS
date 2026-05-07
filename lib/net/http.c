@@ -306,7 +306,7 @@ static void base64_enc(const uint8_t *in, size_t n, char *out) {
     out[j]='\0';
 }
 
-static void ws_handshake(int fd, const char *key) {
+static void ws_handshake(int fd, TlsConn *tls, const char *key) {
     /* RFC 6455 magic GUID */
     const char *magic = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
     char accept_src[128]; snprintf(accept_src, sizeof(accept_src), "%s%s", key, magic);
@@ -318,15 +318,40 @@ static void ws_handshake(int fd, const char *key) {
         "Upgrade: websocket\r\n"
         "Connection: Upgrade\r\n"
         "Sec-WebSocket-Accept: %s\r\n\r\n", b64);
+    if (tls) {
+        tls_write(tls, resp, (size_t)n);
+    } else {
 #ifdef MSG_NOSIGNAL
-    send(fd, resp, (size_t)n, MSG_NOSIGNAL);
+        send(fd, resp, (size_t)n, MSG_NOSIGNAL);
 #else
-    send(fd, resp, (size_t)n, 0);
+        send(fd, resp, (size_t)n, 0);
 #endif
+    }
+}
+
+/* ── HTTP→HTTPS redirect handler ── */
+static void handle_redirect(int fd, int https_port) {
+    char buf[2048]; ssize_t n = recv(fd, buf, sizeof(buf)-1, 0);
+    char path[1024] = "/";
+    if (n > 0) { buf[n] = '\0'; sscanf(buf, "%*s %1023s", path); }
+    char resp[2048];
+    int rlen = snprintf(resp, sizeof(resp),
+        "HTTP/1.1 301 Moved Permanently\r\n"
+        "Location: https://localhost:%d%s\r\n"
+        "Content-Length: 0\r\nConnection: close\r\n\r\n",
+        https_port, path);
+    send(fd, resp, (size_t)rlen, MSG_NOSIGNAL);
+    close(fd);
 }
 
 /* ── Connection handler ── */
-struct HttpServer { Router *router; int port, backlog, epfd, listenfd, running; };
+struct HttpServer {
+    Router  *router;
+    int      port, backlog, epfd, listenfd, running;
+    TlsCtx  *tls_ctx;
+    int      redirect_fd;   /* HTTP→HTTPS plain listener (-1 if unused) */
+    int      https_port;    /* actual HTTPS port (listenfd) */
+};
 
 static void handle_conn(HttpServer *srv, int fd) {
     enum { MAX_REQ_SIZE = 256 * 1024 * 1024 };
@@ -334,20 +359,46 @@ static void handle_conn(HttpServer *srv, int fd) {
     char *buf = malloc(cap + 1);
     if (!buf) { close(fd); return; }
 
+    /* TLS handshake if enabled */
+    TlsConn *tls = NULL;
+    if (srv->tls_ctx) {
+        tls = tls_conn_accept(srv->tls_ctx, fd);
+        if (!tls) {
+            LOG_WARN("TLS handshake failed for fd %d", fd);
+            free(buf);
+            close(fd);
+            return;
+        }
+    }
+
     size_t want_total = 0;
     bool header_done = false;
     while (1) {
         if (used == cap) {
-            if (cap >= MAX_REQ_SIZE) { free(buf); close(fd); return; }
+            if (cap >= MAX_REQ_SIZE) { 
+                if (tls) tls_conn_destroy(tls);
+                free(buf); close(fd); return; 
+            }
             size_t ncap = cap * 2;
             if (ncap > MAX_REQ_SIZE) ncap = MAX_REQ_SIZE;
             char *nb = realloc(buf, ncap + 1);
-            if (!nb) { free(buf); close(fd); return; }
+            if (!nb) { 
+                if (tls) tls_conn_destroy(tls);
+                free(buf); close(fd); return; 
+            }
             buf = nb; cap = ncap;
         }
 
-        ssize_t n = recv(fd, buf + used, cap - used, 0);
-        if (n <= 0) { free(buf); close(fd); return; }
+        ssize_t n;
+        if (tls) {
+            n = tls_read(tls, buf + used, cap - used);
+        } else {
+            n = recv(fd, buf + used, cap - used, 0);
+        }
+        if (n <= 0) { 
+            if (tls) tls_conn_destroy(tls);
+            free(buf); close(fd); return; 
+        }
         used += (size_t)n;
         buf[used] = '\0';
 
@@ -367,7 +418,10 @@ static void handle_conn(HttpServer *srv, int fd) {
                 if (!p && strncasecmp(buf, "content-length:", 15) == 0) p = buf - 1;
                 if (p) cl = (size_t)strtoull(p + 16, NULL, 10);
                 want_total = header_len + cl;
-                if (want_total > MAX_REQ_SIZE) { free(buf); close(fd); return; }
+                if (want_total > MAX_REQ_SIZE) { 
+                    if (tls) tls_conn_destroy(tls);
+                    free(buf); close(fd); return; 
+                }
             }
         }
         if (header_done && used >= want_total) break;
@@ -377,94 +431,185 @@ static void handle_conn(HttpServer *srv, int fd) {
     Arena *a = arena_create(32768);
     HttpReq req = {0}; req.arena = a; req.fd = fd;
 
-    if (parse_request(a, buf, used, &req) < 0) { free(buf); close(fd); arena_destroy(a); return; }
+    if (parse_request(a, buf, used, &req) < 0) { 
+        if (tls) tls_conn_destroy(tls);
+        free(buf); close(fd); arena_destroy(a); return; 
+    }
 
     /* OPTIONS preflight */
     if (strcmp(req.method,"OPTIONS")==0) {
         const char *hdrs = "HTTP/1.1 204 No Content\r\nAccess-Control-Allow-Origin: *\r\n"
                            "Access-Control-Allow-Methods: GET,POST,DELETE,PUT\r\n"
                            "Access-Control-Allow-Headers: Content-Type,Authorization\r\n\r\n";
-        send(fd, hdrs, strlen(hdrs), MSG_NOSIGNAL);
+        if (tls) {
+            tls_write(tls, hdrs, strlen(hdrs));
+        } else {
+            send(fd, hdrs, strlen(hdrs), MSG_NOSIGNAL);
+        }
+        if (tls) tls_conn_destroy(tls);
         free(buf); arena_destroy(a); close(fd); return;
     }
 
     if (req.upgrade_ws) {
         char *key = hm_get(&req.headers, "sec-websocket-key");
-        if (key) ws_handshake(fd, key);
-        /* WS fd stays open — handled separately */
+        if (key) ws_handshake(fd, tls, key);
+        /* Register in App's ws_clients so broadcast can reach this client */
+        App *ws_app = (App *)srv->router->userdata;
+        if (ws_app) {
+            pthread_mutex_lock(&ws_app->ws_mu);
+            if (ws_app->nws_clients < 256) {
+                ws_app->ws_clients[ws_app->nws_clients].fd  = fd;
+                ws_app->ws_clients[ws_app->nws_clients].tls = tls;
+                ws_app->nws_clients++;
+                tls = NULL;  /* ownership transferred to ws_clients */
+            }
+            pthread_mutex_unlock(&ws_app->ws_mu);
+        }
+        if (tls) tls_conn_destroy(tls);
         free(buf);
         arena_destroy(a);
+        /* fd stays open — owned by ws_clients until client disconnects */
         return;
     }
 
     HttpResp resp = {0};
     router_dispatch(srv->router, &req, &resp);
-    send_response(fd, &resp);
+    
+    if (tls) {
+        /* Build response and send via TLS */
+        char resp_buf[16384];
+        snprintf(resp_buf, sizeof(resp_buf),
+                "HTTP/1.1 %d %s\r\nContent-Type: %s\r\nContent-Length: %zu\r\n"
+                "Access-Control-Allow-Origin: *\r\nConnection: keep-alive\r\n\r\n",
+                resp.status, http_status_text(resp.status), resp.content_type, resp.body_len);
+        tls_write(tls, resp_buf, strlen(resp_buf));
+        if (resp.body_len > 0) {
+            tls_write(tls, resp.body, resp.body_len);
+        }
+        tls_conn_destroy(tls);
+    } else {
+        send_response(fd, &resp);
+    }
+    
     free(buf);
     arena_destroy(a);
     close(fd);
 }
 
-HttpServer *http_server_create(Router *r, int port, int backlog) {
+HttpServer *http_server_create(Router *r, int port, int backlog, TlsCtx *tls_ctx) {
     HttpServer *s = calloc(1, sizeof(HttpServer));
     s->router = r; s->port = port; s->backlog = backlog;
+    s->tls_ctx = tls_ctx; s->redirect_fd = -1;
+    s->https_port = tls_ctx ? 8443 : port;
     return s;
 }
 
 void http_server_run(HttpServer *s) {
     signal(SIGPIPE, SIG_IGN);
+    int yes = 1;
+
+    /* When TLS: HTTPS on https_port (8443), plain redirect on port (8080) */
+    int main_port = s->tls_ctx ? s->https_port : s->port;
+
     int lfd = socket(AF_INET, SOCK_STREAM, 0);
-    int yes = 1; setsockopt(lfd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
+    setsockopt(lfd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
 #ifdef SO_REUSEPORT
     setsockopt(lfd, SOL_SOCKET, SO_REUSEPORT, &yes, sizeof(yes));
 #endif
-    struct sockaddr_in addr = {.sin_family=AF_INET, .sin_port=htons((uint16_t)s->port), .sin_addr={INADDR_ANY}};
+    struct sockaddr_in addr = {.sin_family=AF_INET,
+        .sin_port=htons((uint16_t)main_port), .sin_addr={INADDR_ANY}};
     if (bind(lfd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
-        LOG_ERROR("bind port %d: %s", s->port, strerror(errno)); return;
+        LOG_ERROR("bind port %d: %s", main_port, strerror(errno)); return;
     }
     listen(lfd, s->backlog > 0 ? s->backlog : 128);
     s->listenfd = lfd; s->running = 1;
-    LOG_INFO("HTTP server listening on :%d", s->port);
+
+    /* HTTP→HTTPS redirect listener on s->port when TLS is active */
+    if (s->tls_ctx && s->port != main_port) {
+        int rfd = socket(AF_INET, SOCK_STREAM, 0);
+        setsockopt(rfd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
+#ifdef SO_REUSEPORT
+        setsockopt(rfd, SOL_SOCKET, SO_REUSEPORT, &yes, sizeof(yes));
+#endif
+        struct sockaddr_in ra = {.sin_family=AF_INET,
+            .sin_port=htons((uint16_t)s->port), .sin_addr={INADDR_ANY}};
+        if (bind(rfd, (struct sockaddr*)&ra, sizeof(ra)) == 0) {
+            listen(rfd, s->backlog > 0 ? s->backlog : 128);
+            s->redirect_fd = rfd;
+            LOG_INFO("HTTP→HTTPS redirect on :%d → https://localhost:%d",
+                     s->port, main_port);
+        } else {
+            LOG_WARN("redirect bind :%d failed: %s", s->port, strerror(errno));
+            close(rfd);
+        }
+    }
+
+    if (s->tls_ctx)
+        LOG_INFO("HTTPS server listening on :%d (TLS 1.2+)", main_port);
+    else
+        LOG_INFO("HTTP server listening on :%d", main_port);
 
 #ifdef __APPLE__
     int evfd = kqueue(); s->epfd = evfd;
     struct kevent kev;
     EV_SET(&kev, lfd, EVFILT_READ, EV_ADD, 0, 0, NULL);
     kevent(evfd, &kev, 1, NULL, 0, NULL);
+    if (s->redirect_fd >= 0) {
+        EV_SET(&kev, s->redirect_fd, EVFILT_READ, EV_ADD, 0, 0, NULL);
+        kevent(evfd, &kev, 1, NULL, 0, NULL);
+    }
 
     struct kevent events[64];
     while (s->running) {
         struct timespec ts = {0, 100000000}; /* 100ms */
         int nev = kevent(evfd, NULL, 0, events, 64, &ts);
         for (int i = 0; i < nev; i++) {
-            if ((int)events[i].ident == lfd) {
-                struct sockaddr_in ca; socklen_t cl = sizeof(ca);
+            int efd = (int)events[i].ident;
+            struct sockaddr_in ca; socklen_t cl = sizeof(ca);
+            if (efd == lfd) {
                 int cfd = accept(lfd, (struct sockaddr*)&ca, &cl);
                 if (cfd < 0) continue;
                 fcntl(cfd, F_SETFD, FD_CLOEXEC);
                 handle_conn(s, cfd);
+            } else if (s->redirect_fd >= 0 && efd == s->redirect_fd) {
+                int cfd = accept(s->redirect_fd, (struct sockaddr*)&ca, &cl);
+                if (cfd < 0) continue;
+                fcntl(cfd, F_SETFD, FD_CLOEXEC);
+                handle_redirect(cfd, main_port);
             }
         }
     }
-    close(lfd); close(evfd);
+    close(lfd);
+    if (s->redirect_fd >= 0) { close(s->redirect_fd); s->redirect_fd = -1; }
+    close(evfd);
 #else
     int epfd = epoll_create1(0); s->epfd = epfd;
     struct epoll_event ev = {.events = EPOLLIN, .data.fd = lfd};
     epoll_ctl(epfd, EPOLL_CTL_ADD, lfd, &ev);
+    if (s->redirect_fd >= 0) {
+        struct epoll_event rev = {.events = EPOLLIN, .data.fd = s->redirect_fd};
+        epoll_ctl(epfd, EPOLL_CTL_ADD, s->redirect_fd, &rev);
+    }
 
     struct epoll_event events[64];
     while (s->running) {
         int nev = epoll_wait(epfd, events, 64, 100);
         for (int i = 0; i < nev; i++) {
+            struct sockaddr_in ca; socklen_t cl = sizeof(ca);
             if (events[i].data.fd == lfd) {
-                struct sockaddr_in ca; socklen_t cl = sizeof(ca);
                 int cfd = accept4(lfd, (struct sockaddr*)&ca, &cl, SOCK_CLOEXEC);
                 if (cfd < 0) continue;
                 handle_conn(s, cfd);
+            } else if (s->redirect_fd >= 0 && events[i].data.fd == s->redirect_fd) {
+                int cfd = accept4(s->redirect_fd, (struct sockaddr*)&ca, &cl, SOCK_CLOEXEC);
+                if (cfd < 0) continue;
+                handle_redirect(cfd, main_port);
             }
         }
     }
-    close(lfd); close(epfd);
+    close(lfd);
+    if (s->redirect_fd >= 0) { close(s->redirect_fd); s->redirect_fd = -1; }
+    close(epfd);
 #endif
 }
 

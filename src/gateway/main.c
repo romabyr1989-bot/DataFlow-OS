@@ -2,6 +2,7 @@
 #include "../../lib/core/log.h"
 #include "../../lib/auth/auth.h"
 #include "../../lib/core/json.h"
+#include "../../lib/net/tls.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -30,12 +31,17 @@ void app_ws_broadcast(App *app, const char *json_msg) {
     memcpy(frame+flen,json_msg,len); flen+=(int)len;
     int dead[256]; int ndead=0;
     for(int i=0;i<app->nws_clients;i++){
-        if(send(app->ws_clients[i],frame,(size_t)flen,MSG_NOSIGNAL)<0)
-            dead[ndead++]=i;
+        WsClient *wc = &app->ws_clients[i];
+        ssize_t r = wc->tls
+            ? tls_write(wc->tls, frame, (size_t)flen)
+            : send(wc->fd, frame, (size_t)flen, MSG_NOSIGNAL);
+        if(r<0) dead[ndead++]=i;
     }
     for(int i=ndead-1;i>=0;i--){
         int di = dead[i];
         if (di < 0 || di >= app->nws_clients) continue;
+        WsClient *dc = &app->ws_clients[di];
+        if (dc->tls) { tls_conn_destroy(dc->tls); }
         app->ws_clients[di]=app->ws_clients[--app->nws_clients];
     }
     pthread_mutex_unlock(&app->ws_mu);
@@ -74,8 +80,15 @@ void app_init(App *app, const char *config_json) {
             if(js) strncpy(app->jwt_secret,js,sizeof(app->jwt_secret)-1);
             const char *ap=json_str(json_get(cfg,"admin_password"),NULL);
             if(ap) strncpy(app->admin_password,ap,sizeof(app->admin_password)-1);
+            const char *tc=json_str(json_get(cfg,"tls_cert"),NULL);
+            if(tc) strncpy(app->tls_cert_path,tc,sizeof(app->tls_cert_path)-1);
+            const char *tk=json_str(json_get(cfg,"tls_key"),NULL);
+            if(tk) strncpy(app->tls_key_path,tk,sizeof(app->tls_key_path)-1);
         }
         arena_destroy(a);
+    }
+    if (app->tls_cert_path[0] && app->tls_key_path[0]) {
+        app->tls_enabled = true;
     }
     snprintf(app->db_path,sizeof(app->db_path),"%s/catalog.db",app->data_dir);
 
@@ -147,8 +160,18 @@ void app_init(App *app, const char *config_json) {
     api_register_routes(&app->router);
     app->router.userdata = app;
 
+    /* create TLS context if enabled */
+    TlsCtx *tls_ctx = NULL;
+    if (app->tls_enabled && app->tls_cert_path[0] && app->tls_key_path[0]) {
+        tls_ctx = tls_server_ctx_create(app->tls_cert_path, app->tls_key_path);
+        if (!tls_ctx) {
+            LOG_ERROR("failed to create TLS context");
+            exit(1);
+        }
+    }
+
     /* create HTTP server */
-    app->server = http_server_create(&app->router, app->port, 128);
+    app->server = http_server_create(&app->router, app->port, 128, tls_ctx);
 
     /* start scheduler */
     scheduler_start(app->scheduler);
