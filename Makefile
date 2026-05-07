@@ -26,7 +26,8 @@ LIBDIR  = $(OUTDIR)/lib
 
 # ── Core library objects ──
 CORE_SRCS = lib/core/arena.c lib/core/log.c lib/core/hashmap.c \
-            lib/core/threadpool.c lib/core/json.c lib/auth/auth.c
+            lib/core/threadpool.c lib/core/json.c lib/auth/auth.c \
+            lib/auth/rbac.c lib/auth/audit.c
 NET_SRCS  = lib/net/http.c lib/net/tls.c
 STOR_SRCS = lib/storage/storage.c lib/storage/compress.c lib/storage/txn.c lib/index/btree.c
 SQL_SRCS  = lib/sql_parser/sql.c
@@ -34,21 +35,42 @@ QE_SRCS   = lib/qengine/qengine.c
 SCHED_SRCS= lib/scheduler/scheduler.c
 OBS_SRCS  = lib/observ/observ.c
 CONN_SRCS = lib/connector/connector.c
+MV_SRCS   = lib/matview/matview.c
+CL_SRCS   = lib/cluster/proto.c lib/cluster/storage_client.c lib/cluster/replicator.c
 
 ALL_LIB_SRCS = $(CORE_SRCS) $(NET_SRCS) $(STOR_SRCS) $(SQL_SRCS) \
-               $(QE_SRCS) $(SCHED_SRCS) $(OBS_SRCS) $(CONN_SRCS)
+               $(QE_SRCS) $(SCHED_SRCS) $(OBS_SRCS) $(CONN_SRCS) \
+               $(MV_SRCS) $(CL_SRCS)
 
 GW_SRCS   = src/gateway/main.c src/gateway/api.c
+SN_SRCS   = src/storage_node/main.c
 
 # convert .c to .o in OUTDIR
 ALL_OBJS  = $(patsubst %.c,$(OUTDIR)/%.o,$(ALL_LIB_SRCS) $(GW_SRCS))
 LIB_OBJS  = $(patsubst %.c,$(OUTDIR)/%.o,$(ALL_LIB_SRCS))
 
 GATEWAY        = $(BINDIR)/dfo_gateway
+STORAGE_NODE   = $(BINDIR)/dfo_storage
 CSV_PLUGIN     = $(LIBDIR)/csv_connector.so
 PG_PLUGIN      = $(LIBDIR)/pg_connector.so
 PARQUET_PLUGIN = $(LIBDIR)/parquet_connector.so
 JSONHTTP_PLUGIN= $(LIBDIR)/json_http_connector.so
+S3_PLUGIN      = $(LIBDIR)/s3_connector.so
+KAFKA_PLUGIN   = $(LIBDIR)/kafka_connector.so
+
+# Detect librdkafka
+_RDKAFKA_LOCAL := $(shell test -d /usr/local/opt/librdkafka/include && echo /usr/local/opt/librdkafka)
+_RDKAFKA_BREW  := $(shell test -d /opt/homebrew/opt/librdkafka/include && echo /opt/homebrew/opt/librdkafka)
+RDKAFKA_PREFIX := $(or $(_RDKAFKA_LOCAL),$(_RDKAFKA_BREW))
+ifneq ($(RDKAFKA_PREFIX),)
+  KAFKACFLAGS  = -I$(RDKAFKA_PREFIX)/include
+  KAFKALDFLAGS = -L$(RDKAFKA_PREFIX)/lib -lrdkafka
+  HAS_RDKAFKA  = yes
+else
+  KAFKACFLAGS  := $(shell pkg-config --cflags rdkafka 2>/dev/null)
+  KAFKALDFLAGS := $(shell pkg-config --libs rdkafka 2>/dev/null)
+  HAS_RDKAFKA  := $(if $(KAFKALDFLAGS),yes,no)
+endif
 
 # Detect libpq — homebrew keg-only or pkg-config
 _LIBPQ_LOCAL := $(shell test -d /usr/local/opt/libpq/include && echo /usr/local/opt/libpq)
@@ -67,11 +89,16 @@ endif
 .PHONY: all clean run test dirs release debug \
         test-integration test-sql test-all bench
 
+# Base targets always built
+_ALL_TARGETS = dirs $(GATEWAY) $(STORAGE_NODE) $(CSV_PLUGIN) $(PARQUET_PLUGIN) $(JSONHTTP_PLUGIN) $(S3_PLUGIN)
 ifeq ($(HAS_PQ),yes)
-all: dirs $(GATEWAY) $(CSV_PLUGIN) $(PG_PLUGIN) $(PARQUET_PLUGIN) $(JSONHTTP_PLUGIN)
-else
-all: dirs $(GATEWAY) $(CSV_PLUGIN) $(PARQUET_PLUGIN) $(JSONHTTP_PLUGIN)
+  _ALL_TARGETS += $(PG_PLUGIN)
 endif
+ifeq ($(HAS_RDKAFKA),yes)
+  _ALL_TARGETS += $(KAFKA_PLUGIN)
+endif
+
+all: $(_ALL_TARGETS)
 
 release:
 	$(MAKE) BUILD=release all
@@ -85,7 +112,10 @@ dirs:
 	           $(OUTDIR)/lib/sql_parser $(OUTDIR)/lib/qengine \
 	           $(OUTDIR)/lib/scheduler $(OUTDIR)/lib/observ \
 	           $(OUTDIR)/lib/connector $(OUTDIR)/lib/index \
-	           $(OUTDIR)/lib/auth $(OUTDIR)/src/gateway
+	           $(OUTDIR)/lib/auth $(OUTDIR)/lib/matview $(OUTDIR)/lib/cluster \
+	           $(OUTDIR)/src/gateway $(OUTDIR)/src/storage_node \
+	           $(OUTDIR)/lib/connector/plugins/s3 \
+	           $(OUTDIR)/lib/connector/plugins/kafka
 
 # compile rule
 $(OUTDIR)/%.o: %.c
@@ -94,6 +124,12 @@ $(OUTDIR)/%.o: %.c
 
 # gateway binary
 $(GATEWAY): $(ALL_OBJS)
+	@echo "  LD  $@"
+	@$(CC) $(CFLAGS) $^ -o $@ $(LDFLAGS)
+
+# storage node binary (cluster replica)
+SN_OBJS = $(patsubst %.c,$(OUTDIR)/%.o,$(ALL_LIB_SRCS) $(SN_SRCS))
+$(STORAGE_NODE): $(SN_OBJS)
 	@echo "  LD  $@"
 	@$(CC) $(CFLAGS) $^ -o $@ $(LDFLAGS)
 
@@ -131,6 +167,27 @@ $(JSONHTTP_PLUGIN): lib/connector/plugins/json_http/json_http_connector.c \
                     $(OUTDIR)/lib/core/json.o
 	@echo "  SO  $@"
 	@$(CC) $(CFLAGS) -shared -fPIC $^ -o $@ $(LDFLAGS) -lcurl \
+	    $(if $(filter Darwin,$(shell uname)),-undefined dynamic_lookup,)
+
+# S3 / MinIO connector (requires libcurl + libcrypto)
+$(S3_PLUGIN): lib/connector/plugins/s3/s3_connector.c \
+              lib/connector/plugins/s3/aws_sig4.c \
+              $(OUTDIR)/lib/core/arena.o \
+              $(OUTDIR)/lib/storage/storage.o \
+              $(OUTDIR)/lib/core/log.o \
+              $(OUTDIR)/lib/core/json.o
+	@echo "  SO  $@"
+	@$(CC) $(CFLAGS) -shared -fPIC $^ -o $@ $(LDFLAGS) -lcurl -lcrypto \
+	    $(if $(filter Darwin,$(shell uname)),-undefined dynamic_lookup,)
+
+# Kafka connector (requires librdkafka)
+$(KAFKA_PLUGIN): lib/connector/plugins/kafka/kafka_connector.c \
+                 $(OUTDIR)/lib/core/arena.o \
+                 $(OUTDIR)/lib/storage/storage.o \
+                 $(OUTDIR)/lib/core/log.o \
+                 $(OUTDIR)/lib/core/json.o
+	@echo "  SO  $@"
+	@$(CC) $(CFLAGS) $(KAFKACFLAGS) -shared -fPIC $^ -o $@ $(LDFLAGS) $(KAFKALDFLAGS) \
 	    $(if $(filter Darwin,$(shell uname)),-undefined dynamic_lookup,)
 
 # ── Unit tests ──

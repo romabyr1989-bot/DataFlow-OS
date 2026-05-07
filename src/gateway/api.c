@@ -7,6 +7,9 @@
 #include "../../lib/storage/txn.h"
 #include "../../lib/connector/connector.h"
 #include "../../lib/auth/auth.h"
+#include "../../lib/auth/rbac.h"
+#include "../../lib/auth/audit.h"
+#include "../../lib/matview/matview.h"
 #include <sqlite3.h>
 #include <string.h>
 #include <strings.h>
@@ -3479,6 +3482,157 @@ static void h_auth_me(HttpReq *req, HttpResp *resp) {
     http_resp_json(resp, 200, json_resp);
 }
 
+/* ── RBAC handlers ── */
+static void h_rbac_policies_list(HttpReq *req, HttpResp *resp) {
+    if (req->auth.role != ROLE_ADMIN) { http_resp_error(resp, 403, "admin required"); return; }
+    Arena *a = req->arena;
+    char *json = NULL;
+    if (rbac_policy_list(g_app.rbac, (AuthRole)-1, &json, a) < 0) {
+        http_resp_error(resp, 500, "rbac error"); return;
+    }
+    http_resp_json(resp, 200, json);
+}
+
+static void h_rbac_policy_set(HttpReq *req, HttpResp *resp) {
+    if (req->auth.role != ROLE_ADMIN) { http_resp_error(resp, 403, "admin required"); return; }
+    if (!req->body || req->body_len == 0) { http_resp_error(resp, 400, "missing body"); return; }
+    Arena *a = req->arena;
+    JVal *body = json_parse(a, req->body, req->body_len);
+    if (!body || body->type != JV_OBJECT) { http_resp_error(resp, 400, "invalid json"); return; }
+    int role_i     = (int)json_int(json_get(body, "role"), -1);
+    const char *pat= json_str(json_get(body, "table_pattern"), NULL);
+    int actions    = (int)json_int(json_get(body, "allowed_actions"), 0);
+    const char *rf = json_str(json_get(body, "row_filter"), "");
+    if (role_i < 0 || !pat) { http_resp_error(resp, 400, "missing role or table_pattern"); return; }
+    if (rbac_policy_set(g_app.rbac, (AuthRole)role_i, pat, (uint32_t)actions, rf) < 0) {
+        http_resp_error(resp, 500, "rbac set failed"); return;
+    }
+    http_resp_json(resp, 200, "{\"ok\":true}");
+}
+
+static void h_rbac_policy_del(HttpReq *req, HttpResp *resp) {
+    if (req->auth.role != ROLE_ADMIN) { http_resp_error(resp, 403, "admin required"); return; }
+    const char *id_s = hm_get(&req->params, "id");
+    int id = id_s ? atoi(id_s) : 0;
+    if (id <= 0) { http_resp_error(resp, 400, "invalid id"); return; }
+    if (rbac_policy_del(g_app.rbac, id) < 0) {
+        http_resp_error(resp, 500, "rbac delete failed"); return;
+    }
+    http_resp_json(resp, 200, "{\"ok\":true}");
+}
+
+static char *qs_get(const char *qs, const char *key, Arena *a) {
+    if (!qs || !key) return NULL;
+    size_t klen = strlen(key);
+    const char *p = qs;
+    while (*p) {
+        if (strncmp(p, key, klen) == 0 && p[klen] == '=') {
+            const char *val = p + klen + 1;
+            const char *end = strchr(val, '&');
+            size_t vlen = end ? (size_t)(end - val) : strlen(val);
+            char *out = arena_alloc(a, vlen + 1);
+            memcpy(out, val, vlen); out[vlen] = '\0';
+            return out;
+        }
+        p = strchr(p, '&');
+        if (!p) break;
+        p++;
+    }
+    return NULL;
+}
+
+/* ── Audit handlers ── */
+static void h_audit_query(HttpReq *req, HttpResp *resp) {
+    if (req->auth.role != ROLE_ADMIN) { http_resp_error(resp, 403, "admin required"); return; }
+    Arena *a = req->arena;
+    const char *uid   = qs_get(req->query, "user_id", a);
+    const char *from_s= qs_get(req->query, "from",    a);
+    const char *to_s  = qs_get(req->query, "to",      a);
+    const char *lim_s = qs_get(req->query, "limit",   a);
+    int64_t from_ts = from_s ? (int64_t)atoll(from_s) : 0;
+    int64_t to_ts   = to_s   ? (int64_t)atoll(to_s)   : 0;
+    int     limit   = lim_s  ? atoi(lim_s)             : 100;
+    char *json = NULL;
+    if (audit_log_query(g_app.audit, uid, from_ts, to_ts, limit, &json, a) < 0) {
+        http_resp_error(resp, 500, "audit error"); return;
+    }
+    http_resp_json(resp, 200, json);
+}
+
+/* ── Matview handlers ── */
+static void h_matview_create(HttpReq *req, HttpResp *resp) {
+    if (req->auth.role != ROLE_ADMIN && req->auth.role != ROLE_ANALYST) {
+        http_resp_error(resp, 403, "insufficient role"); return;
+    }
+    if (!req->body || req->body_len == 0) { http_resp_error(resp, 400, "missing body"); return; }
+    Arena *a = req->arena;
+    JVal *body = json_parse(a, req->body, req->body_len);
+    if (!body || body->type != JV_OBJECT) { http_resp_error(resp, 400, "invalid json"); return; }
+    const char *name = json_str(json_get(body, "name"), NULL);
+    const char *sql  = json_str(json_get(body, "definition_sql"), NULL);
+    if (!name || !sql) { http_resp_error(resp, 400, "name and definition_sql required"); return; }
+    MatView mv; memset(&mv, 0, sizeof(mv));
+    strncpy(mv.name,           name, sizeof(mv.name)-1);
+    strncpy(mv.definition_sql, sql,  sizeof(mv.definition_sql)-1);
+    mv.refresh_mode = (MvRefreshMode)(int)json_int(json_get(body,"refresh_mode"),0);
+    const char *cron = json_str(json_get(body,"refresh_cron"), "");
+    strncpy(mv.refresh_cron, cron, sizeof(mv.refresh_cron)-1);
+    JVal *srcs = json_get(body, "source_tables");
+    if (srcs && srcs->type == JV_ARRAY) {
+        for (size_t si = 0; si < srcs->nitems && mv.nsource_tables < 16; si++) {
+            const char *t = json_str(srcs->items[si], NULL);
+            if (t) strncpy(mv.source_tables[mv.nsource_tables++], t, 127);
+        }
+    }
+    if (mvs_create_view(g_app.matviews, &mv) < 0) {
+        http_resp_error(resp, 500, "matview create failed"); return;
+    }
+    http_resp_json(resp, 200, arena_sprintf(a, "{\"name\":\"%s\",\"ok\":true}", name));
+}
+
+static void h_matviews_list(HttpReq *req, HttpResp *resp) {
+    (void)req;
+    Arena *a = req->arena;
+    char *json = NULL;
+    if (mvs_list(g_app.matviews, &json, a) < 0) {
+        http_resp_error(resp, 500, "matview list failed"); return;
+    }
+    http_resp_json(resp, 200, json);
+}
+
+static void h_matview_refresh(HttpReq *req, HttpResp *resp) {
+    const char *name = hm_get(&req->params, "name");
+    if (!name) { http_resp_error(resp, 400, "missing name"); return; }
+    if (mvs_refresh(g_app.matviews, name, &g_app) < 0) {
+        http_resp_error(resp, 500, "refresh failed"); return;
+    }
+    http_resp_json(resp, 200, "{\"ok\":true}");
+}
+
+static void h_matview_drop(HttpReq *req, HttpResp *resp) {
+    if (req->auth.role != ROLE_ADMIN) { http_resp_error(resp, 403, "admin required"); return; }
+    const char *name = hm_get(&req->params, "name");
+    if (!name) { http_resp_error(resp, 400, "missing name"); return; }
+    if (mvs_drop_view(g_app.matviews, name) < 0) {
+        http_resp_error(resp, 500, "drop failed"); return;
+    }
+    http_resp_json(resp, 200, "{\"ok\":true}");
+}
+
+/* ── Cluster status ── */
+static void h_cluster_status(HttpReq *req, HttpResp *resp) {
+    (void)req;
+    Arena *a = req->arena;
+    if (!g_app.replicator) {
+        http_resp_json(resp, 200,
+            "{\"cluster_mode\":false,\"is_leader\":false,\"replicas\":[]}");
+        return;
+    }
+    char *buf = arena_alloc(a, 4096);
+    replicator_get_status(g_app.replicator, buf, 4096);
+    http_resp_json(resp, 200, buf);
+}
+
 void api_register_routes(Router *r) {
     router_add(r,"GET",  "/",           h_ui_html);
     router_add(r,"GET",  "/style.css",  h_ui_css);
@@ -3513,4 +3667,17 @@ void api_register_routes(Router *r) {
     router_add(r,"GET",  "/api/auth/apikeys",  h_auth_apikey_list);
     router_add(r,"DELETE","/api/auth/apikeys/:key", h_auth_apikey_delete);
     router_add(r,"GET",  "/api/auth/me",       h_auth_me);
+    // RBAC endpoints
+    router_add(r,"GET",   "/api/rbac/policies",      h_rbac_policies_list);
+    router_add(r,"POST",  "/api/rbac/policies",      h_rbac_policy_set);
+    router_add(r,"DELETE","/api/rbac/policies/:id",  h_rbac_policy_del);
+    // Audit endpoints
+    router_add(r,"GET",   "/api/audit",              h_audit_query);
+    // Matview endpoints
+    router_add(r,"POST",  "/api/matviews",           h_matview_create);
+    router_add(r,"GET",   "/api/matviews",           h_matviews_list);
+    router_add(r,"POST",  "/api/matviews/:name/refresh", h_matview_refresh);
+    router_add(r,"DELETE","/api/matviews/:name",     h_matview_drop);
+    // Cluster endpoint
+    router_add(r,"GET",   "/api/cluster/status",     h_cluster_status);
 }

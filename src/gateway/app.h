@@ -7,6 +7,10 @@
 #include "../../lib/core/hashmap.h"
 #include "../../lib/core/threadpool.h"
 #include "../../lib/auth/auth.h"
+#include "../../lib/auth/rbac.h"
+#include "../../lib/auth/audit.h"
+#include "../../lib/matview/matview.h"
+#include "../../lib/cluster/replicator.h"
 #include <pthread.h>
 
 #define DATA_DIR_DEFAULT "./data"
@@ -44,6 +48,21 @@ typedef struct {
     char        jwt_secret[AUTH_JWT_SECRET_LEN + 1];
     bool        auth_enabled;
     char        admin_password[256];
+
+    /* RBAC */
+    RbacStore  *rbac;
+    bool        rbac_enabled;
+
+    /* audit log */
+    AuditLog   *audit;
+    char        audit_log_file[512];
+
+    /* materialized views */
+    MatViewStore *matviews;
+
+    /* cluster / replication */
+    Replicator  *replicator;
+    bool         cluster_mode;
 
     /* TLS/HTTPS */
     char        tls_cert_path[512];

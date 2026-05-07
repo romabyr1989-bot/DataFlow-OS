@@ -157,6 +157,13 @@ void app_init(App *app, const char *config_json) {
                 char *expanded = expand_env_vars(cd);
                 if (expanded) { strncpy(app->plugins_dir,expanded,sizeof(app->plugins_dir)-1); free(expanded); }
             }
+            /* RBAC */
+            app->rbac_enabled = (bool)json_int(json_get(cfg,"rbac_enabled"), 0);
+            /* audit */
+            const char *alf = json_str(json_get(cfg,"audit_log_file"), NULL);
+            if (alf) strncpy(app->audit_log_file, alf, sizeof(app->audit_log_file)-1);
+            /* cluster */
+            app->cluster_mode = (bool)json_int(json_get(cfg,"cluster_mode"), 0);
         }
         arena_destroy(a);
     }
@@ -212,6 +219,28 @@ void app_init(App *app, const char *config_json) {
     app->workers  = tp_create(WORKER_THREADS, 256);
     app->scheduler= scheduler_create(on_pipeline_run, app);
     app->txn_mgr  = txn_manager_create();
+
+    /* RBAC */
+    char rbac_db[512];
+    snprintf(rbac_db, sizeof(rbac_db), "%s/rbac.db", app->data_dir);
+    app->rbac = rbac_store_create(rbac_db, app->rbac_enabled);
+    if (app->rbac) rbac_init_defaults(app->rbac);
+
+    /* audit log */
+    char audit_db[512];
+    snprintf(audit_db, sizeof(audit_db), "%s/audit.db", app->data_dir);
+    app->audit = audit_log_create(audit_db,
+                     app->audit_log_file[0] ? app->audit_log_file : NULL);
+
+    /* materialized views */
+    app->matviews = mvs_create(app->catalog, app->data_dir);
+
+    /* cluster / replication */
+    if (app->cluster_mode) {
+        char node_id[37] = "leader-0";
+        app->replicator = replicator_create(true, node_id);
+        LOG_INFO("cluster mode enabled, node_id=%s", node_id);
+    }
 
     pthread_mutex_init(&app->tables_mu, NULL);
     pthread_mutex_init(&app->ws_mu, NULL);
@@ -272,6 +301,10 @@ void app_stop(App *app) {
     http_server_stop(app->server);
     tp_destroy(app->workers);
     txn_manager_destroy(app->txn_mgr);
+    if (app->replicator) replicator_destroy(app->replicator);
+    mvs_destroy(app->matviews);
+    audit_log_destroy(app->audit);
+    rbac_store_destroy(app->rbac);
     catalog_close(app->catalog);
     LOG_INFO("DataFlow OS stopped");
 }

@@ -1,0 +1,102 @@
+#include "storage_client.h"
+#include "../core/log.h"
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <netdb.h>
+#include <sys/socket.h>
+#include <arpa/inet.h>
+
+StorageClient *storage_client_create(const char *host, int port) {
+    StorageClient *c = calloc(1, sizeof(StorageClient));
+    strncpy(c->host, host, sizeof(c->host) - 1);
+    c->port = port;
+    c->fd = -1;
+    return c;
+}
+
+void storage_client_destroy(StorageClient *c) {
+    if (!c) return;
+    storage_client_disconnect(c);
+    free(c);
+}
+
+int storage_client_connect(StorageClient *c) {
+    if (c->connected) return 0;
+    struct addrinfo hints, *res;
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_socktype = SOCK_STREAM;
+    char port_str[16];
+    snprintf(port_str, sizeof(port_str), "%d", c->port);
+    if (getaddrinfo(c->host, port_str, &hints, &res) != 0) {
+        LOG_WARN("storage_client: can't resolve %s", c->host);
+        return -1;
+    }
+    int fd = socket(res->ai_family, SOCK_STREAM, 0);
+    if (fd < 0) { freeaddrinfo(res); return -1; }
+    if (connect(fd, res->ai_addr, res->ai_addrlen) != 0) {
+        close(fd);
+        freeaddrinfo(res);
+        LOG_WARN("storage_client: can't connect to %s:%d", c->host, c->port);
+        return -1;
+    }
+    freeaddrinfo(res);
+    c->fd = fd;
+    c->connected = true;
+    return 0;
+}
+
+void storage_client_disconnect(StorageClient *c) {
+    if (c->fd >= 0) { close(c->fd); c->fd = -1; }
+    c->connected = false;
+}
+
+int storage_client_ping(StorageClient *c) {
+    if (!c->connected && storage_client_connect(c) < 0) return -1;
+    uint32_t id = c->next_req_id++;
+    if (proto_send(c->fd, MSG_PING, id, NULL, 0) < 0) {
+        storage_client_disconnect(c); return -1;
+    }
+    ProtoHeader hdr; void *body = NULL;
+    if (proto_recv(c->fd, &hdr, &body, NULL) < 0) {
+        storage_client_disconnect(c); return -1;
+    }
+    proto_free_body(body);
+    return (hdr.msg_type == (uint8_t)MSG_PONG) ? 0 : -1;
+}
+
+int storage_client_replicate(StorageClient *c, const char *table_name,
+                              uint64_t offset, ColBatch *batch) {
+    if (!c->connected && storage_client_connect(c) < 0) return -1;
+    ProtoReplicateHdr rhdr;
+    memset(&rhdr, 0, sizeof(rhdr));
+    strncpy(rhdr.table_name, table_name, sizeof(rhdr.table_name) - 1);
+    rhdr.offset = offset;
+    rhdr.nrows  = batch ? (uint32_t)batch->nrows : 0;
+    uint32_t id = c->next_req_id++;
+    if (proto_send(c->fd, MSG_REPLICATE, id, &rhdr, (uint32_t)sizeof(rhdr)) < 0) {
+        storage_client_disconnect(c); return -1;
+    }
+    ProtoHeader hdr; void *resp = NULL;
+    if (proto_recv(c->fd, &hdr, &resp, NULL) < 0) {
+        storage_client_disconnect(c); return -1;
+    }
+    proto_free_body(resp);
+    return (hdr.msg_type == (uint8_t)MSG_ACK) ? 0 : -1;
+}
+
+int storage_client_status(StorageClient *c, ProtoStatusBody *out) {
+    if (!c->connected && storage_client_connect(c) < 0) return -1;
+    uint32_t id = c->next_req_id++;
+    if (proto_send(c->fd, MSG_STATUS_REQ, id, NULL, 0) < 0) {
+        storage_client_disconnect(c); return -1;
+    }
+    ProtoHeader hdr; void *body = NULL; size_t blen = 0;
+    if (proto_recv(c->fd, &hdr, &body, &blen) < 0) {
+        storage_client_disconnect(c); return -1;
+    }
+    if (out && body && blen >= sizeof(*out))
+        memcpy(out, body, sizeof(*out));
+    proto_free_body(body);
+    return (hdr.msg_type == (uint8_t)MSG_STATUS_RESP) ? 0 : -1;
+}
