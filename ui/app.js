@@ -66,7 +66,7 @@ document.querySelectorAll('.nav-item').forEach(a => {
   a.addEventListener('click', e => { e.preventDefault(); switchView(a.dataset.view); });
 });
 
-const VALID_VIEWS = new Set(['query','pipelines','builder','ingest','analytics','metrics','settings']);
+const VALID_VIEWS = new Set(['query','pipelines','builder','ingest','analytics','matviews','security','metrics','settings']);
 
 function switchView(name, { pushState = true } = {}) {
   if (!VALID_VIEWS.has(name)) name = 'ingest';
@@ -85,8 +85,10 @@ function switchView(name, { pushState = true } = {}) {
   if (name === 'query')     { loadQuerySidebar(); }
   if (name === 'pipelines') loadPipelines();
   if (name === 'analytics') loadAnalyticsModule();
+  if (name === 'matviews')  loadMatviews();
+  if (name === 'security')  { loadRbacPolicies(); }
   if (name === 'metrics')   loadMetrics();
-  if (name === 'settings') loadSettings();
+  if (name === 'settings')  loadSettings();
 
   if (pushState && location.hash !== '#' + name)
     history.pushState({ view: name }, '', '#' + name);
@@ -2905,6 +2907,7 @@ async function loadSettings() {
     tbl.innerHTML = `<div class="settings-loading" style="color:var(--red)">${escHtml(String(err))}</div>`;
   }
   loadApiKeys();
+  loadClusterStatus();
 }
 
 async function settingsDropTable(name) {
@@ -3283,6 +3286,251 @@ function setText(id, val) {
 /* legacy compat */
 function splitCSVLine(line) { return splitCSVLineDelim(line, ','); }
 
+
+/* ═══════════════════════════════════════════════════
+   MATERIALIZED VIEWS
+═══════════════════════════════════════════════════ */
+const MV_REFRESH = ['Вручную', 'По расписанию'];
+
+async function loadMatviews() {
+  const el = document.getElementById('matviews-list');
+  try {
+    const list = await apiFetch('/api/matviews');
+    if (!list || !list.length) {
+      el.innerHTML = '<div class="settings-loading">Нет представлений. Создайте первое.</div>';
+      return;
+    }
+    el.innerHTML = list.map(mv => `
+      <div class="settings-row">
+        <div class="settings-row-label">
+          <div class="settings-row-title">${escHtml(mv.name)}
+            ${mv.is_stale ? '<span class="badge badge-warn" style="margin-left:.4rem;font-size:.7rem">устарело</span>' : ''}
+          </div>
+          <div class="settings-row-desc">
+            ${MV_REFRESH[mv.refresh_mode] || 'Вручную'} ·
+            ${fmtNum(mv.row_count || 0)} строк ·
+            ${mv.last_refreshed_at ? 'обновлено ' + new Date(mv.last_refreshed_at * 1000).toLocaleString('ru') : 'ещё не обновлялось'}
+          </div>
+        </div>
+        <div style="display:flex;gap:.4rem">
+          <button class="btn btn-sm" onclick="queryMatview('${escAttr(mv.name)}')">Запрос</button>
+          <button class="btn btn-sm" onclick="refreshMatview('${escAttr(mv.name)}')">↻ Обновить</button>
+          <button class="btn btn-sm btn-danger" onclick="dropMatview('${escAttr(mv.name)}')">Удалить</button>
+        </div>
+      </div>`).join('');
+  } catch (err) {
+    el.innerHTML = `<div class="settings-loading" style="color:var(--red)">${escHtml(String(err))}</div>`;
+  }
+}
+
+function openCreateMatview() {
+  document.getElementById('matview-create-form').style.display = '';
+  document.getElementById('mv-name').focus();
+}
+
+function closeCreateMatview() {
+  document.getElementById('matview-create-form').style.display = 'none';
+  document.getElementById('mv-status').textContent = '';
+}
+
+document.addEventListener('DOMContentLoaded', () => {
+  const sel = document.getElementById('mv-refresh-mode');
+  if (sel) sel.addEventListener('change', () => {
+    document.getElementById('mv-cron-group').style.display = sel.value === '1' ? '' : 'none';
+  });
+});
+
+async function createMatview() {
+  const name = document.getElementById('mv-name').value.trim();
+  const sql  = document.getElementById('mv-sql').value.trim();
+  const status = document.getElementById('mv-status');
+  if (!name || !sql) { status.textContent = 'Укажите название и SQL'; return; }
+  const sources = document.getElementById('mv-sources').value.split(',').map(s => s.trim()).filter(Boolean);
+  const refresh_mode = parseInt(document.getElementById('mv-refresh-mode').value);
+  const refresh_cron = document.getElementById('mv-cron').value.trim();
+  try {
+    await apiPost('/api/matviews', { name, definition_sql: sql, source_tables: sources, refresh_mode, refresh_cron });
+    status.textContent = '';
+    closeCreateMatview();
+    loadMatviews();
+    showToast(`Представление ${name} создано`, 'ok');
+  } catch (err) {
+    status.textContent = String(err);
+  }
+}
+
+async function refreshMatview(name) {
+  try {
+    await apiPost(`/api/matviews/${encodeURIComponent(name)}/refresh`, {});
+    showToast(`${name} обновлено`, 'ok');
+    loadMatviews();
+  } catch (err) {
+    showToast(String(err), 'error');
+  }
+}
+
+async function dropMatview(name) {
+  if (!confirm(`Удалить представление "${name}"?`)) return;
+  try {
+    await apiFetch(`/api/matviews/${encodeURIComponent(name)}`, 'DELETE');
+    showToast(`${name} удалено`, 'ok');
+    loadMatviews();
+  } catch (err) {
+    showToast(String(err), 'error');
+  }
+}
+
+function queryMatview(name) {
+  switchView('query');
+  setTimeout(() => {
+    document.getElementById('sql-input').value = `SELECT * FROM ${name} LIMIT 100`;
+    runQuery();
+  }, 150);
+}
+
+/* ═══════════════════════════════════════════════════
+   SECURITY — RBAC + AUDIT
+═══════════════════════════════════════════════════ */
+const RBAC_ROLES   = ['Admin', 'Analyst', 'Viewer'];
+const RBAC_ACTIONS = ['', 'Чтение', 'Запись', 'Чтение + Запись'];
+const AUDIT_TYPES  = ['', 'QUERY', 'INGEST', 'PIPELINE_RUN', 'AUTH_LOGIN', 'AUTH_FAIL', 'SCHEMA_CHANGE', 'POLICY_CHANGE'];
+
+function switchSecTab(tab) {
+  ['rbac','audit'].forEach(t => {
+    document.getElementById(`sec-tab-${t}`).classList.toggle('active', t === tab);
+    document.getElementById(`sec-pane-${t}`).style.display = t === tab ? '' : 'none';
+  });
+  if (tab === 'audit') loadAuditLog();
+}
+
+/* ── RBAC ── */
+async function loadRbacPolicies() {
+  const el = document.getElementById('rbac-policies-list');
+  try {
+    const list = await apiFetch('/api/rbac/policies');
+    if (!list || !list.length) {
+      el.innerHTML = '<div class="settings-loading">Политик нет. Добавьте первую.</div>';
+      return;
+    }
+    el.innerHTML = `<table class="result-table" style="width:100%">
+      <thead><tr><th>ID</th><th>Роль</th><th>Таблица (шаблон)</th><th>Права</th><th>Фильтр строк</th><th></th></tr></thead>
+      <tbody>${list.map(p => `<tr>
+        <td>${p.id}</td>
+        <td>${RBAC_ROLES[p.role] ?? p.role}</td>
+        <td><code>${escHtml(p.table_pattern)}</code></td>
+        <td>${RBAC_ACTIONS[p.allowed_actions] ?? p.allowed_actions}</td>
+        <td>${p.row_filter ? `<code>${escHtml(p.row_filter)}</code>` : '—'}</td>
+        <td><button class="btn btn-sm btn-danger" onclick="deleteRbacPolicy(${p.id})">Удалить</button></td>
+      </tr>`).join('')}</tbody></table>`;
+  } catch (err) {
+    el.innerHTML = `<div class="settings-loading" style="color:var(--red)">${escHtml(String(err))}</div>`;
+  }
+}
+
+async function addRbacPolicy() {
+  const role    = parseInt(document.getElementById('rbac-new-role').value);
+  const pattern = document.getElementById('rbac-new-pattern').value.trim();
+  const actions = parseInt(document.getElementById('rbac-new-actions').value);
+  const rf      = document.getElementById('rbac-new-rowfilter').value.trim();
+  const status  = document.getElementById('rbac-status');
+  if (!pattern) { status.textContent = 'Укажите шаблон таблицы'; return; }
+  try {
+    await apiPost('/api/rbac/policies', { role, table_pattern: pattern, allowed_actions: actions, row_filter: rf });
+    document.getElementById('rbac-new-pattern').value = '';
+    document.getElementById('rbac-new-rowfilter').value = '';
+    status.textContent = '';
+    loadRbacPolicies();
+    showToast('Политика добавлена', 'ok');
+  } catch (err) {
+    status.textContent = String(err);
+  }
+}
+
+async function deleteRbacPolicy(id) {
+  if (!confirm('Удалить политику?')) return;
+  try {
+    await apiFetch(`/api/rbac/policies/${id}`, 'DELETE');
+    loadRbacPolicies();
+    showToast('Политика удалена', 'ok');
+  } catch (err) {
+    showToast(String(err), 'error');
+  }
+}
+
+/* ── Audit ── */
+async function loadAuditLog() {
+  const el    = document.getElementById('audit-log-list');
+  const user  = document.getElementById('audit-filter-user').value.trim();
+  const limit = document.getElementById('audit-filter-limit').value || 50;
+  const status = document.getElementById('audit-status');
+  el.innerHTML = '<div class="settings-loading">Загрузка…</div>';
+  try {
+    let qs = `limit=${limit}`;
+    if (user) qs += `&user_id=${encodeURIComponent(user)}`;
+    const list = await apiFetch(`/api/audit?${qs}`);
+    status.textContent = `${list.length} записей`;
+    if (!list.length) {
+      el.innerHTML = '<div class="settings-loading">Событий нет</div>';
+      return;
+    }
+    el.innerHTML = `<table class="result-table" style="width:100%;font-size:.8rem">
+      <thead><tr><th>Время</th><th>Тип</th><th>Пользователь</th><th>IP</th><th>Ресурс</th><th>Код</th><th>Детали</th></tr></thead>
+      <tbody>${list.map(e => `<tr>
+        <td style="white-space:nowrap">${new Date(e.ts * 1000).toLocaleString('ru')}</td>
+        <td><span class="badge ${e.event_type === 5 ? 'badge-danger' : 'badge-ok'}">${AUDIT_TYPES[e.event_type] ?? e.event_type}</span></td>
+        <td>${escHtml(e.user_id || '—')}</td>
+        <td>${escHtml(e.client_ip || '—')}</td>
+        <td>${escHtml(e.resource || '—')}</td>
+        <td>${e.result_code === 0 ? '✓' : '<span style="color:var(--red)">✗ ' + e.result_code + '</span>'}</td>
+        <td style="max-width:280px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${escAttr(e.action_detail||'')}">${escHtml(e.action_detail || '—')}</td>
+      </tr>`).join('')}</tbody></table>`;
+  } catch (err) {
+    el.innerHTML = `<div class="settings-loading" style="color:var(--red)">${escHtml(String(err))}</div>`;
+    status.textContent = '';
+  }
+}
+
+/* ═══════════════════════════════════════════════════
+   CLUSTER STATUS
+═══════════════════════════════════════════════════ */
+async function loadClusterStatus() {
+  const el = document.getElementById('settings-cluster-status');
+  if (!el) return;
+  try {
+    const s = await apiFetch('/api/cluster/status');
+    if (!s.cluster_mode && !s.is_leader && !s.replica_count) {
+      el.innerHTML = '<div class="settings-loading">Кластерный режим отключён</div>';
+      return;
+    }
+    const replicaRows = (s.replicas || []).map(r =>
+      `<div class="settings-row" style="padding:.3rem 0">
+        <div class="settings-row-label">
+          <div class="settings-row-title">${escHtml(r.host)}:${r.port}</div>
+        </div>
+        <span class="badge ${r.connected ? 'badge-ok' : 'badge-danger'}">${r.connected ? 'подключён' : 'недоступен'}</span>
+      </div>`).join('');
+    el.innerHTML = `
+      <div class="settings-row">
+        <div class="settings-row-label"><div class="settings-row-title">Роль</div></div>
+        <span class="badge ${s.is_leader ? 'badge-ok' : 'badge-warn'}">${s.is_leader ? 'Лидер' : 'Реплика'}</span>
+      </div>
+      <div class="settings-row">
+        <div class="settings-row-label"><div class="settings-row-title">Node ID</div></div>
+        <code>${escHtml(s.node_id || '—')}</code>
+      </div>
+      <div class="settings-row">
+        <div class="settings-row-label"><div class="settings-row-title">Последний LSN</div></div>
+        <span>${fmtNum(s.last_acked_lsn || 0)}</span>
+      </div>
+      <div class="settings-row">
+        <div class="settings-row-label"><div class="settings-row-title">Отставание (записей)</div></div>
+        <span>${fmtNum(s.lag_count || 0)}</span>
+      </div>
+      ${replicaRows || '<div class="settings-loading">Реплик нет</div>'}`;
+  } catch (err) {
+    el.innerHTML = `<div class="settings-loading" style="color:var(--red)">${escHtml(String(err))}</div>`;
+  }
+}
 
 /* ═══════════════════════════════════════════════════
    BOOT

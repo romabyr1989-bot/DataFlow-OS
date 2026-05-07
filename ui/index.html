@@ -42,6 +42,8 @@
       <a class="nav-item"        data-view="pipelines" href="#pipelines">Конвейеры</a>
       <a class="nav-item nav-builder" data-view="builder" href="#builder" id="nav-builder">Конструктор</a>
       <a class="nav-item"        data-view="analytics" href="#analytics">Аналитика</a>
+      <a class="nav-item"        data-view="matviews"  href="#matviews">Представления</a>
+      <a class="nav-item"        data-view="security"  href="#security">Безопасность</a>
       <a class="nav-item"        data-view="metrics"   href="#metrics">Метрики</a>
       <a class="nav-item"        data-view="settings"  href="#settings">Настройки</a>
     </nav>
@@ -477,6 +479,114 @@
       </div><!-- #an-editor-screen -->
     </section>
 
+    <!-- ═══ Materialized Views ═══ -->
+    <section id="view-matviews" class="view">
+      <h1>Материализованные представления
+        <button class="btn btn-sm" onclick="loadMatviews()">↻ Обновить</button>
+        <button class="btn btn-primary btn-sm" onclick="openCreateMatview()">+ Создать</button>
+      </h1>
+
+      <div id="matviews-list" class="settings-card"><div class="settings-loading">Загрузка…</div></div>
+
+      <!-- Create form (hidden by default) -->
+      <div id="matview-create-form" class="card" style="display:none;margin-top:1rem">
+        <h2 style="margin:0 0 1rem">Новое представление</h2>
+        <div class="form-group">
+          <label>Название <span class="required">*</span></label>
+          <input id="mv-name" type="text" placeholder="mv_sales_by_region">
+        </div>
+        <div class="form-group">
+          <label>SQL-запрос <span class="required">*</span></label>
+          <textarea id="mv-sql" rows="4" placeholder="SELECT region, SUM(amount) AS total FROM sales GROUP BY region"></textarea>
+        </div>
+        <div class="form-group">
+          <label>Исходные таблицы <span class="label-hint">(через запятую)</span></label>
+          <input id="mv-sources" type="text" placeholder="sales, regions">
+        </div>
+        <div class="form-group">
+          <label>Режим обновления</label>
+          <select id="mv-refresh-mode">
+            <option value="0">Вручную</option>
+            <option value="1">По расписанию</option>
+          </select>
+        </div>
+        <div class="form-group" id="mv-cron-group" style="display:none">
+          <label>Cron расписание</label>
+          <input id="mv-cron" type="text" placeholder="*/30 * * * *">
+        </div>
+        <div style="display:flex;gap:.5rem;margin-top:1rem">
+          <button class="btn btn-primary" onclick="createMatview()">Создать</button>
+          <button class="btn" onclick="closeCreateMatview()">Отмена</button>
+          <span id="mv-status" class="query-stat" style="margin-left:.5rem"></span>
+        </div>
+      </div>
+    </section>
+
+    <!-- ═══ Security (RBAC + Audit) ═══ -->
+    <section id="view-security" class="view">
+      <h1>Безопасность</h1>
+
+      <div class="ingest-tabs" id="security-tabs" style="margin-bottom:1rem">
+        <button class="ingest-tab active" id="sec-tab-rbac"  onclick="switchSecTab('rbac')">Политики RBAC</button>
+        <button class="ingest-tab"        id="sec-tab-audit" onclick="switchSecTab('audit')">Журнал аудита</button>
+      </div>
+
+      <!-- RBAC pane -->
+      <div id="sec-pane-rbac">
+        <div class="card" style="margin-bottom:1rem">
+          <h2 style="margin:0 0 1rem">Добавить политику</h2>
+          <div style="display:flex;gap:.75rem;flex-wrap:wrap;align-items:flex-end">
+            <div class="form-group" style="flex:1;min-width:120px">
+              <label>Роль</label>
+              <select id="rbac-new-role">
+                <option value="2">Viewer</option>
+                <option value="1">Analyst</option>
+                <option value="0">Admin</option>
+              </select>
+            </div>
+            <div class="form-group" style="flex:2;min-width:150px">
+              <label>Шаблон таблицы</label>
+              <input id="rbac-new-pattern" type="text" placeholder="sales* или *">
+            </div>
+            <div class="form-group" style="flex:1;min-width:120px">
+              <label>Права</label>
+              <select id="rbac-new-actions">
+                <option value="1">Чтение (SELECT)</option>
+                <option value="2">Запись (INSERT/UPDATE/DELETE)</option>
+                <option value="3">Чтение + Запись</option>
+              </select>
+            </div>
+            <div class="form-group" style="flex:2;min-width:150px">
+              <label>Фильтр строк <span class="label-hint">(glob, необязательно)</span></label>
+              <input id="rbac-new-rowfilter" type="text" placeholder="region_west*">
+            </div>
+            <button class="btn btn-primary" onclick="addRbacPolicy()">+ Добавить</button>
+            <span id="rbac-status" class="query-stat"></span>
+          </div>
+        </div>
+        <div id="rbac-policies-list" class="settings-card"><div class="settings-loading">Загрузка…</div></div>
+      </div>
+
+      <!-- Audit pane -->
+      <div id="sec-pane-audit" style="display:none">
+        <div class="card" style="margin-bottom:1rem">
+          <div style="display:flex;gap:.75rem;flex-wrap:wrap;align-items:flex-end">
+            <div class="form-group" style="flex:1;min-width:140px">
+              <label>Пользователь</label>
+              <input id="audit-filter-user" type="text" placeholder="admin">
+            </div>
+            <div class="form-group" style="flex:0.7;min-width:90px">
+              <label>Лимит</label>
+              <input id="audit-filter-limit" type="number" value="50" min="1" max="500">
+            </div>
+            <button class="btn btn-primary" onclick="loadAuditLog()">Поиск</button>
+            <span id="audit-status" class="query-stat"></span>
+          </div>
+        </div>
+        <div id="audit-log-list" class="settings-card"><div class="settings-loading">Загрузка…</div></div>
+      </div>
+    </section>
+
     <!-- ═══ Settings ═══ -->
     <section id="view-settings" class="view">
       <h1>Настройки</h1>
@@ -556,6 +666,13 @@
           <option value="admin">admin</option>
         </select>
         <button class="btn btn-primary btn-sm" onclick="createApiKey()">+ Создать ключ</button>
+      </div>
+
+      <h2 style="margin-top:1.75rem">Кластер
+        <button class="btn btn-sm" style="margin-left:.75rem" onclick="loadClusterStatus()">↻</button>
+      </h2>
+      <div class="settings-card" id="settings-cluster-status">
+        <div class="settings-loading">Загрузка…</div>
       </div>
     </section>
 
