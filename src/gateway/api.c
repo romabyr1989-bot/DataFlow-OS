@@ -955,26 +955,89 @@ static int load_tbl(Arena *a, const char *tname, const char *alias,
         }
     }
 
-    /* ── Full scan (fallback) ── */
+    /* ── Full scan with tombstone support ── */
     FILE *wf = fopen(wal_path, "rb");
     if (!wf) { out->nrows=0; return 0; }
 
+    /* Pass 1: collect tombstones */
+    typedef struct { int64_t orig_off; uint8_t op; char *new_csv; size_t new_len; } Tombstone;
+    int tb_cap=16, ntb=0;
+    Tombstone *tbs = arena_alloc(a, (size_t)tb_cap * sizeof(Tombstone));
+    {
+        int64_t file_off=0;
+        char tbuf[262144];
+        while (1) {
+            uint32_t l=0;
+            if (fread(&l,1,4,wf)!=4) break;
+            if (l==0||l>sizeof(tbuf)-1) { fseek(wf,(long)l,SEEK_CUR); file_off+=4+(int64_t)l; continue; }
+            if (fread(tbuf,1,l,wf)!=l) break;
+            file_off += 4+(int64_t)l;
+            uint8_t op=(uint8_t)tbuf[0];
+            if ((op==WAL_OP_DELETE||op==WAL_OP_UPDATE) && l>=9) {
+                int64_t orig=0;
+                for(int b=0;b<8;b++) orig=(orig<<8)|((uint8_t)tbuf[1+b]);
+                if(ntb==tb_cap){tb_cap*=2;Tombstone*nb=arena_alloc(a,(size_t)tb_cap*sizeof(Tombstone));memcpy(nb,tbs,(size_t)ntb*sizeof(Tombstone));tbs=nb;}
+                tbs[ntb].orig_off=orig; tbs[ntb].op=op;
+                tbs[ntb].new_csv=NULL; tbs[ntb].new_len=0;
+                if (op==WAL_OP_UPDATE && l>9) {
+                    size_t csv_len=l-9;
+                    char *nc=arena_alloc(a,csv_len+1);
+                    memcpy(nc,tbuf+9,csv_len); nc[csv_len]='\0';
+                    tbs[ntb].new_csv=nc; tbs[ntb].new_len=csv_len;
+                }
+                ntb++;
+            }
+        }
+        rewind(wf);
+    }
+
+    /* Pass 2: yield rows with tombstones applied */
     int cap=128, n=0;
     char ***rows = arena_alloc(a, (size_t)cap * sizeof(char**));
-
+    int64_t file_off=0;
     while (1) {
         uint32_t l=0;
         if (fread(&l,1,4,wf)!=4) break;
+        int64_t rec_off=file_off; file_off+=4+(int64_t)l;
         if (l==0||l>262144) { fseek(wf,(long)l,SEEK_CUR); continue; }
         char *line = arena_alloc(a,(size_t)l+1);
         if (fread(line,1,l,wf)!=l) break;
         line[l]='\0';
+
+        uint8_t op=(uint8_t)(unsigned char)line[0];
+        if (op==WAL_OP_DELETE||op==WAL_OP_UPDATE) continue; /* skip tombstone records */
+
         size_t rl=strlen(line);
         while(rl>0&&(line[rl-1]=='\n'||line[rl-1]=='\r')) line[--rl]='\0';
 
         int printable=0;
         for (size_t ci=0;ci<rl;ci++) if ((unsigned char)line[ci]>=0x20) printable++;
         if (printable < 2) continue;
+
+        /* Check tombstones */
+        bool dead=false; char *upd_csv=NULL; size_t upd_len=0;
+        for(int ti=0;ti<ntb;ti++) {
+            if(tbs[ti].orig_off==rec_off) {
+                dead=true;
+                if(tbs[ti].op==WAL_OP_UPDATE) { upd_csv=tbs[ti].new_csv; upd_len=tbs[ti].new_len; }
+                break;
+            }
+        }
+        if(dead && !upd_csv) continue; /* deleted */
+        if(upd_csv) {
+            /* apply update: parse new CSV */
+            char *uline=arena_alloc(a,upd_len+1);
+            memcpy(uline,upd_csv,upd_len); uline[upd_len]='\0';
+            size_t ul=strlen(uline);
+            while(ul>0&&(uline[ul-1]=='\n'||uline[ul-1]=='\r')) uline[--ul]='\0';
+            char *vals[MAX_COLS]={0}; int nv=0;
+            split_line_simple(uline,',',vals,MAX_COLS,&nv);
+            char **row=arena_alloc(a,(size_t)ncols*sizeof(char*));
+            for(int i=0;i<ncols;i++) row[i]=(i<nv&&vals[i])?vals[i]:"";
+            if(n==cap){cap*=2;char***nb=arena_alloc(a,(size_t)cap*sizeof(char**));memcpy(nb,rows,(size_t)n*sizeof(char**));rows=nb;}
+            rows[n++]=row;
+            continue;
+        }
 
         char *vals[MAX_COLS]={0}; int nv=0;
         split_line_simple(line,',',vals,MAX_COLS,&nv);
@@ -1919,6 +1982,122 @@ static RS *exec_stmt(Arena *a, const Stmt *s, VTReg *vt) {
         }
         return out;
     }
+
+    /* ── DML: DELETE / UPDATE ── */
+    if (s->type == STMT_DELETE || s->type == STMT_UPDATE) {
+        const char *tname = s->dml.table;
+        if (!tname || !*tname) return NULL;
+
+        Schema *sc = NULL;
+        if (catalog_get_schema(g_app.catalog, tname, &sc, a) != 0 || !sc) return NULL;
+        int ncols = sc->ncols;
+
+        char wal_path[1024], dir_path[1024];
+        snprintf(dir_path, sizeof(dir_path), "%s/%s", g_app.data_dir, tname);
+        snprintf(wal_path, sizeof(wal_path), "%s/wal.bin", dir_path);
+
+        /* Get the open Table handle for writing tombstones */
+        pthread_mutex_lock(&g_app.tables_mu);
+        Table *tbl = hm_get(&g_app.tables, tname);
+        pthread_mutex_unlock(&g_app.tables_mu);
+        if (!tbl) return NULL;
+
+        /* Scan WAL for matching rows */
+        FILE *rf = fopen(wal_path, "rb");
+        if (!rf) return NULL;
+
+        int affected = 0;
+        int64_t file_off = 0;
+        char line[262144];
+
+        while (1) {
+            uint32_t l = 0;
+            if (fread(&l, 1, 4, rf) != 4) break;
+            int64_t rec_off = file_off;
+            file_off += 4 + (int64_t)l;
+            if (l == 0 || l >= sizeof(line)) { fseek(rf, (long)l, SEEK_CUR); continue; }
+            if (fread(line, 1, l, rf) != l) break;
+            line[l] = '\0';
+
+            /* Skip tombstone records */
+            uint8_t op = (uint8_t)(unsigned char)line[0];
+            if (op == WAL_OP_DELETE || op == WAL_OP_UPDATE) continue;
+
+            /* Strip trailing newline */
+            size_t rl = strlen(line);
+            while (rl > 0 && (line[rl-1]=='\n'||line[rl-1]=='\r')) line[--rl] = '\0';
+            int printable = 0;
+            for (size_t ci = 0; ci < rl; ci++) if ((unsigned char)line[ci] >= 0x20) printable++;
+            if (printable < 2) continue;
+
+            /* Parse CSV row */
+            char *vals[MAX_COLS] = {0}; int nv = 0;
+            char row_copy[262144];
+            strncpy(row_copy, line, sizeof(row_copy)-1);
+            row_copy[sizeof(row_copy)-1] = '\0';
+            split_line_simple(row_copy, ',', vals, MAX_COLS, &nv);
+            char **cells = arena_alloc(a, (size_t)ncols * sizeof(char*));
+            for (int i = 0; i < ncols; i++) cells[i] = (i < nv && vals[i]) ? vals[i] : "";
+
+            /* Evaluate WHERE */
+            if (s->dml.where) {
+                JoinCtx ctx = {0};
+                ctx.n = 1;
+                ctx.schemas[0] = sc;
+                ctx.rows[0] = cells;
+                ctx.tnames[0] = tname;
+                ctx.aliases[0] = tname;
+                Val cond = eval_val(s->dml.where, &ctx, a);
+                bool pass = cond.is_null ? false : cond.is_bool ? cond.b : cond.is_num ? (cond.num != 0.0) : (cond.str && *cond.str);
+                if (!pass) continue;
+            }
+
+            /* Row matches */
+            if (s->type == STMT_DELETE) {
+                pthread_mutex_lock(&g_app.tables_mu);
+                table_delete(tbl, rec_off);
+                pthread_mutex_unlock(&g_app.tables_mu);
+                affected++;
+            } else {
+                /* UPDATE: apply SET assignments to build new CSV row */
+                char **new_cells = arena_alloc(a, (size_t)ncols * sizeof(char*));
+                for (int i = 0; i < ncols; i++) new_cells[i] = cells[i];
+                for (int si = 0; si < s->dml.nset; si++) {
+                    for (int ci = 0; ci < ncols; ci++) {
+                        if (strcasecmp(sc->cols[ci].name, s->dml.set_cols[si]) == 0) {
+                            new_cells[ci] = s->dml.set_vals[si];
+                            break;
+                        }
+                    }
+                }
+                /* Serialize new row to CSV */
+                char new_csv[262144]; int off = 0;
+                for (int ci = 0; ci < ncols; ci++) {
+                    if (ci) new_csv[off++] = ',';
+                    const char *v = new_cells[ci] ? new_cells[ci] : "";
+                    int n = snprintf(new_csv+off, sizeof(new_csv)-off-2, "%s", v);
+                    if (n > 0) off += n;
+                }
+                new_csv[off++] = '\n';
+                pthread_mutex_lock(&g_app.tables_mu);
+                table_update(tbl, rec_off, new_csv, (size_t)off);
+                pthread_mutex_unlock(&g_app.tables_mu);
+                affected++;
+            }
+        }
+        fclose(rf);
+
+        /* Return result */
+        const char *col_key = (s->type == STMT_DELETE) ? "deleted" : "updated";
+        char **names = arena_alloc(a, sizeof(char*));
+        names[0] = arena_strdup(a, col_key);
+        RS *rs = rs_new(a, 1, names, 0);
+        char **cells = arena_alloc(a, sizeof(char*));
+        cells[0] = arena_sprintf(a, "%d", affected);
+        rs_add(rs, a, cells, NULL);
+        return rs;
+    }
+
     return NULL;
 }
 
@@ -1961,6 +2140,14 @@ static void h_query(HttpReq *req, HttpResp *resp) {
     int64_t t0 = (int64_t)clock();
     Stmt *stmt = sql_parse(a, sql, strlen(sql));
     if (stmt->error) { http_resp_error(resp,400,stmt->error); arena_destroy(a); return; }
+
+    /* DML requires at least ROLE_ANALYST */
+    if (stmt->type == STMT_DELETE || stmt->type == STMT_UPDATE) {
+        if (g_app.auth_enabled && req->auth.role == ROLE_VIEWER) {
+            http_resp_error(resp, 403, "forbidden: DML requires analyst or admin role");
+            arena_destroy(a); return;
+        }
+    }
 
     /* Apply request-level limit cap */
     if (stmt->type == STMT_SELECT) {

@@ -25,7 +25,8 @@ typedef enum {
     TK_NULLS, TK_FIRST, TK_LAST,
     TK_EXISTS, TK_CAST,
     TK_OVER, TK_PARTITION, TK_ROWS, TK_RANGE, TK_UNBOUNDED,
-    TK_PRECEDING, TK_FOLLOWING, TK_CURRENT, TK_ROW
+    TK_PRECEDING, TK_FOLLOWING, TK_CURRENT, TK_ROW,
+    TK_UPDATE, TK_SET, TK_DELETE
 } TkType;
 
 typedef struct { TkType type; const char *start; size_t len; int64_t ival; double fval; } Token;
@@ -55,6 +56,7 @@ static struct { const char *kw; TkType tk; } KEYWORDS[] = {
     {"OVER",TK_OVER},{"PARTITION",TK_PARTITION},{"ROWS",TK_ROWS},{"RANGE",TK_RANGE},
     {"UNBOUNDED",TK_UNBOUNDED},{"PRECEDING",TK_PRECEDING},{"FOLLOWING",TK_FOLLOWING},
     {"CURRENT",TK_CURRENT},{"ROW",TK_ROW},
+    {"UPDATE",TK_UPDATE},{"SET",TK_SET},{"DELETE",TK_DELETE},
     {NULL,TK_EOF}
 };
 
@@ -799,6 +801,66 @@ static Stmt *parse_with(Lexer *l) {
     return s;
 }
 
+static void parse_update(Lexer *l, Stmt *s) {
+    s->type = STMT_UPDATE;
+    Token tbl = lex_consume(l);
+    if (tbl.type != TK_IDENT) { s->type=STMT_UNKNOWN; s->error="UPDATE: expected table name"; return; }
+    size_t tl = tbl.len < 127 ? tbl.len : 127;
+    memcpy(s->dml.table, tbl.start, tl); s->dml.table[tl] = '\0';
+
+    if (!lex_eat(l, TK_SET)) { s->type=STMT_UNKNOWN; s->error="UPDATE: expected SET"; return; }
+
+    s->dml.nset = 0;
+    while (s->dml.nset < 64) {
+        Token col = lex_consume(l);
+        if (col.type != TK_IDENT) { s->type=STMT_UNKNOWN; s->error="UPDATE SET: expected column"; return; }
+        if (!lex_eat(l, TK_EQ)) { s->type=STMT_UNKNOWN; s->error="UPDATE SET: expected ="; return; }
+
+        int neg = 0;
+        if (lex_peek_is(l, TK_MINUS)) { lex_consume(l); neg = 1; }
+        Token val = lex_consume(l);
+
+        int i = s->dml.nset;
+        size_t cl = col.len < 63 ? col.len : 63;
+        memcpy(s->dml.set_cols[i], col.start, cl); s->dml.set_cols[i][cl] = '\0';
+
+        if (val.type == TK_STRING) {
+            size_t vl = val.len < 255 ? val.len : 255;
+            memcpy(s->dml.set_vals[i], val.start, vl); s->dml.set_vals[i][vl] = '\0';
+        } else if (val.type == TK_NUM_INT) {
+            snprintf(s->dml.set_vals[i], 256, "%s%lld", neg?"-":"", (long long)val.ival);
+        } else if (val.type == TK_NUM_FLOAT) {
+            snprintf(s->dml.set_vals[i], 256, "%s%.10g", neg?"-":"", val.fval);
+        } else if (val.type == TK_NULL) {
+            snprintf(s->dml.set_vals[i], 256, "NULL");
+        } else if (val.type == TK_TRUE) {
+            snprintf(s->dml.set_vals[i], 256, "true");
+        } else if (val.type == TK_FALSE) {
+            snprintf(s->dml.set_vals[i], 256, "false");
+        } else {
+            size_t vl = val.len < 255 ? val.len : 255;
+            memcpy(s->dml.set_vals[i], val.start, vl); s->dml.set_vals[i][vl] = '\0';
+        }
+        s->dml.nset++;
+        if (!lex_peek_is(l, TK_COMMA)) break;
+        lex_consume(l);
+    }
+
+    s->dml.where = NULL;
+    if (lex_eat(l, TK_WHERE)) s->dml.where = parse_expr(l, 0);
+}
+
+static void parse_delete(Lexer *l, Stmt *s) {
+    s->type = STMT_DELETE;
+    lex_eat(l, TK_FROM);
+    Token tbl = lex_consume(l);
+    if (tbl.type != TK_IDENT) { s->type=STMT_UNKNOWN; s->error="DELETE: expected table name"; return; }
+    size_t tl = tbl.len < 127 ? tbl.len : 127;
+    memcpy(s->dml.table, tbl.start, tl); s->dml.table[tl] = '\0';
+    s->dml.where = NULL;
+    if (lex_eat(l, TK_WHERE)) s->dml.where = parse_expr(l, 0);
+}
+
 static Stmt *parse_stmt(Lexer *l) {
     Stmt *s = arena_calloc(l->a, sizeof(Stmt));
     lex_eat(l, TK_SEMICOLON);
@@ -813,6 +875,14 @@ static Stmt *parse_stmt(Lexer *l) {
         lex_consume(l);
         s->type = STMT_SELECT;
         s->select = parse_select(l);
+    } else if (first.type == TK_UPDATE) {
+        lex_consume(l);
+        parse_update(l, s);
+        return s;
+    } else if (first.type == TK_DELETE) {
+        lex_consume(l);
+        parse_delete(l, s);
+        return s;
     } else {
         s->type = STMT_UNKNOWN;
         s->error = "unsupported statement";

@@ -41,6 +41,25 @@ int64_t wal_tell(WAL *w) { return w ? w->write_pos : 0; }
 int     wal_sync(WAL *w) { return fdatasync(w->fd); }
 void    wal_close(WAL *w){ close(w->fd); free(w); }
 
+int wal_append_delete(WAL *w, int64_t orig_offset) {
+    uint8_t buf[9];
+    buf[0] = WAL_OP_DELETE;
+    for (int i = 0; i < 8; i++) buf[1+i] = (uint8_t)((uint64_t)orig_offset >> (56 - i*8));
+    return wal_append(w, buf, 9);
+}
+
+int wal_append_update(WAL *w, int64_t orig_offset, const char *new_csv, size_t csv_len) {
+    size_t total = 9 + csv_len;
+    uint8_t *buf = malloc(total);
+    if (!buf) return -1;
+    buf[0] = WAL_OP_UPDATE;
+    for (int i = 0; i < 8; i++) buf[1+i] = (uint8_t)((uint64_t)orig_offset >> (56 - i*8));
+    memcpy(buf + 9, new_csv, csv_len);
+    int r = wal_append(w, buf, total);
+    free(buf);
+    return r;
+}
+
 /* ── ColBatch helpers ── */
 static bool bit_get(const uint8_t *bm, int i) {
     return !!(bm[i/8] & (1u << (i%8)));
@@ -171,6 +190,119 @@ Schema *table_schema(Table *t)    { return t->schema; }
 int table_scan(Table *t, ColBatch **out, Arena *a) {
     (void)t; (void)out; (void)a;
     return (int)t->row_count;
+}
+
+int table_delete(Table *t, int64_t orig_offset) {
+    if (!t || !t->wal) return -1;
+    return wal_append_delete(t->wal, orig_offset);
+}
+
+int table_update(Table *t, int64_t orig_offset, const char *new_csv, size_t csv_len) {
+    if (!t || !t->wal) return -1;
+    return wal_append_update(t->wal, orig_offset, new_csv, csv_len);
+}
+
+int table_compact(Table *t, Arena *a) {
+    if (!t) return -1;
+    (void)a;
+    char tmp_path[600];
+    snprintf(tmp_path, sizeof(tmp_path), "%s/wal_compact.bin", t->dir);
+
+    char wal_path[600];
+    snprintf(wal_path, sizeof(wal_path), "%s/wal.bin", t->dir);
+
+    /* Pass 1: collect tombstones */
+    FILE *rf = fopen(wal_path, "rb");
+    if (!rf) return -1;
+
+    /* Use a simple sorted array of deleted/updated offsets */
+    int64_t *dead = NULL;
+    int ndead = 0, dead_cap = 0;
+    /* Map from orig_offset → new_csv for UPDATEs (store as linked list nodes) */
+    struct UpdNode { int64_t off; char *csv; size_t csv_len; struct UpdNode *next; } *upd_list = NULL;
+
+    int64_t file_off = 0;
+    char row_buf[262144];
+    while (1) {
+        uint32_t l = 0;
+        if (fread(&l, 4, 1, rf) != 1) break;
+        if (l == 0 || l > sizeof(row_buf)-1) { fseek(rf, (long)l, SEEK_CUR); file_off += 4+(int64_t)l; continue; }
+        if (fread(row_buf, 1, l, rf) != l) break;
+        row_buf[l] = '\0';
+        file_off += 4 + (int64_t)l;
+
+        uint8_t op = (uint8_t)row_buf[0];
+        if (op == WAL_OP_DELETE && l == 9) {
+            int64_t orig = 0;
+            for (int b=0;b<8;b++) orig = (orig<<8)|((uint8_t)row_buf[1+b]);
+            if (ndead == dead_cap) {
+                dead_cap = dead_cap ? dead_cap*2 : 64;
+                dead = realloc(dead, (size_t)dead_cap * sizeof(int64_t));
+            }
+            dead[ndead++] = orig;
+        } else if (op == WAL_OP_UPDATE && l >= 9) {
+            int64_t orig = 0;
+            for (int b=0;b<8;b++) orig = (orig<<8)|((uint8_t)row_buf[1+b]);
+            size_t csv_len = l - 9;
+            struct UpdNode *un = malloc(sizeof(*un) + csv_len + 1);
+            un->off = orig; un->csv = (char*)(un+1);
+            memcpy(un->csv, row_buf+9, csv_len); un->csv[csv_len] = '\0';
+            un->csv_len = csv_len; un->next = upd_list; upd_list = un;
+            /* also tombstone the original */
+            if (ndead == dead_cap) { dead_cap = dead_cap ? dead_cap*2 : 64; dead = realloc(dead,(size_t)dead_cap*sizeof(int64_t)); }
+            dead[ndead++] = orig;
+        }
+    }
+    rewind(rf);
+
+    /* Pass 2: write compacted WAL */
+    FILE *wf = fopen(tmp_path, "wb");
+    if (!wf) { fclose(rf); free(dead); return -1; }
+
+    file_off = 0;
+    while (1) {
+        uint32_t l = 0;
+        if (fread(&l, 4, 1, rf) != 1) break;
+        int64_t rec_off = file_off;
+        if (l == 0 || l > sizeof(row_buf)-1) { fseek(rf, (long)l, SEEK_CUR); file_off += 4+(int64_t)l; continue; }
+        if (fread(row_buf, 1, l, rf) != l) break;
+        row_buf[l] = '\0';
+        file_off += 4 + (int64_t)l;
+
+        uint8_t op = (uint8_t)row_buf[0];
+        if (op == WAL_OP_DELETE || op == WAL_OP_UPDATE) continue; /* drop tombstones */
+
+        /* check if this INSERT is tombstoned */
+        bool tombstoned = false;
+        for (int d=0;d<ndead;d++) if (dead[d]==rec_off) { tombstoned=true; break; }
+        if (tombstoned) {
+            /* Check if this is an UPDATE replacement */
+            for (struct UpdNode *un=upd_list; un; un=un->next) {
+                if (un->off == rec_off) {
+                    uint32_t cl = (uint32_t)un->csv_len;
+                    fwrite(&cl, 4, 1, wf);
+                    fwrite(un->csv, 1, un->csv_len, wf);
+                    break;
+                }
+            }
+            continue;
+        }
+        fwrite(&l, 4, 1, wf);
+        fwrite(row_buf, 1, l, wf);
+    }
+    fclose(rf); fclose(wf);
+
+    /* Replace WAL */
+    rename(tmp_path, wal_path);
+
+    /* Reopen WAL for appending */
+    wal_close(t->wal);
+    t->wal = wal_open(wal_path);
+
+    /* Free update nodes */
+    for (struct UpdNode *un=upd_list; un; ) { struct UpdNode *nx=un->next; free(un); un=nx; }
+    free(dead);
+    return 0;
 }
 
 void table_close(Table *t) {

@@ -33,6 +33,11 @@ typedef struct {
     void       *values[MAX_COLS];      /* int64_t*, double*, char** */
 } ColBatch;
 
+/* ── WAL op types (first byte of record data) ── */
+/* Old INSERT records have no op byte (first byte is printable CSV char >= 0x20). */
+#define WAL_OP_DELETE 0x02   /* [0x02][8-byte BE offset of deleted row] */
+#define WAL_OP_UPDATE 0x03   /* [0x03][8-byte BE offset][new CSV row\n] */
+
 /* ── WAL ── */
 typedef struct WAL WAL;
 WAL     *wal_open  (const char *path);
@@ -40,6 +45,8 @@ int      wal_append(WAL *w, const void *data, size_t len);
 int      wal_sync  (WAL *w);
 int64_t  wal_tell  (WAL *w);  /* current write position (before next append) */
 void     wal_close (WAL *w);
+int      wal_append_delete(WAL *w, int64_t orig_offset);
+int      wal_append_update(WAL *w, int64_t orig_offset, const char *new_csv, size_t csv_len);
 
 /* ── Forward declarations ── */
 typedef struct Catalog Catalog;
@@ -50,6 +57,9 @@ Table  *table_create(const char *name, Schema *schema, const char *dir);
 Table  *table_open  (const char *name, const char *dir);
 int     table_append(Table *t, ColBatch *batch);
 int     table_scan  (Table *t, ColBatch **out, Arena *a);
+int     table_delete(Table *t, int64_t orig_offset);
+int     table_update(Table *t, int64_t orig_offset, const char *new_csv, size_t csv_len);
+int     table_compact(Table *t, Arena *a);
 int64_t table_row_count(Table *t);
 Schema *table_schema   (Table *t);
 void    table_close    (Table *t);
