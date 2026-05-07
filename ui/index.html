@@ -16,11 +16,11 @@
       <form id="login-form">
         <div style="margin-bottom: 1rem;">
           <label for="login-username" style="display: block; margin-bottom: 0.5rem;">Пользователь</label>
-          <input id="login-username" type="text" required style="width: 100%; padding: 0.5rem; border: 1px solid var(--border); border-radius: 4px;">
+          <input id="login-username" type="text" required value="admin" style="width: 100%; padding: 0.5rem; border: 1px solid var(--border); border-radius: 4px;">
         </div>
         <div style="margin-bottom: 1rem;">
           <label for="login-password" style="display: block; margin-bottom: 0.5rem;">Пароль</label>
-          <input id="login-password" type="password" required style="width: 100%; padding: 0.5rem; border: 1px solid var(--border); border-radius: 4px;">
+          <input id="login-password" type="password" required value="admin" style="width: 100%; padding: 0.5rem; border: 1px solid var(--border); border-radius: 4px;">
         </div>
         <button type="submit" class="btn btn-primary" style="width: 100%;">Войти</button>
       </form>
@@ -43,6 +43,7 @@
       <a class="nav-item nav-builder" data-view="builder" href="#builder" id="nav-builder">Конструктор</a>
       <a class="nav-item"        data-view="analytics" href="#analytics">Аналитика</a>
       <a class="nav-item"        data-view="metrics"   href="#metrics">Метрики</a>
+      <a class="nav-item"        data-view="settings"  href="#settings">Настройки</a>
     </nav>
     <div class="sidebar-footer">
       <span id="ws-status" class="badge badge-warn">подключение…</span>
@@ -66,7 +67,7 @@
       <!-- SQL editor -->
       <div class="query-editor-block" id="query-editor-block">
         <div class="query-panel">
-          <textarea id="sql-input" spellcheck="false" placeholder="SELECT * FROM my_table LIMIT 100"></textarea>
+          <textarea id="sql-input" spellcheck="false" placeholder="SELECT * FROM my_table LIMIT 100&#10;-- UPDATE my_table SET col = val WHERE id = 1&#10;-- DELETE FROM my_table WHERE col = val"></textarea>
           <div class="query-toolbar">
             <button class="btn btn-primary" onclick="runQuery()">▶ Выполнить</button>
             <button class="btn" onclick="clearQuery()">Очистить</button>
@@ -537,6 +538,24 @@
       </h2>
       <div class="settings-card" id="settings-tables-list">
         <div class="settings-loading">Загрузка…</div>
+      </div>
+
+      <h2 style="margin-top:1.75rem">API-ключи
+        <button class="btn btn-sm" style="margin-left:.75rem" onclick="loadApiKeys()">↻</button>
+      </h2>
+      <div class="settings-card" id="settings-apikeys-list">
+        <div class="settings-loading">Загрузка…</div>
+      </div>
+      <div style="margin-top:.75rem;display:flex;gap:.5rem;align-items:center;flex-wrap:wrap">
+        <input id="new-apikey-user" type="text" placeholder="user_id (например: svc-bot)"
+               style="flex:1;min-width:140px;padding:.4rem .6rem;background:var(--surface2);border:1px solid var(--border);border-radius:var(--radius);color:var(--text);font-size:.85rem">
+        <select id="new-apikey-role"
+                style="padding:.4rem .6rem;background:var(--surface2);border:1px solid var(--border);border-radius:var(--radius);color:var(--text);font-size:.85rem">
+          <option value="viewer">viewer</option>
+          <option value="analyst" selected>analyst</option>
+          <option value="admin">admin</option>
+        </select>
+        <button class="btn btn-primary btn-sm" onclick="createApiKey()">+ Создать ключ</button>
       </div>
     </section>
 

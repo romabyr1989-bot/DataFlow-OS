@@ -66,7 +66,7 @@ document.querySelectorAll('.nav-item').forEach(a => {
   a.addEventListener('click', e => { e.preventDefault(); switchView(a.dataset.view); });
 });
 
-const VALID_VIEWS = new Set(['query','pipelines','builder','ingest','analytics','metrics']);
+const VALID_VIEWS = new Set(['query','pipelines','builder','ingest','analytics','metrics','settings']);
 
 function switchView(name, { pushState = true } = {}) {
   if (!VALID_VIEWS.has(name)) name = 'ingest';
@@ -86,6 +86,7 @@ function switchView(name, { pushState = true } = {}) {
   if (name === 'pipelines') loadPipelines();
   if (name === 'analytics') loadAnalyticsModule();
   if (name === 'metrics')   loadMetrics();
+  if (name === 'settings') loadSettings();
 
   if (pushState && location.hash !== '#' + name)
     history.pushState({ view: name }, '', '#' + name);
@@ -319,15 +320,34 @@ async function runQuery() {
   try {
     const data = await apiPost('/api/tables/query', { sql });
     const ms   = (performance.now() - t0).toFixed(1);
-    const rows = (data.rows || []).length;
-    status.textContent = `${rows} ${pluralRows(rows)} · ${ms} мс`;
-    result.appendChild(makeResultTable(data));
+    const cols = data.columns || [];
+    const rows = data.rows || [];
+    const dmlKey = cols.length === 1 && rows.length === 1 && (cols[0] === 'deleted' || cols[0] === 'updated') ? cols[0] : null;
+    if (dmlKey) {
+      const n = parseInt(rows[0][0] ?? rows[0][dmlKey] ?? 0, 10);
+      const label = dmlKey === 'deleted' ? 'Удалено' : 'Обновлено';
+      status.textContent = `${label}: ${n} · ${ms} мс`;
+      result.appendChild(makeDmlBanner(dmlKey, n));
+    } else {
+      status.textContent = `${rows.length} ${pluralRows(rows.length)} · ${ms} мс`;
+      result.appendChild(makeResultTable(data));
+    }
   } catch (err) {
     status.textContent = 'Ошибка';
     let msg = String(err);
     try { const j = JSON.parse(msg.replace(/^Error:\s*/,'')); if (j.error) msg = j.error; } catch(_) {}
     result.innerHTML = `<div style="color:var(--red);padding:.5rem;font-family:monospace">${escHtml(msg)}</div>`;
   }
+}
+
+function makeDmlBanner(op, count) {
+  const d = document.createElement('div');
+  d.className = 'dml-banner';
+  const icon = op === 'deleted' ? '🗑' : '✏';
+  const verb = op === 'deleted' ? 'Удалено' : 'Обновлено';
+  const rowWord = count === 1 ? 'строка' : count >= 2 && count <= 4 ? 'строки' : 'строк';
+  d.innerHTML = `<span class="dml-icon">${icon}</span>${verb}: <span class="dml-count">${count}</span>&nbsp;${rowWord}`;
+  return d;
 }
 
 document.addEventListener('DOMContentLoaded', () => {
@@ -2779,6 +2799,64 @@ function rnd(v) {
 }
 
 
+/* ── API Keys ── */
+async function loadApiKeys() {
+  const el = document.getElementById('settings-apikeys-list');
+  if (!el) return;
+  try {
+    const keys = await apiFetch('/api/auth/apikeys');
+    if (!Array.isArray(keys) || !keys.length) {
+      el.innerHTML = '<div class="settings-loading">Ключей нет</div>';
+      return;
+    }
+    const roleLabel = { admin: 'admin', analyst: 'analyst', viewer: 'viewer' };
+    el.innerHTML = keys.map(k => {
+      const keyId = escAttr(k.key || '');
+      const created = k.created_at ? new Date(k.created_at * 1000).toLocaleDateString('ru') : '—';
+      return `
+        <div class="settings-row" id="akrow-${keyId}">
+          <div class="settings-row-label">
+            <div class="settings-row-title" style="font-family:var(--mono);font-size:.85rem">${escHtml(k.key || '—')}</div>
+            <div class="settings-row-desc">
+              user: <b>${escHtml(k.user_id || '—')}</b> · роль: <b>${escHtml(k.role || '—')}</b> · создан: ${escHtml(created)}
+            </div>
+          </div>
+          <button class="btn btn-sm btn-danger" onclick="deleteApiKey('${keyId}')">Удалить</button>
+        </div>`;
+    }).join('');
+  } catch(err) {
+    el.innerHTML = `<div class="settings-loading" style="color:var(--red)">${escHtml(String(err))}</div>`;
+  }
+}
+
+async function createApiKey() {
+  const userEl = document.getElementById('new-apikey-user');
+  const roleEl = document.getElementById('new-apikey-role');
+  const user_id = (userEl?.value || '').trim();
+  const role    = roleEl?.value || 'analyst';
+  if (!user_id) { showToast('Введите user_id', 'warn'); return; }
+  try {
+    const res = await apiPost('/api/auth/apikeys', { user_id, role });
+    showToast(`Ключ создан: ${res.key || '—'}`, 'ok');
+    if (userEl) userEl.value = '';
+    loadApiKeys();
+  } catch(err) {
+    showToast(`Ошибка: ${err}`, 'error');
+  }
+}
+
+async function deleteApiKey(key) {
+  if (!confirm('Удалить API-ключ?')) return;
+  try {
+    await apiDelete(`/api/auth/apikeys/${encodeURIComponent(key)}`);
+    showToast('Ключ удалён', 'ok');
+    const row = document.getElementById(`akrow-${key}`);
+    if (row) row.remove();
+  } catch(err) {
+    showToast(`Ошибка: ${err}`, 'error');
+  }
+}
+
 /* ═══════════════════════════════════════════════════
    SETTINGS
 ═══════════════════════════════════════════════════ */
@@ -2826,6 +2904,7 @@ async function loadSettings() {
   } catch (err) {
     tbl.innerHTML = `<div class="settings-loading" style="color:var(--red)">${escHtml(String(err))}</div>`;
   }
+  loadApiKeys();
 }
 
 async function settingsDropTable(name) {
@@ -3128,7 +3207,7 @@ function showLogin() {
 
 function hideLogin() {
   document.getElementById('login-screen').style.display = 'none';
-  document.getElementById('main-app').style.display = 'block';
+  document.getElementById('main-app').style.display = 'flex';
 }
 
 async function login(username, password) {

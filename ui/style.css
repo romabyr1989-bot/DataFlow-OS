@@ -31,6 +31,7 @@ body {
 
 /* ── Layout ── */
 #app { display: flex; height: 100vh; }
+#main-app { display: flex; flex: 1; overflow: hidden; }
 
 #sidebar {
   width: var(--sidebar);
@@ -235,6 +236,15 @@ kbd { font-size: .65rem; background: rgba(255,255,255,.1); border-radius: 3px; p
 .result-table tr:hover td { background: var(--surface2); }
 .null-val    { color: var(--muted); font-style: italic; }
 .result-empty { padding: 2rem; text-align: center; color: var(--muted); }
+.dml-banner {
+  display: flex; align-items: center; gap: .75rem;
+  background: color-mix(in srgb, var(--green) 12%, var(--surface));
+  border: 1px solid color-mix(in srgb, var(--green) 35%, transparent);
+  border-radius: var(--radius); padding: .9rem 1.25rem;
+  font-size: .92rem; color: var(--text);
+}
+.dml-banner .dml-icon { font-size: 1.3rem; line-height: 1; }
+.dml-banner .dml-count { font-weight: 700; font-size: 1.15rem; color: var(--green); margin-left:.15rem; }
 
 /* ── Pipelines ── */
 .pipeline-item {
