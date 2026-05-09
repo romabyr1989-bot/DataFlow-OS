@@ -72,9 +72,26 @@ check "BEGIN/SET/COMMIT around SELECT works" "echo '$RESP' | grep -q '^7\$'"
 RESP=$(PGPASSWORD=wrong $PSQL "SELECT 1" 2>&1)
 check "bad password rejected (28P01-style err)" "[[ '$RESP' == *password* ]]"
 
-# 8. Unknown SQL → clear error pointing at the JSON API
-RESP=$(PGPASSWORD=admin $PSQL "SELECT * FROM no_such_table" 2>&1)
-check "unknown SQL points at JSON API"     "[[ '$RESP' == *Week\ 1* || '$RESP' == *POST* ]]"
+# 8. Week 2: real SQL via qengine — table operations
+PGPASSWORD=admin curl -sf -X POST "http://localhost:$HTTP_PORT/api/ingest/csv?table=pgw_users" \
+  -H 'Content-Type: text/csv' \
+  -H "Authorization: Bearer $(curl -sf -X POST "http://localhost:$HTTP_PORT/api/auth/token" \
+        -H 'Content-Type: application/json' \
+        -d '{"username":"admin","password":"admin"}' \
+      | python3 -c 'import sys,json;print(json.load(sys.stdin)["token"])')" \
+  --data-binary $'id,name,age\n1,alice,30\n2,bob,25\n3,carol,42\n' > /dev/null
+
+RESP=$(PGPASSWORD=admin $PSQL "SELECT * FROM pgw_users ORDER BY id" 2>&1)
+check "Week 2: SELECT returns 3 rows"      "[[ \$(echo '$RESP' | wc -l) -eq 3 ]]"
+
+RESP=$(PGPASSWORD=admin $PSQL "SELECT name FROM pgw_users WHERE age > 28 ORDER BY name" 2>&1)
+check "Week 2: WHERE filter works"         "[[ '$RESP' == *alice*carol* ]]"
+
+RESP=$(PGPASSWORD=admin $PSQL "SELECT COUNT(*) FROM pgw_users" 2>&1)
+check "Week 2: aggregate COUNT(*)"         "[[ '$RESP' == '3' ]]"
+
+RESP=$(PGPASSWORD=admin $PSQL "SELEKT 1" 2>&1)
+check "Week 2: parser error → ERROR response" "[[ '$RESP' == *ERROR* ]]"
 
 # 9. SSL request handled (psql probes SSL on connect by default — already
 #    exercised above but verify by forcing sslmode=disable still works)

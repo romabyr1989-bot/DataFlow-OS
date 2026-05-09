@@ -224,28 +224,10 @@ static void pg_query_cb(PgConn *conn, const char *sql, void *ud) {
         return;
     }
 
-    /* SELECT <constant int> — covers SELECT 1, SELECT 42, etc.
-     * Strict: no expressions yet; just a leading integer.                    */
-    if (starts_with(norm, "select ")) {
-        const char *rest = norm + 7;
-        char *end = NULL;
-        long long v = strtoll(rest, &end, 10);
-        if (end && end != rest && (*end == '\0' || *end == ' ')) {
-            char buf[32]; snprintf(buf, sizeof(buf), "%lld", v);
-            PgColumn c[] = {{"?column?", PG_OID_INT8, 8}};
-            pgwire_send_row_description(conn, 1, c);
-            const char *row[] = { buf };
-            pgwire_send_data_row(conn, 1, row);
-            pgwire_send_command_complete(conn, "SELECT 1");
-            return;
-        }
-    }
-
-    /* Everything else: clear error pointing at the JSON API for now */
-    pgwire_send_error(conn, "0A000",
-        "Week 1 wire-protocol build: only SELECT 1 / version() / current_database / "
-        "current_user / SET / BEGIN/COMMIT/ROLLBACK are recognized. "
-        "Use POST /api/tables/query for full SQL until Week 2.");
+    /* Everything else — including SELECT 1, SELECT * FROM users, INSERT,
+     * UPDATE, DELETE, GROUP BY, JOINs — goes through the real engine via
+     * api_pg_execute. Result rows are streamed as text-format DataRows. */
+    api_pg_execute(conn, sql);
 }
 
 static void on_pipeline_run(Pipeline *p, void *ud) {

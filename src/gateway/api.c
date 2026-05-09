@@ -3,6 +3,7 @@
 #include "../../lib/core/log.h"
 #include "../../lib/sql_parser/sql.h"
 #include "../../lib/yaml/yaml_loader.h"
+#include "../../lib/pgwire/pgwire.h"
 #include "../../lib/storage/storage.h"
 #include "../../lib/storage/compress.h"
 #include "../../lib/storage/txn.h"
@@ -2385,6 +2386,108 @@ static void h_query(HttpReq *req, HttpResp *resp) {
     const char *body=jb_done(&jb);
     http_resp_json(resp,200,body);
     /* arena 'a' kept alive: body lives in it until response is sent */
+}
+
+/* ── Step 3 Week 2: bridge SQL execution to the PostgreSQL wire-protocol ──
+ *
+ * Reuses sql_parse + exec_stmt — the same path the JSON /api/tables/query
+ * endpoint takes. Differences from h_query:
+ *   • emits results as wire-protocol frames via pgwire helpers (text format)
+ *   • RBAC is currently bypassed for pgwire connections (Week 4 territory);
+ *     authentication is per-connection at startup, so admin / API-key
+ *     bearer effectively gets full access today
+ *   • BEGIN/COMMIT/ROLLBACK accepted as no-ops — real per-connection txn
+ *     state via the txn manager is a future iteration
+ *   • all column types reported as text (OID 25); precise OID mapping is a
+ *     Week 3 polish — most clients (psql, JDBC, psycopg) coerce text into
+ *     the application-side type without complaint                         */
+void api_pg_execute(PgConn *conn, const char *sql) {
+    Arena *a = arena_create(1024 * 1024);
+    Stmt *stmt = sql_parse(a, sql, strlen(sql));
+    if (!stmt) {
+        pgwire_send_error(conn, "42601", "internal: sql_parse returned NULL");
+        arena_destroy(a); return;
+    }
+    if (stmt->error) {
+        pgwire_send_error(conn, "42601", stmt->error);
+        arena_destroy(a); return;
+    }
+
+    /* Transaction control: emit the proper tag, no-op the underlying engine.
+     * Real txn integration over pgwire requires per-connection TxnId state
+     * and is tracked for a future iteration. */
+    if (stmt->type == STMT_BEGIN) {
+        pgwire_send_command_complete(conn, "BEGIN");    arena_destroy(a); return;
+    }
+    if (stmt->type == STMT_COMMIT) {
+        pgwire_send_command_complete(conn, "COMMIT");   arena_destroy(a); return;
+    }
+    if (stmt->type == STMT_ROLLBACK) {
+        pgwire_send_command_complete(conn, "ROLLBACK"); arena_destroy(a); return;
+    }
+
+    /* Apply default LIMIT to keep results bounded — same cap as JSON path */
+    if (stmt->type == STMT_SELECT &&
+        (stmt->select.limit < 0 || stmt->select.limit > 10000)) {
+        stmt->select.limit = 10000;
+    }
+
+    g_txn_current = 0;
+    int64_t t0 = (int64_t)clock();
+    RS *rs = exec_stmt(a, stmt, NULL);
+    g_txn_current = 0;
+    if (!rs) {
+        pgwire_send_error(conn, "XX000", "query execution failed");
+        arena_destroy(a); return;
+    }
+
+    /* RowDescription — at least one column for SELECT; for DML, exec_stmt
+     * returns a 1-col RS containing the affected count. We forward both. */
+    if (rs->ncols > 0) {
+        PgColumn *cols = arena_alloc(a, (size_t)rs->ncols * sizeof(PgColumn));
+        for (int i = 0; i < rs->ncols; i++) {
+            cols[i].name      = rs->col_names[i] ? rs->col_names[i] : "";
+            cols[i].type_oid  = PG_OID_TEXT;     /* Week 2: TEXT for all */
+            cols[i].type_size = -1;
+        }
+        pgwire_send_row_description(conn, rs->ncols, cols);
+    }
+
+    /* DataRows */
+    for (int r = 0; r < rs->nrows; r++) {
+        const char **vals = arena_alloc(a, (size_t)rs->ncols * sizeof(char *));
+        for (int c = 0; c < rs->ncols; c++) {
+            const char *v = rs->rows[r].cells ? rs->rows[r].cells[c] : NULL;
+            vals[c] = v;
+        }
+        pgwire_send_data_row(conn, rs->ncols, vals);
+    }
+
+    /* CommandComplete tag.
+     * exec_stmt returns DML results as a single-row RS where col_names[0] is
+     * "inserted" / "updated" / "deleted" and cells[0][0] is the count. */
+    char tag[64];
+    int affected = rs->nrows;
+    if (rs->ncols == 1 && rs->nrows == 1 && rs->col_names[0] &&
+        rs->rows[0].cells && rs->rows[0].cells[0]) {
+        const char *cn = rs->col_names[0];
+        if (!strcmp(cn, "inserted") || !strcmp(cn, "updated") || !strcmp(cn, "deleted"))
+            affected = atoi(rs->rows[0].cells[0]);
+    }
+    switch (stmt->type) {
+        case STMT_INSERT: snprintf(tag, sizeof(tag), "INSERT 0 %d", affected); break;
+        case STMT_UPDATE: snprintf(tag, sizeof(tag), "UPDATE %d",   affected); break;
+        case STMT_DELETE: snprintf(tag, sizeof(tag), "DELETE %d",   affected); break;
+        default:          snprintf(tag, sizeof(tag), "SELECT %d",   rs->nrows); break;
+    }
+    pgwire_send_command_complete(conn, tag);
+
+    /* Metrics: count this exactly like a JSON query */
+    double ms = (double)((int64_t)clock() - t0) * 1000.0 / CLOCKS_PER_SEC;
+    metrics_push(&g_app.metrics->query_latency_ms, ms);
+    g_app.metrics->total_queries++;
+
+    arena_destroy(a);
 }
 
 /* ── GET /api/tables/:name/schema ── */

@@ -397,9 +397,14 @@ static void *accept_thread_fn(void *arg) {
         c->fd  = cfd;
         c->srv = s;
         pthread_t t;
-        if (pthread_create(&t, NULL, connection_thread, c) != 0) {
-            close(cfd); free(c); continue;
-        }
+        /* macOS pthread default stack is 512 KB — too small for the
+         * recursive-descent SQL parser + qengine. Use 4 MB. */
+        pthread_attr_t attr;
+        pthread_attr_init(&attr);
+        pthread_attr_setstacksize(&attr, 4 * 1024 * 1024);
+        int prc = pthread_create(&t, &attr, connection_thread, c);
+        pthread_attr_destroy(&attr);
+        if (prc != 0) { close(cfd); free(c); continue; }
         pthread_detach(t);
     }
     LOG_INFO("pgwire: accept loop stopped");

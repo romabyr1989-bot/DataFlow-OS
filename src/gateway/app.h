@@ -104,3 +104,10 @@ void api_register_routes(Router *r);
 
 /* pipeline step execution (runs transform_sql → target_table for each step) */
 void pipeline_execute_steps(Pipeline *p, App *app);
+
+/* Step 3 Week 2: bridge a PG-wire query into the SQL engine.
+ * Parses SQL via sql_parse, executes via exec_stmt, walks the RS,
+ * and emits RowDescription / DataRow* / CommandComplete back to the
+ * client via the pgwire helpers. ErrorResponse is sent on parse or
+ * execution failure. Implementation lives in src/gateway/api.c. */
+void api_pg_execute(PgConn *conn, const char *sql);
