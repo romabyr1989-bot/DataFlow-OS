@@ -57,13 +57,23 @@ Cleartext is **fine over loopback / VPN / private networks**. If you're
 exposing the port over the public internet, terminate TLS upstream
 (stunnel / nginx stream) until Week 4 lands native pgwire SSL.
 
-## What works (Week 2 — real qengine integration)
+## What works (Week 2 — real qengine; Week 3 — catalog + types)
 
 After Week 2 the wire-protocol bridge runs SQL through the same `sql_parse`
 + `exec_stmt` path that powers `POST /api/tables/query`. Anything the JSON
 API understands now works over pgwire too — including SELECT with FROM,
 WHERE, ORDER BY, GROUP BY, aggregates, JOINs, subqueries, and window
 functions.
+
+Week 3 adds two things that make BI tools usable:
+
+- **Per-column type inference at result time.** Numeric columns surface
+  as `int8` / `float8`; booleans as `bool`. Falls back to `text` when a
+  column is empty or contains mixed shapes. (`SELECT id FROM users`
+  arrives in psql right-aligned now.)
+- **`pg_catalog` and `information_schema` emulation.** Specific probes
+  return synthesized rows from the live `g_app.tables` map — psql `\dt`
+  works, DBeaver / DataGrip schema browsers populate.
 
 | SQL                              | Behaviour                                        |
 |----------------------------------|--------------------------------------------------|
@@ -89,30 +99,31 @@ functions.
 |-------|----------------------------------------------------------------------|
 | 1 ✓   | TCP listener, startup, cleartext auth, compatibility probes          |
 | 2 ✓   | Real qengine integration via `api_pg_execute` — Simple Query path    |
-| 3     | Extended Query: Parse / Bind / Execute (psycopg parameter binding)   |
-| 3     | `pg_catalog` + `information_schema` emulation → DBeaver shows tables |
-| 3     | Type-OID polish — int8 / float8 / bool / timestamp instead of text   |
-| 4     | SCRAM-SHA-256 auth + TLS termination + dbt / BI tool compat polish   |
+| 3 ✓   | `pg_catalog` + `information_schema` emulation → DBeaver / `\dt` work |
+| 3 ✓   | Type-OID inference — int8 / float8 / bool from cell values           |
+| 4     | SCRAM-SHA-256 auth + TLS termination                                 |
+| 4     | Extended Query: Parse / Bind / Execute (psycopg parameter binding)   |
+| 4     | dbt-postgres / Tableau / Power BI compat polish                      |
 
-## Type mapping (Week 2 — pragmatic: text for everything)
+## Type mapping (Week 3 — per-column inference)
 
-Week 2 sends every column as PostgreSQL `text` (OID 25) in text format
-(format code 0). The internal qengine already serializes cells as
-strings, so emitting them as `text` is a clean pass-through.
+The internal qengine already serializes cells to strings, so wire output
+remains in **text format** (format code 0) — but the OID announced in
+RowDescription is now picked per-column by sniffing the first non-null
+cell:
 
-This works fine for psql, JDBC drivers, and most BI tools — they
-coerce text values into the application-side type on the client. Tools
-that probe metadata to plan operator dispatch (dbt's COALESCE-with-int,
-some Tableau aggregations) may want precise OIDs; those land in Week 3
-together with the `pg_catalog` emulation.
+| Cell shape                                 | Announced OID  |
+|--------------------------------------------|----------------|
+| `true` / `false` (case-insensitive)        | 16 (`bool`)    |
+| `^[+-]?\d+$`                               | 20 (`int8`)    |
+| `^[+-]?\d+\.\d+([eE][+-]?\d+)?$`           | 701 (`float8`) |
+| anything else, or column entirely empty    | 25 (`text`)    |
 
-| DataFlow ColType | Wire OID (Week 2) | Final OID (Week 3+) |
-|------------------|-------------------|----------------------|
-| `COL_INT64`      | 25 (text)         | 20 (int8)            |
-| `COL_DOUBLE`     | 25 (text)         | 701 (float8)         |
-| `COL_TEXT`       | 25 (text)         | 25 (text)            |
-| `COL_BOOL`       | 25 (text)         | 16 (bool)            |
-| timestamp        | 25 (text)         | 1114 (timestamp)     |
+This is heuristic but matches psql's right-alignment expectations and
+satisfies dbt-postgres' "is this column numeric?" planner. A column with
+mixed shapes (e.g. some integers, some words) collapses to text — the
+qengine doesn't yet expose the underlying ColType per result column. A
+follow-up will thread types through RS so we can use the schema directly.
 
 ## Operational notes
 
@@ -140,21 +151,42 @@ variants), every recognized statement, BEGIN/SET/COMMIT no-op flow,
 and gateway log assertions. Skipped automatically if `psql` isn't in
 `PATH`.
 
-## Known limitations (Week 2 — don't file bugs for these)
+## Catalog probes recognized
 
-- **All columns reported as `text`.** Type-OID polish is Week 3.
+Matching is permissive: the SQL is lower-cased and we look for the
+catalog table name as a substring. Filter / projection columns the
+client tacked on are **ignored** — the synthesized row set is what they
+get.
+
+| Probe SQL contains                   | Returned columns                                          |
+|--------------------------------------|-----------------------------------------------------------|
+| `from information_schema.tables`     | table_catalog, table_schema, table_name, table_type        |
+| `from information_schema.columns`    | table_catalog, schema, table_name, column_name, ordinal, data_type, is_nullable |
+| `from pg_catalog.pg_namespace` / `from pg_namespace` | oid, nspname, nspowner                  |
+| `from pg_catalog.pg_class` / `from pg_class`         | oid, relname, relnamespace, relkind     |
+
+The schema is always `public`; the catalog is the database name from the
+client's startup packet.
+
+## Known limitations (Week 3 — don't file bugs for these)
+
 - **No Extended Query protocol** (Parse/Bind/Execute). Parameter binding
   via psycopg's `cur.execute(sql, params)` falls back to in-driver
   string substitution and works for most cases. Server-side prepared
-  statements and statement cache: Week 3.
+  statements: Week 4.
 - **BEGIN/COMMIT/ROLLBACK are no-ops at the engine level.** They emit
   the right protocol tags so psql / DBeaver are happy, but the
   transaction manager is not threaded through. Use the JSON
   `/api/tables/query` endpoint with `txn_id` for real transactions.
-- **No `pg_catalog` / `information_schema` yet.** DBeaver and similar
-  tools showing the left-pane table tree will be empty until Week 3.
+- **Catalog probes ignore filters.** `SELECT * FROM information_schema
+  .tables WHERE table_schema = 'public'` returns the same set as the
+  unfiltered version. Tools that join multiple catalog tables together
+  may need to fall back to plain SQL.
+- **Type inference is heuristic.** A column where every value is
+  numeric-looking gets `int8`/`float8`; a mixed column collapses to
+  `text`. Schema-driven typing requires threading ColType through RS
+  in the engine — follow-up work.
 - **RBAC bypassed for pgwire.** Auth happens once at connect time; per
   query RBAC checks (used by the JSON API) are not yet wired into the
-  pgwire path. Users with API-key passwords get the same access their
-  HTTP token would, scoped at connect.
+  pgwire path.
 - Cancel, NOTIFY/LISTEN, COPY, two-phase commit: not implemented.

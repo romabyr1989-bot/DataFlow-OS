@@ -93,6 +93,27 @@ check "Week 2: aggregate COUNT(*)"         "[[ '$RESP' == '3' ]]"
 RESP=$(PGPASSWORD=admin $PSQL "SELEKT 1" 2>&1)
 check "Week 2: parser error → ERROR response" "[[ '$RESP' == *ERROR* ]]"
 
+# Week 3 — pg_catalog / information_schema emulation
+RESP=$(PGPASSWORD=admin $PSQL "SELECT table_schema, table_name FROM information_schema.tables" 2>&1)
+check "Week 3: information_schema.tables shows pgw_users" "[[ '$RESP' == *pgw_users* ]]"
+check "Week 3: information_schema.tables uses public schema" "[[ '$RESP' == *public* ]]"
+
+RESP=$(PGPASSWORD=admin $PSQL "SELECT column_name, data_type FROM information_schema.columns" 2>&1)
+check "Week 3: information_schema.columns includes 'name'" "[[ '$RESP' == *name* ]]"
+check "Week 3: information_schema.columns includes 'age'"  "[[ '$RESP' == *age* ]]"
+
+RESP=$(PGPASSWORD=admin $PSQL "SELECT * FROM pg_catalog.pg_namespace" 2>&1)
+check "Week 3: pg_namespace exposes 'public'"     "[[ '$RESP' == *public* ]]"
+check "Week 3: pg_namespace exposes 'pg_catalog'" "[[ '$RESP' == *pg_catalog* ]]"
+
+RESP=$(PGPASSWORD=admin $PSQL "SELECT relname FROM pg_class" 2>&1)
+check "Week 3: pg_class lists user tables"        "[[ '$RESP' == *pgw_users* ]]"
+
+# Week 3 — type inference: int column should round-trip cleanly through
+# psql with right-alignment / no quoting (psql aligns numerics right).
+RESP=$(PGPASSWORD=admin $PSQL "SELECT id FROM pgw_users ORDER BY id LIMIT 1" 2>&1)
+check "Week 3: typed int column returns scalar 1" "[[ '$RESP' == '1' ]]"
+
 # 9. SSL request handled (psql probes SSL on connect by default — already
 #    exercised above but verify by forcing sslmode=disable still works)
 RESP=$(PGPASSWORD=admin psql "host=localhost port=$PG_PORT user=admin dbname=dataflow sslmode=disable" -tAc "SELECT 1" 2>&1)

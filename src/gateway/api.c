@@ -2388,20 +2388,178 @@ static void h_query(HttpReq *req, HttpResp *resp) {
     /* arena 'a' kept alive: body lives in it until response is sent */
 }
 
-/* ── Step 3 Week 2: bridge SQL execution to the PostgreSQL wire-protocol ──
+/* ── Step 3 Week 2/3: bridge SQL execution to the PostgreSQL wire-protocol ──
  *
  * Reuses sql_parse + exec_stmt — the same path the JSON /api/tables/query
  * endpoint takes. Differences from h_query:
  *   • emits results as wire-protocol frames via pgwire helpers (text format)
- *   • RBAC is currently bypassed for pgwire connections (Week 4 territory);
- *     authentication is per-connection at startup, so admin / API-key
- *     bearer effectively gets full access today
- *   • BEGIN/COMMIT/ROLLBACK accepted as no-ops — real per-connection txn
+ *   • RBAC is bypassed for pgwire connections — auth happens once at
+ *     connect (Week 4 will tighten this)
+ *   • BEGIN/COMMIT/ROLLBACK accepted as no-ops — per-connection txn
  *     state via the txn manager is a future iteration
- *   • all column types reported as text (OID 25); precise OID mapping is a
- *     Week 3 polish — most clients (psql, JDBC, psycopg) coerce text into
- *     the application-side type without complaint                         */
+ *   • Week 3: column OIDs inferred per-column from the first non-null
+ *     cell; pg_catalog + information_schema probes are intercepted
+ *     before sql_parse so DBeaver / DataGrip / psql can list tables    */
+
+/* Heuristic: peek at the first non-null cell in this column and pick a
+ * Postgres OID matching its lexical form. Defaults to text. */
+static int32_t pg_infer_col_oid(const RS *rs, int col_idx) {
+    if (!rs || col_idx < 0 || col_idx >= rs->ncols) return PG_OID_TEXT;
+    for (int r = 0; r < rs->nrows; r++) {
+        if (!rs->rows[r].cells) continue;
+        const char *s = rs->rows[r].cells[col_idx];
+        if (!s || !s[0]) continue;
+        if (!strcasecmp(s, "true") || !strcasecmp(s, "false")) return PG_OID_BOOL;
+        const char *p = s;
+        if (*p == '-' || *p == '+') p++;
+        bool has_digit = false;
+        while (*p >= '0' && *p <= '9') { p++; has_digit = true; }
+        if (has_digit && *p == '\0') return PG_OID_INT8;
+        if (has_digit && *p == '.') {
+            p++;
+            while (*p >= '0' && *p <= '9') p++;
+            if (*p == 'e' || *p == 'E') {
+                p++; if (*p == '-' || *p == '+') p++;
+                while (*p >= '0' && *p <= '9') p++;
+            }
+            if (*p == '\0') return PG_OID_FLOAT8;
+        }
+        return PG_OID_TEXT;
+    }
+    return PG_OID_TEXT;
+}
+
+/* ── pg_catalog / information_schema emulation ───────────────────────
+ * Many BI tools probe these on connect. We intercept the most common
+ * shapes BEFORE sql_parse and synthesize result sets from g_app.tables.
+ * Returns 1 if handled (response already sent), 0 to fall through to
+ * the real engine. Matching is permissive — we just look for the
+ * catalog table name in a case-folded copy of the SQL.                 */
+
+static void pg_normalize(const char *src, char *out, size_t cap) {
+    while (*src == ' ' || *src == '\t' || *src == '\n') src++;
+    size_t n = 0;
+    while (*src && n + 1 < cap) {
+        char c = *src++;
+        out[n++] = (c >= 'A' && c <= 'Z') ? (char)(c - 'A' + 'a') : c;
+    }
+    out[n] = '\0';
+    while (n > 0 && (out[n-1] == ';' || out[n-1] == ' ' ||
+                     out[n-1] == '\t' || out[n-1] == '\n')) out[--n] = '\0';
+}
+
+static void pg_handle_info_tables(PgConn *conn) {
+    PgColumn cols[] = {
+        {"table_catalog", PG_OID_TEXT, -1},
+        {"table_schema",  PG_OID_TEXT, -1},
+        {"table_name",    PG_OID_TEXT, -1},
+        {"table_type",    PG_OID_TEXT, -1},
+    };
+    pgwire_send_row_description(conn, 4, cols);
+    pthread_mutex_lock(&g_app.tables_mu);
+    int idx = 0; const char *k; void *v; int n = 0;
+    while ((idx = hm_next(&g_app.tables, idx, &k, &v)) >= 0) {
+        const char *vals[4] = { pgwire_database(conn), "public", k, "BASE TABLE" };
+        pgwire_send_data_row(conn, 4, vals);
+        n++;
+    }
+    pthread_mutex_unlock(&g_app.tables_mu);
+    char tag[32]; snprintf(tag, sizeof(tag), "SELECT %d", n);
+    pgwire_send_command_complete(conn, tag);
+}
+
+static void pg_handle_info_columns(PgConn *conn) {
+    PgColumn cols[] = {
+        {"table_catalog",      PG_OID_TEXT, -1},
+        {"table_schema",       PG_OID_TEXT, -1},
+        {"table_name",         PG_OID_TEXT, -1},
+        {"column_name",        PG_OID_TEXT, -1},
+        {"ordinal_position",   PG_OID_INT8,  8},
+        {"data_type",          PG_OID_TEXT, -1},
+        {"is_nullable",        PG_OID_TEXT, -1},
+    };
+    pgwire_send_row_description(conn, 7, cols);
+    pthread_mutex_lock(&g_app.tables_mu);
+    int idx = 0; const char *k; void *v; int n = 0;
+    while ((idx = hm_next(&g_app.tables, idx, &k, &v)) >= 0) {
+        Table *t = (Table *)v;
+        Schema *s = t ? table_schema(t) : NULL;
+        if (!s) continue;
+        for (int c = 0; c < s->ncols; c++) {
+            const char *t_name = "text";
+            switch (s->cols[c].type) {
+                case COL_INT64:  t_name = "bigint";           break;
+                case COL_DOUBLE: t_name = "double precision"; break;
+                case COL_BOOL:   t_name = "boolean";          break;
+                default:         t_name = "text";             break;
+            }
+            char ord[16]; snprintf(ord, sizeof(ord), "%d", c + 1);
+            const char *vals[7] = {
+                pgwire_database(conn), "public", k,
+                s->cols[c].name, ord, t_name,
+                s->cols[c].nullable ? "YES" : "NO",
+            };
+            pgwire_send_data_row(conn, 7, vals);
+            n++;
+        }
+    }
+    pthread_mutex_unlock(&g_app.tables_mu);
+    char tag[32]; snprintf(tag, sizeof(tag), "SELECT %d", n);
+    pgwire_send_command_complete(conn, tag);
+}
+
+static void pg_handle_pg_namespace(PgConn *conn) {
+    PgColumn cols[] = {
+        {"oid",      PG_OID_INT8, 8},
+        {"nspname",  PG_OID_TEXT, -1},
+        {"nspowner", PG_OID_INT8, 8},
+    };
+    pgwire_send_row_description(conn, 3, cols);
+    const char *r1[] = { "11",   "pg_catalog", "10" };
+    const char *r2[] = { "2200", "public",     "10" };
+    pgwire_send_data_row(conn, 3, r1);
+    pgwire_send_data_row(conn, 3, r2);
+    pgwire_send_command_complete(conn, "SELECT 2");
+}
+
+static void pg_handle_pg_class(PgConn *conn) {
+    PgColumn cols[] = {
+        {"oid",          PG_OID_INT8, 8},
+        {"relname",      PG_OID_TEXT, -1},
+        {"relnamespace", PG_OID_INT8, 8},
+        {"relkind",      PG_OID_TEXT, -1},
+    };
+    pgwire_send_row_description(conn, 4, cols);
+    pthread_mutex_lock(&g_app.tables_mu);
+    int idx = 0; const char *k; void *v; int n = 0;
+    int64_t fake_oid = 16384;
+    while ((idx = hm_next(&g_app.tables, idx, &k, &v)) >= 0) {
+        char oid_buf[32]; snprintf(oid_buf, sizeof(oid_buf), "%lld", (long long)fake_oid++);
+        const char *vals[4] = { oid_buf, k, "2200", "r" };
+        pgwire_send_data_row(conn, 4, vals);
+        n++;
+    }
+    pthread_mutex_unlock(&g_app.tables_mu);
+    char tag[32]; snprintf(tag, sizeof(tag), "SELECT %d", n);
+    pgwire_send_command_complete(conn, tag);
+}
+
+static int pg_emulate_catalog(PgConn *conn, const char *sql) {
+    char norm[512]; pg_normalize(sql, norm, sizeof(norm));
+    if (strstr(norm, "from information_schema.tables"))  { pg_handle_info_tables(conn);  return 1; }
+    if (strstr(norm, "from information_schema.columns")) { pg_handle_info_columns(conn); return 1; }
+    if (strstr(norm, "from pg_catalog.pg_namespace") ||
+        strstr(norm, "from pg_namespace"))               { pg_handle_pg_namespace(conn); return 1; }
+    if (strstr(norm, "from pg_catalog.pg_class") ||
+        strstr(norm, "from pg_class"))                   { pg_handle_pg_class(conn);     return 1; }
+    return 0;
+}
+
 void api_pg_execute(PgConn *conn, const char *sql) {
+    /* Catalog probes go first so we don't hand them to a parser that
+     * has no knowledge of pg_class etc. */
+    if (pg_emulate_catalog(conn, sql)) return;
+
     Arena *a = arena_create(1024 * 1024);
     Stmt *stmt = sql_parse(a, sql, strlen(sql));
     if (!stmt) {
@@ -2442,13 +2600,17 @@ void api_pg_execute(PgConn *conn, const char *sql) {
     }
 
     /* RowDescription — at least one column for SELECT; for DML, exec_stmt
-     * returns a 1-col RS containing the affected count. We forward both. */
+     * returns a 1-col RS containing the affected count. Week 3: column
+     * type is inferred per-column from the first non-null cell. */
     if (rs->ncols > 0) {
         PgColumn *cols = arena_alloc(a, (size_t)rs->ncols * sizeof(PgColumn));
         for (int i = 0; i < rs->ncols; i++) {
             cols[i].name      = rs->col_names[i] ? rs->col_names[i] : "";
-            cols[i].type_oid  = PG_OID_TEXT;     /* Week 2: TEXT for all */
-            cols[i].type_size = -1;
+            cols[i].type_oid  = pg_infer_col_oid(rs, i);
+            cols[i].type_size = (cols[i].type_oid == PG_OID_INT8)   ? 8
+                              : (cols[i].type_oid == PG_OID_FLOAT8) ? 8
+                              : (cols[i].type_oid == PG_OID_BOOL)   ? 1
+                              :                                       -1;
         }
         pgwire_send_row_description(conn, rs->ncols, cols);
     }
