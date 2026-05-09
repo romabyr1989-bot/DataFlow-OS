@@ -297,6 +297,10 @@ void app_init(App *app, const char *config_json) {
 
     /* start scheduler */
     scheduler_start(app->scheduler);
+
+    /* Step 4: file_arrival trigger watcher.
+     * Returns NULL if no file_arrival triggers exist or platform unsupported. */
+    app->file_watcher = file_watcher_create(app->scheduler);
 }
 
 void app_run(App *app) {
@@ -305,6 +309,7 @@ void app_run(App *app) {
 }
 
 void app_stop(App *app) {
+    if (app->file_watcher) { file_watcher_destroy(app->file_watcher); app->file_watcher = NULL; }
     scheduler_stop(app->scheduler);
     http_server_stop(app->server);
     tp_destroy(app->workers);

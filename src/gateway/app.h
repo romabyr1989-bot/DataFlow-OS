@@ -3,6 +3,7 @@
 #include "../../lib/storage/storage.h"
 #include "../../lib/storage/txn.h"
 #include "../../lib/scheduler/scheduler.h"
+#include "../../lib/scheduler/file_watcher.h"
 #include "../../lib/observ/observ.h"
 #include "../../lib/core/hashmap.h"
 #include "../../lib/core/threadpool.h"
@@ -25,6 +26,7 @@ typedef struct {
     /* subsystems */
     Catalog    *catalog;
     Scheduler  *scheduler;
+    FileWatcher *file_watcher;     /* Step 4: TRIGGER_FILE_ARRIVAL backend */
     Metrics    *metrics;
     ThreadPool *workers;
 

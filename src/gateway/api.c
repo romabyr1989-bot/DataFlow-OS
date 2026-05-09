@@ -3065,6 +3065,46 @@ static void h_pipeline_runs(HttpReq *req, HttpResp *resp) {
     http_resp_json(resp,200,json?json:"[]");
 }
 
+/* ── POST /api/triggers/:token ── (webhook trigger; public — token is the auth)
+ *
+ * Looks up a pipeline by its TRIGGER_WEBHOOK token, fires it, returns 202
+ * with the pipeline name. Body is accepted (any JSON / form-encoded text)
+ * but currently not forwarded into the pipeline's environment — that's a
+ * future enhancement. */
+static void h_webhook_trigger(HttpReq *req, HttpResp *resp) {
+    const char *token = hm_get(&req->params, "token");
+    if (!token || !*token) { http_resp_error(resp, 400, "missing token"); return; }
+    Pipeline *p = scheduler_find_by_webhook_token(g_app.scheduler, token);
+    if (!p) { http_resp_error(resp, 404, "unknown trigger"); return; }
+    if (p->run_status == RUN_RUNNING) {
+        http_resp_error(resp, 409, "pipeline already running"); return;
+    }
+
+    /* Verify HTTP method matches the configured webhook_method (default POST) */
+    int method_ok = 0;
+    for (int i = 0; i < p->ntriggers; i++) {
+        if (p->triggers[i].type != TRIGGER_WEBHOOK) continue;
+        if (strcmp(p->triggers[i].webhook_token, token) != 0) continue;
+        const char *m = p->triggers[i].webhook_method[0]
+                        ? p->triggers[i].webhook_method : "POST";
+        if (strcasecmp(req->method, m) == 0) method_ok = 1;
+        break;
+    }
+    if (!method_ok) { http_resp_error(resp, 405, "method not allowed"); return; }
+
+    g_app.metrics->total_pipelines_run++;
+    Arena *ba = arena_create(256);
+    app_ws_broadcast(&g_app, arena_sprintf(ba,
+        "{\"event\":\"pipeline_run_started\",\"id\":\"%s\",\"trigger\":\"webhook\"}", p->id));
+    arena_destroy(ba);
+    scheduler_run_pipeline_now(g_app.scheduler, p);
+    pipeline_execute_steps(p, &g_app);
+
+    http_resp_json(resp, 202, arena_sprintf(req->arena,
+        "{\"status\":\"triggered\",\"pipeline_id\":\"%s\",\"pipeline_name\":\"%s\"}",
+        p->id, p->name));
+}
+
 /* ── GET /api/metrics ── */
 static void h_metrics(HttpReq *req, HttpResp *resp) {
     (void)req;
@@ -3790,6 +3830,9 @@ void api_register_routes(Router *r) {
     router_add(r,"POST", "/api/pipelines/:id/run",   h_pipeline_run);
     router_add(r,"DELETE","/api/pipelines/:id",      h_pipeline_delete);
     router_add(r,"GET",  "/api/pipelines/:id/runs",  h_pipeline_runs);
+    /* Step 4: event-driven triggers — webhook (public route, token=auth) */
+    router_add(r,"POST", "/api/triggers/:token",     h_webhook_trigger);
+    router_add(r,"GET",  "/api/triggers/:token",     h_webhook_trigger);
     router_add(r,"GET",  "/api/metrics",             h_metrics);
     router_add(r,"GET",  "/metrics",                 h_metrics_prometheus);
     router_add(r,"POST",   "/api/analytics/results",     h_result_save);

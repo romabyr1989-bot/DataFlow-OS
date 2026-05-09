@@ -166,6 +166,27 @@ static void copy_jval_str(JVal *v, char *dst, size_t dstsz, Arena *a) {
     }
 }
 
+/* Map textual trigger type to enum. Unknown values default to MANUAL
+ * (no automatic firing) — fail-closed for safety. */
+static TriggerType trigger_type_from_str(const char *s) {
+    if (!s || !*s)                      return TRIGGER_CRON;
+    if (strcmp(s, "cron")          == 0) return TRIGGER_CRON;
+    if (strcmp(s, "webhook")       == 0) return TRIGGER_WEBHOOK;
+    if (strcmp(s, "file_arrival")  == 0) return TRIGGER_FILE_ARRIVAL;
+    if (strcmp(s, "manual")        == 0) return TRIGGER_MANUAL;
+    return TRIGGER_MANUAL;
+}
+
+static const char *trigger_type_to_str(TriggerType t) {
+    switch (t) {
+        case TRIGGER_CRON:         return "cron";
+        case TRIGGER_WEBHOOK:      return "webhook";
+        case TRIGGER_FILE_ARRIVAL: return "file_arrival";
+        case TRIGGER_MANUAL:       return "manual";
+        default:                   return "manual";
+    }
+}
+
 int pipeline_from_json(Pipeline *p, const char *json) {
     Arena *a = arena_create(32768);
     JVal *root = json_parse(a, json, strlen(json));
@@ -179,6 +200,40 @@ int pipeline_from_json(Pipeline *p, const char *json) {
     strncpy(p->webhook_on,  json_str(json_get(root,"webhook_on"),"failure"), sizeof(p->webhook_on)-1);
     p->alert_cooldown = (int)json_int(json_get(root,"alert_cooldown"), 300);
     p->last_alert_at = 0;
+
+    /* Step 4: parse triggers[] if present.
+     * Back-compat: when absent, synthesize a single TRIGGER_CRON if `cron`
+     * is set; otherwise leave ntriggers=0 (manual-only). */
+    p->ntriggers = 0;
+    JVal *trigs = json_get(root, "triggers");
+    if (trigs && trigs->type == JV_ARRAY) {
+        size_t n = trigs->nitems > MAX_TRIGGERS ? MAX_TRIGGERS : trigs->nitems;
+        for (size_t i = 0; i < n; i++) {
+            JVal *t = trigs->items[i];
+            if (!t || t->type != JV_OBJECT) continue;
+            PipelineTrigger *pt = &p->triggers[p->ntriggers];
+            memset(pt, 0, sizeof(*pt));
+            pt->type = trigger_type_from_str(json_str(json_get(t, "type"), "cron"));
+            strncpy(pt->cron_expr,
+                    json_str(json_get(t, "cron_expr"), ""), sizeof(pt->cron_expr) - 1);
+            strncpy(pt->webhook_token,
+                    json_str(json_get(t, "webhook_token"), ""), sizeof(pt->webhook_token) - 1);
+            strncpy(pt->webhook_method,
+                    json_str(json_get(t, "webhook_method"), "POST"), sizeof(pt->webhook_method) - 1);
+            strncpy(pt->watch_dir,
+                    json_str(json_get(t, "watch_dir"), ""), sizeof(pt->watch_dir) - 1);
+            strncpy(pt->file_pattern,
+                    json_str(json_get(t, "file_pattern"), "*"), sizeof(pt->file_pattern) - 1);
+            p->ntriggers++;
+        }
+    }
+    if (p->ntriggers == 0 && p->cron[0]) {
+        PipelineTrigger *pt = &p->triggers[0];
+        memset(pt, 0, sizeof(*pt));
+        pt->type = TRIGGER_CRON;
+        strncpy(pt->cron_expr, p->cron, sizeof(pt->cron_expr) - 1);
+        p->ntriggers = 1;
+    }
 
     JVal *steps = json_get(root,"steps");
     if(steps && steps->type==JV_ARRAY) {
@@ -239,11 +294,45 @@ char *pipeline_to_json(const Pipeline *p, Arena *a) {
         jb_obj_end(&jb);
     }
     jb_arr_end(&jb);
+
+    /* Step 4: emit triggers[] */
+    jb_key(&jb, "triggers"); jb_arr_begin(&jb);
+    for (int i = 0; i < p->ntriggers; i++) {
+        const PipelineTrigger *t = &p->triggers[i];
+        jb_obj_begin(&jb);
+        jb_key(&jb, "type"); jb_str(&jb, trigger_type_to_str(t->type));
+        if (t->type == TRIGGER_CRON) {
+            jb_key(&jb, "cron_expr"); jb_str(&jb, t->cron_expr);
+        } else if (t->type == TRIGGER_WEBHOOK) {
+            jb_key(&jb, "webhook_token");  jb_str(&jb, t->webhook_token);
+            jb_key(&jb, "webhook_method"); jb_str(&jb, t->webhook_method[0] ? t->webhook_method : "POST");
+        } else if (t->type == TRIGGER_FILE_ARRIVAL) {
+            jb_key(&jb, "watch_dir");    jb_str(&jb, t->watch_dir);
+            jb_key(&jb, "file_pattern"); jb_str(&jb, t->file_pattern);
+        }
+        jb_obj_end(&jb);
+    }
+    jb_arr_end(&jb);
+
     jb_obj_end(&jb);
     return (char*)jb_done(&jb);
 }
 
-/* ── Поток планировщика ── */
+/* ── Поток планировщика ──
+ * Step 4 update: cron-trigger lookup walks triggers[] and uses the first
+ * TRIGGER_CRON entry. Pipelines without any cron trigger sit idle here —
+ * they fire from webhook/file-watcher/manual paths instead. */
+
+/* Returns the cron expression a pipeline should currently follow, or NULL
+ * if none. Prefers triggers[].cron_expr over the legacy `cron` field. */
+static const char *pipeline_active_cron(const Pipeline *p) {
+    for (int i = 0; i < p->ntriggers; i++) {
+        if (p->triggers[i].type == TRIGGER_CRON && p->triggers[i].cron_expr[0])
+            return p->triggers[i].cron_expr;
+    }
+    return p->cron[0] ? p->cron : NULL;
+}
+
 static void *sched_loop(void *arg) {
     Scheduler *s = arg;
     LOG_INFO("scheduler started");
@@ -256,17 +345,19 @@ static void *sched_loop(void *arg) {
         for(int i=0;i<s->npipelines;i++){
             Pipeline *p=&s->pipelines[i];
             if(!p->enabled) continue;
-            if(p->next_run==0 && p->cron[0])
-                p->next_run=cron_next(p->cron,now);
+            const char *cron = pipeline_active_cron(p);
+            if (!cron) continue;   /* manual / webhook / file-arrival only */
+            if(p->next_run==0)
+                p->next_run=cron_next(cron,now);
             if(p->next_run>0 && now>=p->next_run && p->run_status!=RUN_RUNNING){
                 p->last_run=now;
                 /* @reboot запускается один раз при старте; INT64_MAX исключает повторный запуск. */
-                if(strcmp(p->cron,"@reboot")==0)
+                if(strcmp(cron,"@reboot")==0)
                     p->next_run=INT64_MAX;
                 else
-                    p->next_run=cron_next(p->cron,now);
+                    p->next_run=cron_next(cron,now);
                 p->run_status=RUN_RUNNING;
-                LOG_INFO("scheduler triggering pipeline %s", p->id);
+                LOG_INFO("scheduler triggering pipeline %s (cron)", p->id);
                 if(s->on_run) s->on_run(p, s->on_run_data);
             }
         }
@@ -308,3 +399,37 @@ Pipeline *scheduler_find(Scheduler *s, const char *id) {
 
 void scheduler_start(Scheduler *s) { s->running=1; pthread_create(&s->thread,NULL,sched_loop,s); }
 void scheduler_stop(Scheduler *s)  { s->running=0; pthread_join(s->thread,NULL); }
+
+/* Step 4: webhook-trigger lookup. O(N×T) — fine for typical pipeline counts. */
+Pipeline *scheduler_find_by_webhook_token(Scheduler *s, const char *token) {
+    if (!token || !*token) return NULL;
+    pthread_mutex_lock(&s->mu);
+    Pipeline *found = NULL;
+    for (int i = 0; i < s->npipelines && !found; i++) {
+        Pipeline *p = &s->pipelines[i];
+        if (!p->enabled) continue;
+        for (int j = 0; j < p->ntriggers; j++) {
+            if (p->triggers[j].type == TRIGGER_WEBHOOK &&
+                strcmp(p->triggers[j].webhook_token, token) == 0) {
+                found = p;
+                break;
+            }
+        }
+    }
+    pthread_mutex_unlock(&s->mu);
+    return found;
+}
+
+/* Step 4: synchronous trigger entry-point used by webhook + file watcher.
+ * Updates last_run/next_run to "now" and invokes the run callback. The
+ * callback is responsible for offloading actual pipeline execution. */
+void scheduler_run_pipeline_now(Scheduler *s, Pipeline *p) {
+    if (!s || !p) return;
+    pthread_mutex_lock(&s->mu);
+    p->last_run    = (int64_t)time(NULL);
+    p->run_status  = RUN_RUNNING;
+    /* Don't update next_run — cron schedule (if any) keeps its own cadence */
+    LOG_INFO("scheduler triggering pipeline %s (event)", p->id);
+    if (s->on_run) s->on_run(p, s->on_run_data);
+    pthread_mutex_unlock(&s->mu);
+}

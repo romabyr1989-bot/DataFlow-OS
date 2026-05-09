@@ -131,6 +131,7 @@ void router_dispatch(Router *r, HttpReq *req, HttpResp *resp) {
                 "/api/auth/token",
                 "/metrics",    /* Prometheus scraper не передаёт Authorization */
                 "/health",
+                "/api/triggers/:token", /* webhook trigger — token IS the auth */
                 NULL
             };
             bool is_public = false;
