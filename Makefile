@@ -44,6 +44,8 @@ ALL_LIB_SRCS = $(CORE_SRCS) $(NET_SRCS) $(STOR_SRCS) $(SQL_SRCS) \
 
 GW_SRCS   = src/gateway/main.c src/gateway/api.c
 SN_SRCS   = src/storage_node/main.c
+MCP_SRCS  = src/mcp_server/main.c src/mcp_server/dispatch.c \
+            src/mcp_server/tools.c src/mcp_server/http_client.c
 
 # convert .c to .o in OUTDIR
 ALL_OBJS  = $(patsubst %.c,$(OUTDIR)/%.o,$(ALL_LIB_SRCS) $(GW_SRCS))
@@ -51,6 +53,7 @@ LIB_OBJS  = $(patsubst %.c,$(OUTDIR)/%.o,$(ALL_LIB_SRCS))
 
 GATEWAY        = $(BINDIR)/dfo_gateway
 STORAGE_NODE   = $(BINDIR)/dfo_storage
+MCP_SERVER     = $(BINDIR)/dfo_mcp_server
 CSV_PLUGIN     = $(LIBDIR)/csv_connector.so
 PG_PLUGIN      = $(LIBDIR)/pg_connector.so
 PARQUET_PLUGIN = $(LIBDIR)/parquet_connector.so
@@ -90,7 +93,7 @@ endif
         test-integration test-sql test-all bench
 
 # Base targets always built
-_ALL_TARGETS = dirs $(GATEWAY) $(STORAGE_NODE) $(CSV_PLUGIN) $(PARQUET_PLUGIN) $(JSONHTTP_PLUGIN) $(S3_PLUGIN)
+_ALL_TARGETS = dirs $(GATEWAY) $(STORAGE_NODE) $(MCP_SERVER) $(CSV_PLUGIN) $(PARQUET_PLUGIN) $(JSONHTTP_PLUGIN) $(S3_PLUGIN)
 ifeq ($(HAS_PQ),yes)
   _ALL_TARGETS += $(PG_PLUGIN)
 endif
@@ -113,7 +116,7 @@ dirs:
 	           $(OUTDIR)/lib/scheduler $(OUTDIR)/lib/observ \
 	           $(OUTDIR)/lib/connector $(OUTDIR)/lib/index \
 	           $(OUTDIR)/lib/auth $(OUTDIR)/lib/matview $(OUTDIR)/lib/cluster \
-	           $(OUTDIR)/src/gateway $(OUTDIR)/src/storage_node \
+	           $(OUTDIR)/src/gateway $(OUTDIR)/src/storage_node $(OUTDIR)/src/mcp_server \
 	           $(OUTDIR)/lib/connector/plugins/s3 \
 	           $(OUTDIR)/lib/connector/plugins/kafka
 
@@ -132,6 +135,16 @@ SN_OBJS = $(patsubst %.c,$(OUTDIR)/%.o,$(ALL_LIB_SRCS) $(SN_SRCS))
 $(STORAGE_NODE): $(SN_OBJS)
 	@echo "  LD  $@"
 	@$(CC) $(CFLAGS) $^ -o $@ $(LDFLAGS)
+
+# MCP server binary (stdio JSON-RPC bridge for AI agents)
+# Only links the small core needed for arg parsing + JSON + libcurl HTTP client.
+MCP_CORE_OBJS = $(OUTDIR)/lib/core/arena.o \
+                $(OUTDIR)/lib/core/json.o \
+                $(OUTDIR)/lib/core/log.o
+MCP_OBJS = $(patsubst %.c,$(OUTDIR)/%.o,$(MCP_SRCS)) $(MCP_CORE_OBJS)
+$(MCP_SERVER): $(MCP_OBJS)
+	@echo "  LD  $@"
+	@$(CC) $(CFLAGS) $^ -o $@ $(LDFLAGS) -lcurl
 
 # CSV connector shared library
 $(CSV_PLUGIN): lib/connector/plugins/csv/csv_connector.c \
