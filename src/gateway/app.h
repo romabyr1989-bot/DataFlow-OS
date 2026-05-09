@@ -4,6 +4,7 @@
 #include "../../lib/storage/txn.h"
 #include "../../lib/scheduler/scheduler.h"
 #include "../../lib/scheduler/file_watcher.h"
+#include "../../lib/pgwire/pgwire.h"
 #include "../../lib/observ/observ.h"
 #include "../../lib/core/hashmap.h"
 #include "../../lib/core/threadpool.h"
@@ -70,6 +71,13 @@ typedef struct {
      * If non-empty, app_init scans this directory for *.yaml / *.yml at
      * startup and registers each as a pipeline. Empty = feature off. */
     char         pipelines_dir[512];
+
+    /* Step 3 Week 1: PostgreSQL wire-protocol server (opt-in).
+     * Enabled when pgwire_port > 0 in the config. Auth is cleartext —
+     * fine for loopback or VPN; future weeks add SCRAM + TLS. */
+    PgWireServer *pgwire;
+    int           pgwire_port;
+    bool          pgwire_enabled;
 
     /* TLS/HTTPS */
     char        tls_cert_path[512];

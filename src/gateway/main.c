@@ -100,6 +100,154 @@ void app_ws_broadcast(App *app, const char *json_msg) {
     pthread_mutex_unlock(&app->ws_mu);
 }
 
+/* ── Step 3 Week 1: PostgreSQL wire-protocol callbacks ─────────────
+ *
+ * Auth: accept either (admin, admin_password) or (anything, "dfo_xxx" API key).
+ *       Cleartext over TCP — fine for loopback/VPN; SCRAM + TLS land later.
+ * Query: this Week 1 build understands a small set of compatibility probes
+ *        that psql / DBeaver / Tableau emit on connect:
+ *          SELECT 1 / SELECT 1+1 / etc — constant-folded scalar
+ *          SELECT version() / SHOW server_version
+ *          SELECT current_database() / current_user / current_schema()
+ *          BEGIN / COMMIT / ROLLBACK / SET ... — accepted as no-ops
+ *        Anything else returns a clear error pointing at the JSON API.
+ *        Real qengine integration is Week 2.                                */
+static int pg_authenticate_cb(const char *user, const char *password,
+                              const char *database, void *ud) {
+    App *app = (App *)ud;
+    (void)database;
+    if (!user || !password) return -1;
+    /* admin → admin_password (configured) */
+    if (strcmp(user, "admin") == 0 && app->admin_password[0] &&
+        strcmp(password, app->admin_password) == 0)
+        return 0;
+    /* API-key auth: password is a "dfo_<hex>" token */
+    if (app->auth_store && strncmp(password, "dfo_", 4) == 0) {
+        AuthClaims c;
+        if (auth_apikey_verify(app->auth_store, password, &c) == 0) return 0;
+    }
+    LOG_WARN("pgwire: auth rejected for user=%s", user);
+    return -1;
+}
+
+/* Lower-case + strip leading whitespace + drop trailing ';' for matching. */
+static void normalize_sql(const char *sql, char *out, size_t cap) {
+    while (*sql == ' ' || *sql == '\t' || *sql == '\n') sql++;
+    size_t n = 0;
+    while (*sql && n + 1 < cap) {
+        char c = *sql++;
+        out[n++] = (c >= 'A' && c <= 'Z') ? (char)(c - 'A' + 'a') : c;
+    }
+    out[n] = '\0';
+    /* trim trailing ';' or whitespace */
+    while (n > 0 && (out[n-1] == ';' || out[n-1] == ' ' ||
+                     out[n-1] == '\t' || out[n-1] == '\n')) out[--n] = '\0';
+}
+
+static int starts_with(const char *s, const char *prefix) {
+    return strncmp(s, prefix, strlen(prefix)) == 0;
+}
+
+static void pg_query_cb(PgConn *conn, const char *sql, void *ud) {
+    (void)ud;
+    char norm[1024]; normalize_sql(sql, norm, sizeof(norm));
+
+    /* Empty statement — psql sends "" between commands */
+    if (norm[0] == '\0') {
+        pgwire_send_command_complete(conn, "");
+        return;
+    }
+
+    /* Transaction control: accept as no-ops (no real txn yet over pgwire) */
+    if (strcmp(norm, "begin") == 0 || strcmp(norm, "begin transaction") == 0) {
+        pgwire_send_command_complete(conn, "BEGIN");          return;
+    }
+    if (strcmp(norm, "commit") == 0 || strcmp(norm, "commit transaction") == 0) {
+        pgwire_send_command_complete(conn, "COMMIT");         return;
+    }
+    if (strcmp(norm, "rollback") == 0) {
+        pgwire_send_command_complete(conn, "ROLLBACK");       return;
+    }
+    if (starts_with(norm, "set ")) {
+        pgwire_send_command_complete(conn, "SET");            return;
+    }
+    if (starts_with(norm, "discard ")) {
+        pgwire_send_command_complete(conn, "DISCARD ALL");    return;
+    }
+
+    /* SHOW server_version → single text row */
+    if (strcmp(norm, "show server_version") == 0) {
+        PgColumn c[] = {{"server_version", PG_OID_TEXT, -1}};
+        pgwire_send_row_description(conn, 1, c);
+        const char *row[] = {"16.0 (DataFlow OS)"};
+        pgwire_send_data_row(conn, 1, row);
+        pgwire_send_command_complete(conn, "SHOW");
+        return;
+    }
+
+    /* SELECT version() */
+    if (strcmp(norm, "select version()") == 0) {
+        PgColumn c[] = {{"version", PG_OID_TEXT, -1}};
+        pgwire_send_row_description(conn, 1, c);
+        const char *row[] = {"DataFlow OS 0.1 (PostgreSQL-compatible wire protocol)"};
+        pgwire_send_data_row(conn, 1, row);
+        pgwire_send_command_complete(conn, "SELECT 1");
+        return;
+    }
+
+    /* SELECT current_database() / current_user / current_schema() */
+    if (strcmp(norm, "select current_database()") == 0) {
+        PgColumn c[] = {{"current_database", PG_OID_TEXT, -1}};
+        pgwire_send_row_description(conn, 1, c);
+        const char *row[] = { pgwire_database(conn) };
+        pgwire_send_data_row(conn, 1, row);
+        pgwire_send_command_complete(conn, "SELECT 1");
+        return;
+    }
+    if (strcmp(norm, "select current_user") == 0 ||
+        strcmp(norm, "select current_user()") == 0 ||
+        strcmp(norm, "select user") == 0) {
+        PgColumn c[] = {{"current_user", PG_OID_TEXT, -1}};
+        pgwire_send_row_description(conn, 1, c);
+        const char *row[] = { pgwire_user(conn) };
+        pgwire_send_data_row(conn, 1, row);
+        pgwire_send_command_complete(conn, "SELECT 1");
+        return;
+    }
+    if (strcmp(norm, "select current_schema()") == 0 ||
+        strcmp(norm, "select current_schema") == 0) {
+        PgColumn c[] = {{"current_schema", PG_OID_TEXT, -1}};
+        pgwire_send_row_description(conn, 1, c);
+        const char *row[] = { "public" };
+        pgwire_send_data_row(conn, 1, row);
+        pgwire_send_command_complete(conn, "SELECT 1");
+        return;
+    }
+
+    /* SELECT <constant int> — covers SELECT 1, SELECT 42, etc.
+     * Strict: no expressions yet; just a leading integer.                    */
+    if (starts_with(norm, "select ")) {
+        const char *rest = norm + 7;
+        char *end = NULL;
+        long long v = strtoll(rest, &end, 10);
+        if (end && end != rest && (*end == '\0' || *end == ' ')) {
+            char buf[32]; snprintf(buf, sizeof(buf), "%lld", v);
+            PgColumn c[] = {{"?column?", PG_OID_INT8, 8}};
+            pgwire_send_row_description(conn, 1, c);
+            const char *row[] = { buf };
+            pgwire_send_data_row(conn, 1, row);
+            pgwire_send_command_complete(conn, "SELECT 1");
+            return;
+        }
+    }
+
+    /* Everything else: clear error pointing at the JSON API for now */
+    pgwire_send_error(conn, "0A000",
+        "Week 1 wire-protocol build: only SELECT 1 / version() / current_database / "
+        "current_user / SET / BEGIN/COMMIT/ROLLBACK are recognized. "
+        "Use POST /api/tables/query for full SQL until Week 2.");
+}
+
 static void on_pipeline_run(Pipeline *p, void *ud) {
     App *app=(App*)ud;
     LOG_INFO("running pipeline %s (%s)", p->name, p->id);
@@ -173,6 +321,11 @@ void app_init(App *app, const char *config_json) {
                 char *expanded = expand_env_vars(pld);
                 if (expanded) { strncpy(app->pipelines_dir, expanded, sizeof(app->pipelines_dir)-1); free(expanded); }
             }
+            /* Step 3 Week 1: PostgreSQL wire-protocol server */
+            app->pgwire_port    = (int)json_int(json_get(cfg, "pgwire_port"), 0);
+            app->pgwire_enabled = (bool)json_int(json_get(cfg, "pgwire_enabled"), 0);
+            /* If port is set without enabled flag, infer enabled */
+            if (app->pgwire_port > 0 && !app->pgwire_enabled) app->pgwire_enabled = true;
         }
         arena_destroy(a);
     }
@@ -369,6 +522,22 @@ void app_init(App *app, const char *config_json) {
     /* Step 4: file_arrival trigger watcher.
      * Returns NULL if no file_arrival triggers exist or platform unsupported. */
     app->file_watcher = file_watcher_create(app->scheduler);
+
+    /* Step 3 Week 1: PostgreSQL wire-protocol server (opt-in via config) */
+    if (app->pgwire_enabled && app->pgwire_port > 0) {
+        PgWireCallbacks cbs = {
+            .authenticate = pg_authenticate_cb,
+            .query        = pg_query_cb,
+        };
+        app->pgwire = pgwire_create(app->pgwire_port, cbs, app);
+        if (app->pgwire && pgwire_start(app->pgwire) == 0) {
+            LOG_INFO("PostgreSQL wire-protocol enabled on :%d (Week 1: handshake + simple queries only)",
+                     app->pgwire_port);
+        } else {
+            LOG_WARN("pgwire: failed to start on :%d", app->pgwire_port);
+            if (app->pgwire) { pgwire_destroy(app->pgwire); app->pgwire = NULL; }
+        }
+    }
 }
 
 void app_run(App *app) {
@@ -377,6 +546,7 @@ void app_run(App *app) {
 }
 
 void app_stop(App *app) {
+    if (app->pgwire) { pgwire_destroy(app->pgwire); app->pgwire = NULL; }
     if (app->file_watcher) { file_watcher_destroy(app->file_watcher); app->file_watcher = NULL; }
     scheduler_stop(app->scheduler);
     http_server_stop(app->server);
