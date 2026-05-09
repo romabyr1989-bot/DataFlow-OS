@@ -33,6 +33,7 @@ STOR_SRCS = lib/storage/storage.c lib/storage/compress.c lib/storage/txn.c lib/i
 SQL_SRCS  = lib/sql_parser/sql.c
 QE_SRCS   = lib/qengine/qengine.c
 SCHED_SRCS= lib/scheduler/scheduler.c lib/scheduler/file_watcher.c
+YAML_SRCS = lib/yaml/yaml_loader.c
 OBS_SRCS  = lib/observ/observ.c
 CONN_SRCS = lib/connector/connector.c
 MV_SRCS   = lib/matview/matview.c
@@ -40,7 +41,7 @@ CL_SRCS   = lib/cluster/proto.c lib/cluster/storage_client.c lib/cluster/replica
 
 ALL_LIB_SRCS = $(CORE_SRCS) $(NET_SRCS) $(STOR_SRCS) $(SQL_SRCS) \
                $(QE_SRCS) $(SCHED_SRCS) $(OBS_SRCS) $(CONN_SRCS) \
-               $(MV_SRCS) $(CL_SRCS)
+               $(MV_SRCS) $(CL_SRCS) $(YAML_SRCS)
 
 GW_SRCS   = src/gateway/main.c src/gateway/api.c
 SN_SRCS   = src/storage_node/main.c
@@ -117,6 +118,7 @@ dirs:
 	           $(OUTDIR)/lib/scheduler $(OUTDIR)/lib/observ \
 	           $(OUTDIR)/lib/connector $(OUTDIR)/lib/index \
 	           $(OUTDIR)/lib/auth $(OUTDIR)/lib/matview $(OUTDIR)/lib/cluster \
+	           $(OUTDIR)/lib/yaml \
 	           $(OUTDIR)/src/gateway $(OUTDIR)/src/storage_node $(OUTDIR)/src/mcp_server \
 	           $(OUTDIR)/lib/connector/plugins/s3 \
 	           $(OUTDIR)/lib/connector/plugins/kafka \

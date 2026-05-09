@@ -66,6 +66,11 @@ typedef struct {
     Replicator  *replicator;
     bool         cluster_mode;
 
+    /* Step 5: YAML pipelines auto-load (GitOps).
+     * If non-empty, app_init scans this directory for *.yaml / *.yml at
+     * startup and registers each as a pipeline. Empty = feature off. */
+    char         pipelines_dir[512];
+
     /* TLS/HTTPS */
     char        tls_cert_path[512];
     char        tls_key_path[512];

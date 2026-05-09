@@ -3,12 +3,15 @@
 #include "../../lib/auth/auth.h"
 #include "../../lib/core/json.h"
 #include "../../lib/net/tls.h"
+#include "../../lib/yaml/yaml_loader.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
 #include <signal.h>
 #include <unistd.h>
+#include <errno.h>
+#include <dirent.h>
 #include <sys/stat.h>
 #include <sys/socket.h>
 #ifndef MSG_NOSIGNAL
@@ -164,6 +167,12 @@ void app_init(App *app, const char *config_json) {
             if (alf) strncpy(app->audit_log_file, alf, sizeof(app->audit_log_file)-1);
             /* cluster */
             app->cluster_mode = (bool)json_int(json_get(cfg,"cluster_mode"), 0);
+            /* Step 5: GitOps YAML pipelines */
+            const char *pld = json_str(json_get(cfg,"pipelines_dir"), NULL);
+            if (pld) {
+                char *expanded = expand_env_vars(pld);
+                if (expanded) { strncpy(app->pipelines_dir, expanded, sizeof(app->pipelines_dir)-1); free(expanded); }
+            }
         }
         arena_destroy(a);
     }
@@ -276,6 +285,65 @@ void app_init(App *app, const char *config_json) {
         }
     }
     LOG_INFO("loaded %d pipelines", pn);
+
+    /* Step 5: auto-load YAML pipelines from pipelines_dir.
+     * If a YAML pipeline has the same `name` as one already loaded from the
+     * catalog, the YAML version replaces it — files are the source of truth
+     * in GitOps mode. */
+    if (app->pipelines_dir[0]) {
+        DIR *d = opendir(app->pipelines_dir);
+        if (!d) {
+            LOG_WARN("pipelines_dir '%s' cannot be opened: %s",
+                     app->pipelines_dir, strerror(errno));
+        } else {
+            int yaml_loaded = 0, yaml_failed = 0;
+            struct dirent *de;
+            while ((de = readdir(d))) {
+                size_t nlen = strlen(de->d_name);
+                if (nlen < 5) continue;
+                int is_yaml = (strcmp(de->d_name + nlen - 5, ".yaml") == 0) ||
+                              (strcmp(de->d_name + nlen - 4, ".yml")  == 0);
+                if (!is_yaml) continue;
+                char path[1024];
+                snprintf(path, sizeof(path), "%s/%s", app->pipelines_dir, de->d_name);
+                FILE *f = fopen(path, "r");
+                if (!f) { yaml_failed++; continue; }
+                fseek(f, 0, SEEK_END); long sz = ftell(f); rewind(f);
+                if (sz <= 0 || sz > 1024 * 1024) { fclose(f); yaml_failed++; continue; }
+                char *src = malloc((size_t)sz + 1);
+                if (!src) { fclose(f); yaml_failed++; continue; }
+                fread(src, 1, (size_t)sz, f); src[sz] = '\0';
+                fclose(f);
+
+                Arena *ya = arena_create(64 * 1024);
+                YamlError yerr = {0};
+                char *json = NULL;
+                if (yaml_to_json(src, (size_t)sz, ya, &json, &yerr) < 0) {
+                    LOG_WARN("pipelines_dir: %s parse error line %d: %s",
+                             de->d_name, yerr.line, yerr.buf);
+                    arena_destroy(ya); free(src); yaml_failed++; continue;
+                }
+                Pipeline p; memset(&p, 0, sizeof(p));
+                if (pipeline_from_json(&p, json) < 0) {
+                    LOG_WARN("pipelines_dir: %s schema invalid", de->d_name);
+                    arena_destroy(ya); free(src); yaml_failed++; continue;
+                }
+                /* Generate a stable id from the file name if not present */
+                if (!p.id[0])
+                    snprintf(p.id, sizeof(p.id), "yaml_%s", de->d_name);
+                /* Replace any existing pipeline with the same id */
+                scheduler_remove(app->scheduler, p.id);
+                scheduler_add(app->scheduler, &p);
+                yaml_loaded++;
+                arena_destroy(ya);
+                free(src);
+            }
+            closedir(d);
+            LOG_INFO("pipelines_dir: loaded %d YAML pipeline(s) (%d failed) from %s",
+                     yaml_loaded, yaml_failed, app->pipelines_dir);
+        }
+    }
+
     arena_destroy(la);
 
     /* register routes */

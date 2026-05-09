@@ -2,6 +2,7 @@
 #include "../../lib/core/json.h"
 #include "../../lib/core/log.h"
 #include "../../lib/sql_parser/sql.h"
+#include "../../lib/yaml/yaml_loader.h"
 #include "../../lib/storage/storage.h"
 #include "../../lib/storage/compress.h"
 #include "../../lib/storage/txn.h"
@@ -2776,6 +2777,40 @@ static void h_pipeline_create(HttpReq *req, HttpResp *resp) {
     arena_destroy(ba);
 }
 
+/* ── POST /api/pipelines/preview-yaml ──
+ *
+ * Body: text/yaml — a single pipeline document.
+ * Response 200: parsed JSON pipeline (NOT saved). Used by the UI / CLI to
+ *               validate YAML before applying.
+ * Response 400: {"error": "...", "line": N, "col": M} on parse error.
+ *
+ * Step 5 entry point for YAML pipeline authoring. Validation re-uses
+ * pipeline_from_json so callers see the same fields they'd get from /api/pipelines. */
+static void h_pipeline_preview_yaml(HttpReq *req, HttpResp *resp) {
+    if (!req->body || !req->body_len) { http_resp_error(resp, 400, "empty body"); return; }
+    Arena *a = req->arena;
+    YamlError yerr = {0};
+    char *json = NULL;
+    if (yaml_to_json(req->body, req->body_len, a, &json, &yerr) < 0) {
+        char *msg = arena_sprintf(a,
+            "{\"error\":\"yaml parse error\",\"detail\":\"%s\",\"line\":%d,\"col\":%d}",
+            yerr.buf, yerr.line, yerr.col);
+        resp->status = 400;
+        resp->content_type = "application/json";
+        resp->body = msg;
+        resp->body_len = strlen(msg);
+        return;
+    }
+    /* Validate by round-tripping through pipeline_from_json + pipeline_to_json */
+    Pipeline p; memset(&p, 0, sizeof(p));
+    if (pipeline_from_json(&p, json) < 0) {
+        http_resp_error(resp, 400, "yaml parsed but pipeline schema is invalid");
+        return;
+    }
+    char *normalized = pipeline_to_json(&p, a);
+    http_resp_json(resp, 200, normalized);
+}
+
 /* ── GET /api/pipelines/:id ── */
 static void h_pipeline_get(HttpReq *req, HttpResp *resp) {
     const char *id=hm_get(&req->params,"id");
@@ -3826,6 +3861,7 @@ void api_register_routes(Router *r) {
     router_add(r,"POST", "/api/ingest/parquet",        h_ingest_parquet);
     router_add(r,"GET",  "/api/pipelines",           h_pipelines_list);
     router_add(r,"POST", "/api/pipelines",           h_pipeline_create);
+    router_add(r,"POST", "/api/pipelines/preview-yaml", h_pipeline_preview_yaml); /* Step 5 */
     router_add(r,"GET",  "/api/pipelines/:id",       h_pipeline_get);
     router_add(r,"POST", "/api/pipelines/:id/run",   h_pipeline_run);
     router_add(r,"DELETE","/api/pipelines/:id",      h_pipeline_delete);
