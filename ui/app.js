@@ -28,6 +28,59 @@ let ingestFile = null;  // raw File object (for parquet binary upload)
 /* User preferences */
 let prefs = {};
 
+/* ═══════════════════════════════════════════════════
+   AIRBYTE — pre-defined source catalog
+   Used by the pipeline builder when connector_type === 'airbyte'.
+   Versions pinned to known-good as of 2026-05.
+═══════════════════════════════════════════════════ */
+const AIRBYTE_CATALOG = {
+  /* databases */
+  'PostgreSQL':     { image: 'airbyte/source-postgres:3.6.16',         category: 'database' },
+  'MySQL':          { image: 'airbyte/source-mysql:3.7.4',             category: 'database' },
+  'MongoDB v2':     { image: 'airbyte/source-mongodb-v2:1.5.0',        category: 'database' },
+  'MS SQL Server':  { image: 'airbyte/source-mssql:4.0.31',            category: 'database' },
+  'Oracle':         { image: 'airbyte/source-oracle:0.5.4',            category: 'database' },
+  'Snowflake':      { image: 'airbyte/source-snowflake:0.3.1',         category: 'database' },
+  /* payments / finance */
+  'Stripe':         { image: 'airbyte/source-stripe:5.5.0',            category: 'payments' },
+  'PayPal':         { image: 'airbyte/source-paypal-transaction:2.5.5', category: 'payments' },
+  /* CRM / sales */
+  'HubSpot':        { image: 'airbyte/source-hubspot:4.4.5',           category: 'crm' },
+  'Salesforce':     { image: 'airbyte/source-salesforce:2.5.20',       category: 'crm' },
+  'Pipedrive':      { image: 'airbyte/source-pipedrive:2.2.0',         category: 'crm' },
+  'Intercom':       { image: 'airbyte/source-intercom:0.8.5',          category: 'crm' },
+  /* marketing */
+  'Mailchimp':      { image: 'airbyte/source-mailchimp:2.0.16',        category: 'marketing' },
+  'SendGrid':       { image: 'airbyte/source-sendgrid:1.1.4',          category: 'marketing' },
+  'Facebook Ads':   { image: 'airbyte/source-facebook-marketing:3.3.10', category: 'marketing' },
+  'Google Ads':     { image: 'airbyte/source-google-ads:3.7.4',        category: 'marketing' },
+  /* analytics */
+  'Google Analytics': { image: 'airbyte/source-google-analytics-data-api:2.6.0', category: 'analytics' },
+  'Mixpanel':       { image: 'airbyte/source-mixpanel:2.5.0',          category: 'analytics' },
+  'Amplitude':      { image: 'airbyte/source-amplitude:0.4.6',         category: 'analytics' },
+  'Segment':        { image: 'airbyte/source-segment:0.1.0',           category: 'analytics' },
+  /* commerce */
+  'Shopify':        { image: 'airbyte/source-shopify:2.4.10',          category: 'ecommerce' },
+  'WooCommerce':    { image: 'airbyte/source-woocommerce:0.4.0',       category: 'ecommerce' },
+  'Square':         { image: 'airbyte/source-square:1.6.6',            category: 'ecommerce' },
+  /* dev / ops */
+  'GitHub':         { image: 'airbyte/source-github:1.7.3',            category: 'dev' },
+  'GitLab':         { image: 'airbyte/source-gitlab:3.0.4',            category: 'dev' },
+  'Jira':           { image: 'airbyte/source-jira:1.7.5',              category: 'dev' },
+  'Linear':         { image: 'airbyte/source-linear:0.4.0',            category: 'dev' },
+  /* comms */
+  'Slack':          { image: 'airbyte/source-slack:1.4.0',             category: 'comms' },
+  'Notion':         { image: 'airbyte/source-notion:2.2.6',            category: 'comms' },
+  'Zendesk':        { image: 'airbyte/source-zendesk-support:4.7.4',   category: 'comms' },
+  /* dev sample */
+  'Faker (test)':   { image: 'airbyte/source-faker:6.2.6',             category: 'sample' },
+};
+function airbyteCategoryColor(cat) {
+  return ({database:'#5b6ef5',payments:'#34d399',crm:'#fbbf24',marketing:'#f87171',
+          analytics:'#22d3ee',ecommerce:'#a78bfa',dev:'#94a3b8',comms:'#fb7185',
+          sample:'#94a3b8'})[cat] || '#94a3b8';
+}
+
 
 /* ═══════════════════════════════════════════════════
    PREFERENCES

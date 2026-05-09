@@ -60,6 +60,7 @@ PARQUET_PLUGIN = $(LIBDIR)/parquet_connector.so
 JSONHTTP_PLUGIN= $(LIBDIR)/json_http_connector.so
 S3_PLUGIN      = $(LIBDIR)/s3_connector.so
 KAFKA_PLUGIN   = $(LIBDIR)/kafka_connector.so
+AIRBYTE_PLUGIN = $(LIBDIR)/airbyte_connector.so
 
 # Detect librdkafka
 _RDKAFKA_LOCAL := $(shell test -d /usr/local/opt/librdkafka/include && echo /usr/local/opt/librdkafka)
@@ -93,7 +94,7 @@ endif
         test-integration test-sql test-all bench
 
 # Base targets always built
-_ALL_TARGETS = dirs $(GATEWAY) $(STORAGE_NODE) $(MCP_SERVER) $(CSV_PLUGIN) $(PARQUET_PLUGIN) $(JSONHTTP_PLUGIN) $(S3_PLUGIN)
+_ALL_TARGETS = dirs $(GATEWAY) $(STORAGE_NODE) $(MCP_SERVER) $(CSV_PLUGIN) $(PARQUET_PLUGIN) $(JSONHTTP_PLUGIN) $(S3_PLUGIN) $(AIRBYTE_PLUGIN)
 ifeq ($(HAS_PQ),yes)
   _ALL_TARGETS += $(PG_PLUGIN)
 endif
@@ -118,7 +119,8 @@ dirs:
 	           $(OUTDIR)/lib/auth $(OUTDIR)/lib/matview $(OUTDIR)/lib/cluster \
 	           $(OUTDIR)/src/gateway $(OUTDIR)/src/storage_node $(OUTDIR)/src/mcp_server \
 	           $(OUTDIR)/lib/connector/plugins/s3 \
-	           $(OUTDIR)/lib/connector/plugins/kafka
+	           $(OUTDIR)/lib/connector/plugins/kafka \
+	           $(OUTDIR)/lib/connector/plugins/airbyte
 
 # compile rule
 $(OUTDIR)/%.o: %.c
@@ -201,6 +203,17 @@ $(KAFKA_PLUGIN): lib/connector/plugins/kafka/kafka_connector.c \
                  $(OUTDIR)/lib/core/json.o
 	@echo "  SO  $@"
 	@$(CC) $(CFLAGS) $(KAFKACFLAGS) -shared -fPIC $^ -o $@ $(LDFLAGS) $(KAFKALDFLAGS) \
+	    $(if $(filter Darwin,$(shell uname)),-undefined dynamic_lookup,)
+
+# Airbyte runner — universal connector that shells out to docker/podman
+# Runs any whitelisted airbyte/source-* image. No external deps beyond core.
+$(AIRBYTE_PLUGIN): lib/connector/plugins/airbyte/airbyte_runner.c \
+                   $(OUTDIR)/lib/core/arena.o \
+                   $(OUTDIR)/lib/storage/storage.o \
+                   $(OUTDIR)/lib/core/log.o \
+                   $(OUTDIR)/lib/core/json.o
+	@echo "  SO  $@"
+	@$(CC) $(CFLAGS) -shared -fPIC $^ -o $@ $(LDFLAGS) \
 	    $(if $(filter Darwin,$(shell uname)),-undefined dynamic_lookup,)
 
 # ── Unit tests ──
