@@ -92,7 +92,7 @@ else
 endif
 
 .PHONY: all clean run test dirs release debug \
-        test-integration test-sql test-all bench
+        test-integration test-sql test-all bench flight
 
 # Base targets always built
 _ALL_TARGETS = dirs $(GATEWAY) $(STORAGE_NODE) $(MCP_SERVER) $(CSV_PLUGIN) $(PARQUET_PLUGIN) $(JSONHTTP_PLUGIN) $(S3_PLUGIN) $(AIRBYTE_PLUGIN)
@@ -277,13 +277,38 @@ bench: dirs all $(BENCH_BINS)
 # ── All tests combined ──
 test-all: test test-sql test-integration
 
+# ── Arrow Flight server (Step 2) — optional C++ bridge ──
+# Built separately because it pulls in Arrow C++ + gRPC + nlohmann_json.
+# Not part of `make all` to keep the base build dependency-free.
+#
+# Install deps first:
+#   macOS:  brew install apache-arrow grpc nlohmann-json
+#   Debian: apt install libarrow-flight-dev libgrpc++-dev nlohmann-json3-dev libcurl4-openssl-dev cmake
+#
+# Then:    make flight
+# Output:  build/release/bin/dfo_flight_server
+FLIGHT_BIN     = $(BINDIR)/dfo_flight_server
+FLIGHT_BUILD   = src/flight_server/build
+
+flight: dirs
+	@if ! command -v cmake >/dev/null 2>&1; then \
+		echo "ERROR: cmake not found — install with brew/apt and retry"; exit 1; \
+	fi
+	@mkdir -p $(FLIGHT_BUILD)
+	@cd $(FLIGHT_BUILD) && cmake -DCMAKE_BUILD_TYPE=Release .. && cmake --build . -j 2>&1
+	@cp $(FLIGHT_BUILD)/dfo_flight_server $(FLIGHT_BIN)
+	@echo "  LD  $(FLIGHT_BIN)"
+
+flight-clean:
+	@rm -rf $(FLIGHT_BUILD)
+
 # ── Run ──
 run: all
 	@mkdir -p data
 	./$(GATEWAY) -p 8080
 
 clean:
-	rm -rf build/
+	rm -rf build/ src/flight_server/build/
 
 # ── Install UI (copy to served dir) ──
 install-ui:
