@@ -14,12 +14,16 @@
  *     DataRow (D)* → CommandComplete (C) → ReadyForQuery (Z)
  *   • Termination (X) and clean shutdown
  *
- * What's NOT implemented yet (tracked in docs/POSTGRES_WIRE.md):
- *   • Extended Query protocol (Parse/Bind/Execute) — Week 2
- *   • pg_catalog / information_schema emulation — Week 3
- *   • SCRAM-SHA-256 / md5 auth — Week 4 (cleartext is fine over loopback)
- *   • SSL/TLS termination — Week 4
- *   • COPY, NOTIFY/LISTEN, prepared statements
+ * Week 4 added: Extended Query (Parse/Bind/Describe/Execute/Close/Sync/
+ * Flush). Internally it lowers to Simple Query: $1..$N placeholders are
+ * substituted with bound parameter values (text format only) and the
+ * resulting SQL goes to the same `query` callback as Simple Query.
+ *
+ * What's still NOT implemented (tracked in docs/POSTGRES_WIRE.md):
+ *   • SCRAM-SHA-256 / md5 auth (cleartext is fine over loopback / VPN)
+ *   • SSL/TLS termination
+ *   • COPY, NOTIFY/LISTEN, two-phase commit
+ *   • Binary parameter format codes (text format only)
  *
  * Design: the wire-protocol layer here is decoupled from SQL execution.
  * Callers register a `query` callback that does whatever they want with

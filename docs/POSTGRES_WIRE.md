@@ -101,9 +101,8 @@ Week 3 adds two things that make BI tools usable:
 | 2 ✓   | Real qengine integration via `api_pg_execute` — Simple Query path    |
 | 3 ✓   | `pg_catalog` + `information_schema` emulation → DBeaver / `\dt` work |
 | 3 ✓   | Type-OID inference — int8 / float8 / bool from cell values           |
-| 4     | SCRAM-SHA-256 auth + TLS termination                                 |
-| 4     | Extended Query: Parse / Bind / Execute (psycopg parameter binding)   |
-| 4     | dbt-postgres / Tableau / Power BI compat polish                      |
+| 4 ✓   | Extended Query: Parse / Bind / Describe / Execute / Close / Sync /  Flush — **psycopg2 / JDBC / dbt-postgres now work** |
+| Later | SCRAM-SHA-256 auth, TLS termination, BI compat polish                |
 
 ## Type mapping (Week 3 — per-column inference)
 
@@ -168,12 +167,48 @@ get.
 The schema is always `public`; the catalog is the database name from the
 client's startup packet.
 
-## Known limitations (Week 3 — don't file bugs for these)
+## Extended Query (Week 4)
 
-- **No Extended Query protocol** (Parse/Bind/Execute). Parameter binding
-  via psycopg's `cur.execute(sql, params)` falls back to in-driver
-  string substitution and works for most cases. Server-side prepared
-  statements: Week 4.
+The Extended Query protocol is now wired. psycopg2 / JDBC / asyncpg /
+dbt-postgres / DBeaver all use it for parameterized queries.
+
+```python
+import psycopg2
+c = psycopg2.connect("host=localhost port=5432 user=admin password=admin dbname=dataflow")
+cur = c.cursor()
+cur.execute("SELECT name FROM users WHERE age > %s AND age < %s", (28, 40))
+print(cur.fetchall())   # ← real Extended Query: Parse + Bind + Execute
+```
+
+How it lowers internally: when the client sends Parse → Bind → Describe
+→ Execute, the wire layer substitutes `$1..$N` into the prepared SQL
+with the bound values (text format only) and hands the resulting plain
+SQL to the same `query` callback Simple Query uses. This means:
+
+- Numeric parameters are inlined as raw digits.
+- Text parameters are wrapped in `'…'` with embedded `'` doubled per
+  SQL standard.
+- `NULL` parameters become the SQL keyword `NULL`.
+- Parameter type OIDs from Parse are **ignored** — substitution is
+  format-driven, not type-driven.
+
+Trade-off: server-side prepared statements aren't real (the engine
+re-parses each time), so there's no plan-cache benefit. For most BI
+workloads that's fine — what mattered was the protocol surface.
+
+Per-connection limits: 32 prepared statements + 32 portals.
+
+## Known limitations (Week 4 — don't file bugs for these)
+- **No SCRAM / md5 auth, no TLS.** Cleartext over plaintext TCP. Fine
+  for loopback / VPN; for public exposure, terminate TLS upstream
+  (stunnel, nginx stream, envoy).
+- **No binary parameter format.** Bind rejects format code 1. psycopg /
+  JDBC / dbt all default to text format, so rarely matters.
+- **No real prepared-statement plan caching.** Parse stores the SQL
+  string verbatim; Execute re-parses on every call after parameter
+  substitution. Per-connection limit: 32 prepared statements + 32 portals.
+- **Describe replies `NoData`.** Drivers tolerate this and rely on the
+  RowDescription sent during Execute.
 - **BEGIN/COMMIT/ROLLBACK are no-ops at the engine level.** They emit
   the right protocol tags so psql / DBeaver are happy, but the
   transaction manager is not threaded through. Use the JSON

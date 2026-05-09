@@ -42,6 +42,26 @@ struct PgWireServer {
 };
 
 /* ── Per-connection state ─────────────────────────────────────── */
+
+/* Extended Query: prepared statements + portals.
+ * `name` is "" for unnamed (the unnamed slots are at index 0). */
+#define PG_MAX_PREPARED 32
+#define PG_MAX_PORTALS  32
+
+typedef struct {
+    char  name[64];
+    char *sql;          /* heap-owned (free on Close / overwrite) */
+    int   in_use;
+} PgPrepared;
+
+typedef struct {
+    char         name[64];
+    PgPrepared  *prep;          /* points into PgConn::prepared */
+    int          n_params;
+    char       **values;        /* heap; values[i]=NULL → SQL NULL */
+    int          in_use;
+} PgPortal;
+
 struct PgConn {
     int               fd;
     PgWireServer     *srv;
@@ -51,6 +71,13 @@ struct PgConn {
     /* Cancel keys (we just emit zeroes; we don't yet support cancel) */
     int32_t           proc_id;
     int32_t           secret_key;
+
+    /* Extended Query state — Week 4 */
+    PgPrepared        prepared[PG_MAX_PREPARED];
+    PgPortal          portals [PG_MAX_PORTALS];
+    /* When something fails inside an extended-query batch, we set this
+     * and skip subsequent P/B/D/E messages until Sync arrives. */
+    int               batch_error;
 };
 
 /* ── I/O helpers ──────────────────────────────────────────────── */
@@ -283,6 +310,376 @@ static int handle_password(PgConn *c) {
     return rc;
 }
 
+/* ── Extended Query — wire emitters ──────────────────────────── */
+static int send_simple_tag(int fd, uint8_t type) {
+    /* Empty-body messages: ParseComplete (1), BindComplete (2),
+     * CloseComplete (3), NoData (n), EmptyQueryResponse (I). */
+    MsgBuf m; mb_init(&m);
+    return mb_send(fd, &m, type);
+}
+
+/* ── Extended Query — body parsing helpers ───────────────────── */
+
+/* Read a NUL-terminated cstring from `buf`. *off advanced past the NUL.
+ * Returns NULL on overflow. */
+static const char *xq_cstr(const uint8_t *buf, size_t len, size_t *off) {
+    if (*off >= len) return NULL;
+    const char *s = (const char *)(buf + *off);
+    while (*off < len && buf[*off] != 0) (*off)++;
+    if (*off >= len) return NULL;
+    (*off)++;            /* consume NUL */
+    return s;
+}
+
+static int xq_int16(const uint8_t *buf, size_t len, size_t *off, int16_t *out) {
+    if (*off + 2 > len) return -1;
+    *out = (int16_t)((buf[*off] << 8) | buf[*off + 1]);
+    *off += 2;
+    return 0;
+}
+
+static int xq_int32(const uint8_t *buf, size_t len, size_t *off, int32_t *out) {
+    if (*off + 4 > len) return -1;
+    *out = (int32_t)be32(buf + *off);
+    *off += 4;
+    return 0;
+}
+
+/* ── Extended Query — slot helpers ───────────────────────────── */
+
+static PgPrepared *xq_find_or_alloc_prepared(PgConn *c, const char *name) {
+    /* Replace existing slot with same name OR find first empty one. */
+    for (int i = 0; i < PG_MAX_PREPARED; i++) {
+        if (c->prepared[i].in_use && strcmp(c->prepared[i].name, name) == 0)
+            return &c->prepared[i];
+    }
+    for (int i = 0; i < PG_MAX_PREPARED; i++) {
+        if (!c->prepared[i].in_use) return &c->prepared[i];
+    }
+    return NULL;
+}
+
+static PgPrepared *xq_find_prepared(PgConn *c, const char *name) {
+    for (int i = 0; i < PG_MAX_PREPARED; i++) {
+        if (c->prepared[i].in_use && strcmp(c->prepared[i].name, name) == 0)
+            return &c->prepared[i];
+    }
+    return NULL;
+}
+
+static void xq_prepared_release(PgPrepared *p) {
+    if (!p->in_use) return;
+    free(p->sql); p->sql = NULL;
+    p->name[0] = 0;
+    p->in_use = 0;
+}
+
+static PgPortal *xq_find_or_alloc_portal(PgConn *c, const char *name) {
+    for (int i = 0; i < PG_MAX_PORTALS; i++) {
+        if (c->portals[i].in_use && strcmp(c->portals[i].name, name) == 0)
+            return &c->portals[i];
+    }
+    for (int i = 0; i < PG_MAX_PORTALS; i++) {
+        if (!c->portals[i].in_use) return &c->portals[i];
+    }
+    return NULL;
+}
+
+static PgPortal *xq_find_portal(PgConn *c, const char *name) {
+    for (int i = 0; i < PG_MAX_PORTALS; i++) {
+        if (c->portals[i].in_use && strcmp(c->portals[i].name, name) == 0)
+            return &c->portals[i];
+    }
+    return NULL;
+}
+
+static void xq_portal_release(PgPortal *p) {
+    if (!p->in_use) return;
+    if (p->values) {
+        for (int i = 0; i < p->n_params; i++) free(p->values[i]);
+        free(p->values);
+        p->values = NULL;
+    }
+    p->n_params = 0;
+    p->prep = NULL;
+    p->name[0] = 0;
+    p->in_use = 0;
+}
+
+/* ── Extended Query — parameter substitution ─────────────────── */
+
+/* Decide whether a string-typed value should be emitted as raw SQL
+ * (numeric / NULL / booleans) or single-quoted text. */
+static int xq_value_is_numeric(const char *v) {
+    if (!v || !*v) return 0;
+    const char *p = v;
+    if (*p == '-' || *p == '+') p++;
+    int has_digit = 0;
+    while (*p >= '0' && *p <= '9') { p++; has_digit = 1; }
+    if (has_digit && *p == '\0') return 1;
+    if (has_digit && *p == '.') {
+        p++;
+        while (*p >= '0' && *p <= '9') p++;
+        if (*p == 'e' || *p == 'E') {
+            p++; if (*p == '-' || *p == '+') p++;
+            while (*p >= '0' && *p <= '9') p++;
+        }
+        if (*p == '\0') return 1;
+    }
+    return 0;
+}
+
+/* Append a single bound value to `out` as SQL syntax, advancing *off.
+ * Output buffer is sized at the call site to be safely larger than
+ * sql_len + sum_of_value_lens * 2 + small overhead. */
+static void xq_append_value(char *out, size_t cap, size_t *off,
+                            const char *v) {
+    if (!v) {                                        /* SQL NULL */
+        const char *n = "NULL";
+        size_t nl = 4;
+        if (*off + nl < cap) { memcpy(out + *off, n, nl); *off += nl; }
+        return;
+    }
+    if (xq_value_is_numeric(v) ||
+        !strcasecmp(v, "true") || !strcasecmp(v, "false")) {
+        size_t vl = strlen(v);
+        if (*off + vl < cap) { memcpy(out + *off, v, vl); *off += vl; }
+        return;
+    }
+    /* Quote as text literal, doubling embedded ' per SQL standard. */
+    if (*off + 1 < cap) out[(*off)++] = '\'';
+    for (const char *p = v; *p && *off + 2 < cap; p++) {
+        if (*p == '\'') { out[(*off)++] = '\''; out[(*off)++] = '\''; }
+        else            { out[(*off)++] = *p; }
+    }
+    if (*off + 1 < cap) out[(*off)++] = '\'';
+}
+
+/* Substitute $1..$N in `sql` with the bound values. Numbers are
+ * inlined raw, strings get single-quoted with '' escape, NULLs are
+ * emitted as the keyword NULL. Heap-allocates the result. */
+static char *xq_substitute_params(const char *sql, char **values, int n_params) {
+    size_t sql_len = strlen(sql);
+    size_t cap = sql_len + 64;
+    for (int i = 0; i < n_params; i++) {
+        if (values[i]) cap += strlen(values[i]) * 2 + 4;
+        else           cap += 6;                     /* "NULL" */
+    }
+    char  *out = malloc(cap);
+    if (!out) return NULL;
+    size_t off = 0;
+    for (size_t i = 0; i < sql_len; ) {
+        if (sql[i] == '$' && sql[i+1] >= '0' && sql[i+1] <= '9') {
+            i++;
+            int idx = 0;
+            while (sql[i] >= '0' && sql[i] <= '9') { idx = idx*10 + (sql[i] - '0'); i++; }
+            if (idx >= 1 && idx <= n_params) {
+                xq_append_value(out, cap, &off, values[idx - 1]);
+            } else {
+                /* Out of range: emit NULL — defensive. */
+                xq_append_value(out, cap, &off, NULL);
+            }
+            continue;
+        }
+        if (off + 1 < cap) out[off++] = sql[i];
+        i++;
+    }
+    out[off] = '\0';
+    return out;
+}
+
+/* ── Extended Query — message handlers ───────────────────────── */
+
+static void handle_parse(PgConn *c, const uint8_t *body, size_t len) {
+    size_t off = 0;
+    const char *name = xq_cstr(body, len, &off);
+    const char *sql  = xq_cstr(body, len, &off);
+    if (!name || !sql) {
+        pgwire_send_error(c, "08P01", "Parse: malformed body");
+        c->batch_error = 1; return;
+    }
+    /* Skip parameter type OIDs (we don't use them; substitution is text-mode) */
+    int16_t n_param_types = 0;
+    if (xq_int16(body, len, &off, &n_param_types) < 0) {
+        pgwire_send_error(c, "08P01", "Parse: missing param-type count");
+        c->batch_error = 1; return;
+    }
+    off += (size_t)n_param_types * 4;                /* ignore type oids */
+
+    PgPrepared *p = xq_find_or_alloc_prepared(c, name);
+    if (!p) {
+        pgwire_send_error(c, "53000", "too many prepared statements");
+        c->batch_error = 1; return;
+    }
+    if (p->in_use) xq_prepared_release(p);
+    strncpy(p->name, name, sizeof(p->name) - 1);
+    p->name[sizeof(p->name) - 1] = '\0';
+    p->sql = strdup(sql);
+    p->in_use = 1;
+    send_simple_tag(c->fd, '1');                     /* ParseComplete */
+}
+
+static void handle_bind(PgConn *c, const uint8_t *body, size_t len) {
+    size_t off = 0;
+    const char *portal_name = xq_cstr(body, len, &off);
+    const char *stmt_name   = xq_cstr(body, len, &off);
+    if (!portal_name || !stmt_name) {
+        pgwire_send_error(c, "08P01", "Bind: malformed cstrings");
+        c->batch_error = 1; return;
+    }
+
+    int16_t n_fmt = 0;
+    if (xq_int16(body, len, &off, &n_fmt) < 0) {
+        pgwire_send_error(c, "08P01", "Bind: missing format-code count");
+        c->batch_error = 1; return;
+    }
+    /* Reject any non-zero (binary) format code — Week 4 supports text only.
+     * `n_fmt`==0 means "all text"; ==1 means "all values use this code";
+     * == n_params means per-value. */
+    int all_text = (n_fmt == 0);
+    int16_t default_fmt = 0;
+    int    *param_fmts = NULL;
+    if (n_fmt == 1) {
+        if (xq_int16(body, len, &off, &default_fmt) < 0) goto bad;
+    } else if (n_fmt > 1) {
+        param_fmts = malloc((size_t)n_fmt * sizeof(int));
+        if (!param_fmts) goto bad;
+        for (int i = 0; i < n_fmt; i++) {
+            int16_t v = 0; if (xq_int16(body, len, &off, &v) < 0) { free(param_fmts); goto bad; }
+            param_fmts[i] = v;
+        }
+    }
+
+    int16_t n_params = 0;
+    if (xq_int16(body, len, &off, &n_params) < 0) { free(param_fmts); goto bad; }
+
+    char **values = NULL;
+    if (n_params > 0) {
+        values = calloc((size_t)n_params, sizeof(char *));
+        if (!values) { free(param_fmts); goto bad; }
+        for (int i = 0; i < n_params; i++) {
+            int32_t L = 0;
+            if (xq_int32(body, len, &off, &L) < 0) { goto values_bad; }
+            if (L < 0) { values[i] = NULL; continue; }
+            if ((size_t)off + (size_t)L > len) goto values_bad;
+            int fmt = all_text ? 0
+                    : (n_fmt == 1 ? default_fmt
+                                  : (i < n_fmt ? param_fmts[i] : 0));
+            if (fmt != 0) {
+                pgwire_send_error(c, "0A000",
+                    "binary parameter format not supported (use text format)");
+                /* free what we already alloc'd */
+                for (int j = 0; j < i; j++) free(values[j]);
+                free(values); free(param_fmts);
+                c->batch_error = 1;
+                return;
+            }
+            values[i] = malloc((size_t)L + 1);
+            if (!values[i]) goto values_bad;
+            memcpy(values[i], body + off, (size_t)L);
+            values[i][L] = '\0';
+            off += (size_t)L;
+        }
+    }
+    free(param_fmts);
+
+    /* Skip result format codes — we always emit text. */
+    int16_t n_res_fmt = 0;
+    xq_int16(body, len, &off, &n_res_fmt);
+    off += (size_t)n_res_fmt * 2;
+
+    PgPrepared *prep = xq_find_prepared(c, stmt_name);
+    if (!prep) {
+        pgwire_send_error(c, "26000", "Bind: prepared statement not found");
+        for (int i = 0; i < n_params; i++) if (values) free(values[i]);
+        free(values);
+        c->batch_error = 1; return;
+    }
+    PgPortal *po = xq_find_or_alloc_portal(c, portal_name);
+    if (!po) {
+        pgwire_send_error(c, "53000", "too many portals");
+        for (int i = 0; i < n_params; i++) if (values) free(values[i]);
+        free(values);
+        c->batch_error = 1; return;
+    }
+    if (po->in_use) xq_portal_release(po);
+    strncpy(po->name, portal_name, sizeof(po->name) - 1);
+    po->name[sizeof(po->name) - 1] = '\0';
+    po->prep = prep;
+    po->n_params = n_params;
+    po->values = values;
+    po->in_use = 1;
+    send_simple_tag(c->fd, '2');                     /* BindComplete */
+    return;
+
+values_bad:
+    if (values) {
+        for (int i = 0; i < n_params; i++) free(values[i]);
+        free(values);
+    }
+    free(param_fmts);
+bad:
+    pgwire_send_error(c, "08P01", "Bind: malformed body");
+    c->batch_error = 1;
+}
+
+static void handle_describe(PgConn *c, const uint8_t *body, size_t len) {
+    /* We don't know the result schema until we run the query — emit
+     * NoData and let Execute send the actual RowDescription. Most Postgres
+     * clients tolerate this; it costs them one extra round-trip if they
+     * relied on Describe to plan. */
+    if (len < 1) { pgwire_send_error(c, "08P01", "Describe: empty body"); c->batch_error = 1; return; }
+    /* body[0] = 'S' (statement) or 'P' (portal); name follows; we don't read it */
+    send_simple_tag(c->fd, 'n');                     /* NoData */
+}
+
+static void handle_execute(PgConn *c, const uint8_t *body, size_t len) {
+    size_t off = 0;
+    const char *portal_name = xq_cstr(body, len, &off);
+    int32_t max_rows = 0;
+    if (!portal_name || xq_int32(body, len, &off, &max_rows) < 0) {
+        pgwire_send_error(c, "08P01", "Execute: malformed body");
+        c->batch_error = 1; return;
+    }
+    (void)max_rows;                                   /* we don't paginate yet */
+
+    PgPortal *po = xq_find_portal(c, portal_name);
+    if (!po) {
+        pgwire_send_error(c, "26000", "Execute: portal not found");
+        c->batch_error = 1; return;
+    }
+    if (!po->prep || !po->prep->sql) {
+        pgwire_send_error(c, "26000", "Execute: portal has no statement");
+        c->batch_error = 1; return;
+    }
+
+    char *final_sql = (po->n_params > 0)
+        ? xq_substitute_params(po->prep->sql, po->values, po->n_params)
+        : strdup(po->prep->sql);
+    if (!final_sql) {
+        pgwire_send_error(c, "53200", "out of memory");
+        c->batch_error = 1; return;
+    }
+    if (c->srv->cbs.query) c->srv->cbs.query(c, final_sql, c->srv->ud);
+    free(final_sql);
+}
+
+static void handle_close(PgConn *c, const uint8_t *body, size_t len) {
+    if (len < 1) { send_simple_tag(c->fd, '3'); return; }
+    char kind = (char)body[0];
+    size_t off = 1;
+    const char *name = xq_cstr(body, len, &off);
+    if (!name) name = "";
+    if (kind == 'S') {
+        PgPrepared *p = xq_find_prepared(c, name);
+        if (p) xq_prepared_release(p);
+    } else if (kind == 'P') {
+        PgPortal *p = xq_find_portal(c, name);
+        if (p) xq_portal_release(p);
+    }
+    send_simple_tag(c->fd, '3');                     /* CloseComplete */
+}
+
 static int run_query_loop(PgConn *c) {
     while (c->srv->running) {
         uint8_t hdr[5];
@@ -297,7 +694,7 @@ static int run_query_loop(PgConn *c) {
 
         switch (type) {
             case 'Q': {
-                /* Query: cstring */
+                /* Simple Query: cstring */
                 const char *sql = body_len ? (const char *)body : "";
                 if (c->srv->cbs.query) {
                     c->srv->cbs.query(c, sql, c->srv->ud);
@@ -307,15 +704,24 @@ static int run_query_loop(PgConn *c) {
                 send_ready_for_query(c->fd, 'I');
                 break;
             }
-            case 'X':                       /* Terminate */
+            /* ── Extended Query batch (Week 4) ── */
+            case 'P': if (!c->batch_error) handle_parse   (c, body, body_len); break;
+            case 'B': if (!c->batch_error) handle_bind    (c, body, body_len); break;
+            case 'D': if (!c->batch_error) handle_describe(c, body, body_len); break;
+            case 'E': if (!c->batch_error) handle_execute (c, body, body_len); break;
+            case 'C': if (!c->batch_error) handle_close   (c, body, body_len); break;
+            case 'S':                                        /* Sync */
+                send_ready_for_query(c->fd, c->batch_error ? 'E' : 'I');
+                c->batch_error = 0;
+                break;
+            case 'H':                                        /* Flush — we already flush */
+                break;
+            case 'X':                                        /* Terminate */
                 free(body);
                 return 0;
-            case 'P': case 'B': case 'E': case 'D':
-            case 'C': case 'S': case 'H': case 'F': case 'd': case 'f':
-                /* Extended-query / COPY messages — Week 2/4 territory.
-                 * Send a clear error and continue; psql falls back gracefully. */
-                pgwire_send_error(c, "0A000",
-                    "extended query / COPY not yet implemented (Week 2/4)");
+            case 'F': case 'd': case 'f':
+                /* FunctionCall / CopyData / CopyFail — not supported */
+                pgwire_send_error(c, "0A000", "FunctionCall / COPY not supported");
                 send_ready_for_query(c->fd, 'I');
                 break;
             default:
@@ -372,6 +778,9 @@ static void *connection_thread(void *arg) {
     run_query_loop(c);
 
 done:
+    /* Free Extended Query state */
+    for (int i = 0; i < PG_MAX_PREPARED; i++) xq_prepared_release(&c->prepared[i]);
+    for (int i = 0; i < PG_MAX_PORTALS;  i++) xq_portal_release  (&c->portals [i]);
     close(c->fd);
     LOG_INFO("pgwire: client disconnected");
     free(c);
