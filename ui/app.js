@@ -3176,6 +3176,106 @@ async function loadSettings() {
   }
   loadApiKeys();
   loadClusterStatus();
+  renderConnectionsPanel();
+}
+
+/* ── External protocol connections panel ────────────────────────
+ * Lists the four protocols DataFlow OS exposes: HTTP REST, Arrow
+ * Flight (gRPC), PostgreSQL wire, MCP (stdio). Connection strings
+ * are templated against the current location.host. The actual
+ * runtime status of each (whether the pgwire / Flight / MCP
+ * server is started) isn't exposed by the gateway today, so we
+ * present them as documented endpoints with copy-to-clipboard. */
+function _connectionCard(opts) {
+  const { icon, title, status, body, docs } = opts;
+  return `<div class="settings-row" style="display:block;padding:.75rem 0;border-bottom:1px solid var(--border)">
+    <div style="display:flex;align-items:center;gap:.5rem;margin-bottom:.5rem">
+      <span style="font-size:1.2rem">${icon}</span>
+      <strong>${title}</strong>
+      ${status ? `<span class="badge badge-ok" style="font-size:.65rem">${status}</span>` : ''}
+      ${docs ? `<a href="${docs}" target="_blank" style="margin-left:auto;font-size:.7rem;color:var(--muted)">docs ↗</a>` : ''}
+    </div>
+    ${body}
+  </div>`;
+}
+
+function _copyableLine(label, code) {
+  const id = 'cp_' + Math.random().toString(36).slice(2, 9);
+  return `<div style="display:flex;align-items:center;gap:.4rem;margin:.25rem 0;font-size:.75rem">
+    <span style="min-width:90px;color:var(--muted)">${label}</span>
+    <code id="${id}" style="flex:1;background:var(--surface2);padding:.2rem .4rem;border-radius:3px;overflow:auto;white-space:pre-wrap;word-break:break-all">${escHtml(code)}</code>
+    <button class="btn btn-sm" onclick="navigator.clipboard.writeText(document.getElementById('${id}').textContent);showToast('Скопировано','ok')">⧉</button>
+  </div>`;
+}
+
+function renderConnectionsPanel() {
+  const el = document.getElementById('settings-connections');
+  if (!el) return;
+  const h = location.hostname || 'localhost';
+  const port = location.port || '8080';
+  const base = `${location.protocol}//${h}:${port}`;
+
+  const cards = [];
+
+  /* 1. HTTP REST */
+  cards.push(_connectionCard({
+    icon: '🌐',
+    title: 'HTTP REST API',
+    status: 'always on',
+    body:
+      _copyableLine('Base URL',  base) +
+      _copyableLine('curl test', `curl -X POST ${base}/api/auth/token -H 'Content-Type: application/json' -d '{"username":"admin","password":"admin"}'`) +
+      `<div style="font-size:.7rem;color:var(--muted);margin-top:.3rem">JSON ввод/вывод. Auth: JWT через POST /api/auth/token. Используется UI и SDK.</div>`,
+    docs: 'docs/API.md',
+  }));
+
+  /* 2. PostgreSQL wire */
+  cards.push(_connectionCard({
+    icon: '🐘',
+    title: 'PostgreSQL wire-protocol',
+    status: 'opt-in (pgwire_port в config)',
+    body:
+      _copyableLine('psql',  `PGPASSWORD=admin psql -h ${h} -p 5432 -U admin -d dataflow`) +
+      _copyableLine('psycopg2', `psycopg2.connect("host=${h} port=5432 user=admin password=admin dbname=dataflow")`) +
+      _copyableLine('JDBC', `jdbc:postgresql://${h}:5432/dataflow?user=admin&password=admin`) +
+      `<div style="font-size:.7rem;color:var(--muted);margin-top:.3rem">Включи в config: <code>"pgwire_enabled":1, "pgwire_port":5432</code>. Поддержано: Simple+Extended Query, pg_catalog, type inference. БЕЗ TLS — для loopback/VPN.</div>`,
+    docs: 'docs/POSTGRES_WIRE.md',
+  }));
+
+  /* 3. Arrow Flight */
+  cards.push(_connectionCard({
+    icon: '✈️',
+    title: 'Apache Arrow Flight (gRPC)',
+    status: 'отдельный бинарь dfo_flight_server',
+    body:
+      _copyableLine('grpc URL', `grpc://${h}:8815`) +
+      _copyableLine('PyArrow', `pyarrow.flight.FlightClient("grpc://${h}:8815").do_get(pyarrow.flight.Ticket(b"sql:SELECT 1"))`) +
+      _copyableLine('запуск', `dfo_flight_server --gateway ${base} --api-key $TOKEN --port 8815`) +
+      `<div style="font-size:.7rem;color:var(--muted);margin-top:.3rem">Zero-JSON Arrow IPC — ~10× быстрее REST для больших query. Ставится через <code>conda install -c conda-forge libarrow-all</code>, потом <code>make flight</code>.</div>`,
+    docs: 'docs/ARROW_FLIGHT.md',
+  }));
+
+  /* 4. MCP (Model Context Protocol) */
+  cards.push(_connectionCard({
+    icon: '🤖',
+    title: 'MCP (Model Context Protocol)',
+    status: 'для AI-агентов',
+    body:
+      _copyableLine('бинарь', `dfo_mcp_server --gateway ${base} --api-key $TOKEN`) +
+      _copyableLine('Claude Desktop', `~/Library/Application Support/Claude/claude_desktop_config.json`) +
+      `<pre style="background:var(--surface2);padding:.4rem;border-radius:3px;font-size:.7rem;margin:.3rem 0">{
+  "mcpServers": {
+    "dataflow-os": {
+      "command": "dfo_mcp_server",
+      "args": ["--gateway", "${base}", "--api-key", "&lt;JWT&gt;"]
+    }
+  }
+}</pre>` +
+      `<div style="font-size:.7rem;color:var(--muted);margin-top:.3rem">10 tools: query / list_tables / describe_table / ingest_csv / list_pipelines / get_metrics / analyze / + ещё 3. Подключается к Claude Desktop, Cursor, Cline.</div>`,
+    docs: 'docs/MCP.md',
+  }));
+
+  el.innerHTML = cards.join('');
 }
 
 async function settingsDropTable(name) {
