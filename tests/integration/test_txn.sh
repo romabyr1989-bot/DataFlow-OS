@@ -80,23 +80,14 @@ query() {
         -d "{\"sql\":\"$escaped\"}"
 }
 
-# Create table
-RESP=$(query "CREATE TABLE txn_test (id TEXT, name TEXT, score TEXT)")
-HTTP_CODE=$(echo "$RESP" | tail -1)
-check "CREATE TABLE txn_test" "$([ "$HTTP_CODE" = "200" ] && echo 1 || echo 0)"
-
-# INSERT 3 rows
-RESP=$(query "INSERT INTO txn_test VALUES ('1', 'alice', '100')")
-HTTP_CODE=$(echo "$RESP" | tail -1)
-check "INSERT row 1 (alice)" "$([ "$HTTP_CODE" = "200" ] && echo 1 || echo 0)"
-
-RESP=$(query "INSERT INTO txn_test VALUES ('2', 'bob', '200')")
-HTTP_CODE=$(echo "$RESP" | tail -1)
-check "INSERT row 2 (bob)" "$([ "$HTTP_CODE" = "200" ] && echo 1 || echo 0)"
-
-RESP=$(query "INSERT INTO txn_test VALUES ('3', 'carol', '300')")
-HTTP_CODE=$(echo "$RESP" | tail -1)
-check "INSERT row 3 (carol)" "$([ "$HTTP_CODE" = "200" ] && echo 1 || echo 0)"
+# DataFlow OS doesn't support `CREATE TABLE` / `INSERT INTO ... VALUES` —
+# tables are created via the CSV ingest endpoint instead. Bulk-load 3
+# rows in one shot. The table comes alive with the inferred schema.
+HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" -X POST \
+    "$BASE/api/ingest/csv?table=txn_test" \
+    -H "$AUTH" -H 'Content-Type: text/csv' \
+    --data-binary $'id,name,score\n1,alice,100\n2,bob,200\n3,carol,300\n')
+check "ingest 3 rows into txn_test" "$([ "$HTTP_CODE" = "200" ] && echo 1 || echo 0)"
 
 # SELECT all — should see 3 rows
 RESP=$(query "SELECT * FROM txn_test")

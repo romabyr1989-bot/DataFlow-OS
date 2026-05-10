@@ -1093,8 +1093,18 @@ static int load_tbl(Arena *a, const char *tname, const char *alias,
         uint8_t op=(uint8_t)(unsigned char)line[0];
         if (op==WAL_OP_DELETE||op==WAL_OP_UPDATE) continue; /* skip tombstone records */
 
-        /* Compressed batch record (version byte 0x01) */
+        /* Compressed batch record (version byte 0x01).
+         * Skip the entire batch if it's been tombstoned by DML —
+         * the DML walker emits replacement uncompressed CSV records
+         * for survivors, so all rows are still represented elsewhere. */
         if (op == 0x01 && l > 1) {
+            bool batch_dead = false;
+            for (int ti = 0; ti < ntb; ti++) {
+                if (tbs[ti].orig_off == rec_off && tbs[ti].op == WAL_OP_DELETE) {
+                    batch_dead = true; break;
+                }
+            }
+            if (batch_dead) continue;
             CompressedBatch *cb = compressed_batch_deserialize(line+1, (size_t)(l-1), a);
             if (cb) {
                 ColBatch *batch = decompress_batch(cb, a);
@@ -2119,15 +2129,72 @@ static RS *exec_stmt(Arena *a, const Stmt *s, VTReg *vt) {
         pthread_mutex_unlock(&g_app.tables_mu);
         if (!tbl) return NULL;
 
-        /* Scan WAL for matching rows */
+        /* Scan WAL for matching rows.
+         * Important: any DML on a compressed batch needs to (a) tombstone
+         * the batch and (b) re-append survivors as uncompressed CSV. We
+         * defer those writes into a queue and flush AFTER the read scan
+         * finishes — otherwise our own appends extend the file end and
+         * the same fread() loop would then process them again, causing
+         * double-counting and ghost rows. */
+        typedef struct DmlOp { int64_t tombstone_off; char *append_csv; size_t append_len; struct DmlOp *next; } DmlOp;
+        DmlOp *pending_head = NULL, *pending_tail = NULL;
+        #define PENDING_TOMBSTONE(off) do { \
+            DmlOp *_o = arena_calloc(a, sizeof(DmlOp)); _o->tombstone_off = (off); _o->append_csv = NULL; \
+            if (pending_tail) pending_tail->next = _o; else pending_head = _o; pending_tail = _o; } while (0)
+        #define PENDING_APPEND(buf, len) do { \
+            DmlOp *_o = arena_calloc(a, sizeof(DmlOp)); _o->tombstone_off = -1; \
+            _o->append_csv = arena_alloc(a, (size_t)(len) + 1); \
+            memcpy(_o->append_csv, (buf), (size_t)(len)); _o->append_csv[(size_t)(len)] = '\0'; \
+            _o->append_len = (size_t)(len); \
+            if (pending_tail) pending_tail->next = _o; else pending_head = _o; pending_tail = _o; } while (0)
+
         FILE *rf = fopen(wal_path, "rb");
         if (!rf) return NULL;
+        /* Snapshot the WAL size up-front; ignore any bytes appended after */
+        fseek(rf, 0, SEEK_END);
+        int64_t wal_end = ftell(rf);
+        rewind(rf);
+
+        /* Set of already-tombstoned offsets so we don't double-process
+         * batches that a previous DML statement masked. */
+        int dead_cap = 16, ndead = 0;
+        int64_t *dead_offs = arena_alloc(a, (size_t)dead_cap * sizeof(int64_t));
+
+        /* Pre-pass: collect all existing WAL_OP_DELETE tombstones so the
+         * main scan can skip them. (UPDATE-tombstones are also DELETE in
+         * intent — the row is masked.) */
+        {
+            char tbuf[262144];
+            int64_t off = 0;
+            while (off < wal_end) {
+                uint32_t l = 0;
+                if (fread(&l, 1, 4, rf) != 4) break;
+                int64_t this_off = off;
+                off += 4 + (int64_t)l;
+                if (l == 0 || l >= sizeof(tbuf)) { fseek(rf, (long)l, SEEK_CUR); continue; }
+                if (fread(tbuf, 1, l, rf) != l) break;
+                uint8_t top = (uint8_t)tbuf[0];
+                if ((top == WAL_OP_DELETE || top == WAL_OP_UPDATE) && l >= 9) {
+                    int64_t ref = 0;
+                    for (int b = 0; b < 8; b++) ref = (ref << 8) | (uint8_t)tbuf[1 + b];
+                    if (ndead == dead_cap) {
+                        dead_cap *= 2;
+                        int64_t *nb = arena_alloc(a, (size_t)dead_cap * sizeof(int64_t));
+                        memcpy(nb, dead_offs, (size_t)ndead * sizeof(int64_t));
+                        dead_offs = nb;
+                    }
+                    dead_offs[ndead++] = ref;
+                }
+                (void)this_off;
+            }
+            rewind(rf);
+        }
 
         int affected = 0;
         int64_t file_off = 0;
         char line[262144];
 
-        while (1) {
+        while (file_off < wal_end) {
             uint32_t l = 0;
             if (fread(&l, 1, 4, rf) != 4) break;
             int64_t rec_off = file_off;
@@ -2139,6 +2206,122 @@ static RS *exec_stmt(Arena *a, const Stmt *s, VTReg *vt) {
             /* Skip tombstone records */
             uint8_t op = (uint8_t)(unsigned char)line[0];
             if (op == WAL_OP_DELETE || op == WAL_OP_UPDATE) continue;
+
+            /* Skip records that an earlier DML already tombstoned */
+            {
+                bool already_dead = false;
+                for (int di = 0; di < ndead; di++) {
+                    if (dead_offs[di] == rec_off) { already_dead = true; break; }
+                }
+                if (already_dead) continue;
+            }
+
+            /* Compressed batch (version byte 0x01) — release-build format.
+             *
+             * The DML walker can't address individual rows by file offset
+             * inside a compressed batch (a single record packs many rows).
+             * Pragmatic fix: decompress, evaluate WHERE per-row, then if
+             * any matched: tombstone the whole batch + re-append the
+             * survivors (and UPDATE-modified rows) as uncompressed CSV
+             * records. Future SELECTs read the new uncompressed records
+             * normally; the old batch is masked by its tombstone.
+             *
+             * Limitations: not txn-safe (txn_buffer can't yet track batch
+             * tombstones + appended replacements atomically), so we only
+             * apply this in auto-commit. A txn-active path falls through
+             * to the legacy CSV walker below — which won't match anything
+             * inside compressed batches but won't crash either. */
+            if (op == 0x01 && l > 1 && g_txn_current == 0) {
+                CompressedBatch *cb = compressed_batch_deserialize(line + 1, (size_t)(l - 1), a);
+                if (!cb) continue;
+                ColBatch *batch = decompress_batch(cb, a);
+                if (!batch || batch->nrows == 0) continue;
+
+                int rcount = batch->nrows;
+                bool *matched = arena_calloc(a, (size_t)rcount * sizeof(bool));
+                char ***row_cells = arena_alloc(a, (size_t)rcount * sizeof(char **));
+                int batch_affected = 0;
+
+                for (int r = 0; r < rcount; r++) {
+                    char **cells = arena_alloc(a, (size_t)ncols * sizeof(char *));
+                    for (int ci = 0; ci < ncols; ci++) {
+                        if (ci >= batch->ncols) { cells[ci] = (char *)""; continue; }
+                        if (batch->null_bitmap[ci] &&
+                            (batch->null_bitmap[ci][r/8] & (1u << (r%8)))) {
+                            cells[ci] = (char *)"";
+                            continue;
+                        }
+                        ColType t = (batch->schema && ci < batch->schema->ncols)
+                                       ? batch->schema->cols[ci].type : COL_TEXT;
+                        switch (t) {
+                            case COL_INT64:
+                                cells[ci] = arena_sprintf(a, "%lld",
+                                    (long long)((int64_t *)batch->values[ci])[r]); break;
+                            case COL_DOUBLE:
+                                cells[ci] = arena_sprintf(a, "%.10g",
+                                    ((double *)batch->values[ci])[r]); break;
+                            case COL_BOOL:
+                                cells[ci] = (char *)(((int64_t *)batch->values[ci])[r]
+                                                      ? "true" : "false"); break;
+                            default:
+                                cells[ci] = ((char **)batch->values[ci])[r]
+                                              ? ((char **)batch->values[ci])[r] : (char *)"";
+                                break;
+                        }
+                    }
+                    row_cells[r] = cells;
+
+                    bool pass = true;
+                    if (s->dml.where) {
+                        JoinCtx ctx = {0};
+                        ctx.n = 1;
+                        ctx.schemas[0] = sc;
+                        ctx.rows[0] = cells;
+                        ctx.tnames[0] = tname;
+                        ctx.aliases[0] = tname;
+                        Val cond = eval_val(s->dml.where, &ctx, a);
+                        pass = cond.is_null ? false
+                              : cond.is_bool ? cond.b
+                              : cond.is_num ? (cond.num != 0.0)
+                              : (cond.str && *cond.str);
+                    }
+                    if (pass) { matched[r] = true; batch_affected++; }
+                }
+
+                if (batch_affected > 0) {
+                    /* Defer writes: tombstone the batch + queue replacement
+                     * CSV records. Actual WAL writes happen after we close
+                     * the read scan. */
+                    PENDING_TOMBSTONE(rec_off);
+                    for (int r = 0; r < rcount; r++) {
+                        char **out_cells = row_cells[r];
+                        if (matched[r]) {
+                            if (s->type == STMT_DELETE) continue;
+                            /* UPDATE: apply SET */
+                            for (int si = 0; si < s->dml.nset; si++) {
+                                for (int ci = 0; ci < ncols; ci++) {
+                                    if (strcasecmp(sc->cols[ci].name, s->dml.set_cols[si]) == 0) {
+                                        out_cells[ci] = (char *)s->dml.set_vals[si];
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        char csv_buf[262144]; int co = 0;
+                        for (int ci = 0; ci < ncols; ci++) {
+                            if (ci) csv_buf[co++] = ',';
+                            const char *v = out_cells[ci] ? out_cells[ci] : "";
+                            int n = snprintf(csv_buf + co, sizeof(csv_buf) - (size_t)co - 2,
+                                              "%s", v);
+                            if (n > 0) co += n;
+                        }
+                        csv_buf[co++] = '\n';
+                        PENDING_APPEND(csv_buf, co);
+                    }
+                    affected += batch_affected;
+                }
+                continue;
+            }
 
             /* Strip trailing newline */
             size_t rl = strlen(line);
@@ -2212,6 +2395,21 @@ static RS *exec_stmt(Arena *a, const Stmt *s, VTReg *vt) {
             }
         }
         fclose(rf);
+
+        /* Flush all pending DML writes now that we've finished reading */
+        if (pending_head) {
+            pthread_mutex_lock(&g_app.tables_mu);
+            for (DmlOp *op = pending_head; op; op = op->next) {
+                if (op->tombstone_off >= 0) {
+                    table_delete(tbl, op->tombstone_off);
+                } else if (op->append_csv && op->append_len > 0) {
+                    table_wal_append(tbl, op->append_csv, op->append_len);
+                }
+            }
+            pthread_mutex_unlock(&g_app.tables_mu);
+        }
+        #undef PENDING_TOMBSTONE
+        #undef PENDING_APPEND
 
         /* Return result */
         const char *col_key = (s->type == STMT_DELETE) ? "deleted" : "updated";

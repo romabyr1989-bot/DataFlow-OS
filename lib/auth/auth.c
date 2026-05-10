@@ -244,6 +244,12 @@ int auth_check_request(AuthStore *s, const char *jwt_secret, void *req_void, Aut
             if (auth_jwt_verify(jwt_secret, token, claims_out) == 0) {
                 return 0;
             }
+            /* Fallback: clients commonly send API keys as Bearer too.
+             * Recognize the "dfo_" prefix and dispatch to apikey verify. */
+            if (strncmp(token, "dfo_", 4) == 0 &&
+                auth_apikey_verify(s, token, claims_out) == 0) {
+                return 0;
+            }
         } else if (strncasecmp(auth, "ApiKey ", 7) == 0) {
             const char *key = auth + 7;
             if (auth_apikey_verify(s, key, claims_out) == 0) {
