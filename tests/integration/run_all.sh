@@ -9,6 +9,7 @@ TESTS=(
     "$SCRIPT_DIR/test_audit.sh"
     "$SCRIPT_DIR/test_txn.sh"
     "$SCRIPT_DIR/test_replication.sh"
+    "$SCRIPT_DIR/test_python_step.sh"
 )
 
 TOTAL_PASS=0

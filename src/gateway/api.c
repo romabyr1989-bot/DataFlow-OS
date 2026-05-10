@@ -20,6 +20,11 @@
 #include <time.h>
 #include <unistd.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
+#include <signal.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <poll.h>
 #include <math.h>
 
 /* Thread-local: txn_id active during exec_stmt call (0 = auto-commit) */
@@ -3451,6 +3456,266 @@ static int run_connector_step(App *app, Arena *a, PipelineStep *st, char *errbuf
     return total_rows;
 }
 
+/* ── Python step ────────────────────────────────────────────────
+ * Runs `python3 -c <wrapper>` as a subprocess. The wrapper reads
+ * stdin as CSV into a pandas DataFrame called `df`, executes the
+ * user's code, then writes `df` back to stdout as CSV. Caller is
+ * responsible for piping input CSV in and ingesting the result.
+ *
+ * Why subprocess and not embedded CPython:
+ * - keeps gateway's pure-C core free of libpython dependency
+ * - matches the trust model of the existing bash/connector step
+ *   (no sandbox; same uid as gateway)
+ * - lets users freely install pandas/numpy without coordinating
+ *   with gateway lifecycle
+ *
+ * Error handling: on non-zero exit, the script's stderr is captured
+ * into `errbuf`; the step is marked failed and retry semantics apply
+ * normally. */
+static int run_python_step(App *app, Arena *a, PipelineStep *st,
+                           char *errbuf, size_t errsz) {
+    /* 1. Materialize input CSV from transform_sql (or empty if none). */
+    char *input_csv = NULL;
+    size_t input_len = 0;
+    if (st->transform_sql[0]) {
+        Stmt *stmt = sql_parse(a, st->transform_sql, strlen(st->transform_sql));
+        if (!stmt || stmt->error) {
+            snprintf(errbuf, errsz, "python step %s: input SQL parse error: %s",
+                     st->id, stmt && stmt->error ? stmt->error : "null");
+            return -1;
+        }
+        RS *rs = exec_stmt(a, stmt, NULL);
+        if (!rs) {
+            snprintf(errbuf, errsz, "python step %s: input SQL exec failed", st->id);
+            return -1;
+        }
+        /* Build CSV: header + rows */
+        size_t cap = 4096; size_t off = 0;
+        input_csv = arena_alloc(a, cap);
+        #define CSV_RESERVE(n) do { \
+            if (off + (n) + 1 > cap) { \
+                while (off + (n) + 1 > cap) cap *= 2; \
+                char *nb = arena_alloc(a, cap); memcpy(nb, input_csv, off); input_csv = nb; \
+            } } while (0)
+        for (int c = 0; c < rs->ncols; c++) {
+            const char *cn = rs->col_names[c] ? rs->col_names[c] : "";
+            size_t cl = strlen(cn);
+            CSV_RESERVE(cl + 2);
+            if (c) input_csv[off++] = ',';
+            memcpy(input_csv + off, cn, cl); off += cl;
+        }
+        CSV_RESERVE(1); input_csv[off++] = '\n';
+        for (int r = 0; r < rs->nrows; r++) {
+            for (int c = 0; c < rs->ncols; c++) {
+                const char *v = rs->rows[r].cells ? rs->rows[r].cells[c] : "";
+                if (!v) v = "";
+                size_t vl = strlen(v);
+                /* Quote any value with comma/quote/newline */
+                int needs_q = 0;
+                for (size_t i = 0; i < vl; i++)
+                    if (v[i] == ',' || v[i] == '"' || v[i] == '\n') { needs_q = 1; break; }
+                CSV_RESERVE(vl * 2 + 4);
+                if (c) input_csv[off++] = ',';
+                if (needs_q) {
+                    input_csv[off++] = '"';
+                    for (size_t i = 0; i < vl; i++) {
+                        if (v[i] == '"') input_csv[off++] = '"';
+                        input_csv[off++] = v[i];
+                    }
+                    input_csv[off++] = '"';
+                } else {
+                    memcpy(input_csv + off, v, vl); off += vl;
+                }
+            }
+            CSV_RESERVE(1); input_csv[off++] = '\n';
+        }
+        input_csv[off] = '\0';
+        input_len = off;
+        #undef CSV_RESERVE
+    } else {
+        input_csv = (char *)"";
+        input_len = 0;
+    }
+
+    /* 2. Build the wrapper script. The user code is interpolated as-is. */
+    const char *user_code = st->python_code;
+    size_t code_len = strlen(user_code);
+    size_t wrap_cap = code_len + 1024;
+    char *wrapper = arena_alloc(a, wrap_cap);
+    snprintf(wrapper, wrap_cap,
+        "import sys, io\n"
+        "try:\n"
+        "    import pandas as pd\n"
+        "except ImportError:\n"
+        "    sys.stderr.write('error: `pandas` is not installed for python3. '\n"
+        "                     'Install with: python3 -m pip install pandas\\n')\n"
+        "    sys.exit(2)\n"
+        "_csv_in = sys.stdin.read()\n"
+        "df = pd.read_csv(io.StringIO(_csv_in)) if _csv_in.strip() else pd.DataFrame()\n"
+        "# ── user code ──\n"
+        "%s\n"
+        "# ── /user code ──\n"
+        "df.to_csv(sys.stdout, index=False)\n",
+        user_code);
+
+    /* 3. Spawn subprocess with bidirectional pipes. */
+    int in_pipe[2], out_pipe[2], err_pipe[2];
+    if (pipe(in_pipe) || pipe(out_pipe) || pipe(err_pipe)) {
+        snprintf(errbuf, errsz, "python step %s: pipe() failed", st->id);
+        return -1;
+    }
+    pid_t pid = fork();
+    if (pid < 0) {
+        snprintf(errbuf, errsz, "python step %s: fork() failed", st->id);
+        return -1;
+    }
+    if (pid == 0) {
+        /* CHILD */
+        dup2(in_pipe[0],  STDIN_FILENO);
+        dup2(out_pipe[1], STDOUT_FILENO);
+        dup2(err_pipe[1], STDERR_FILENO);
+        close(in_pipe[0]); close(in_pipe[1]);
+        close(out_pipe[0]); close(out_pipe[1]);
+        close(err_pipe[0]); close(err_pipe[1]);
+        execlp("python3", "python3", "-c", wrapper, (char *)NULL);
+        _exit(127);
+    }
+    /* PARENT */
+    close(in_pipe[0]); close(out_pipe[1]); close(err_pipe[1]);
+
+    /* Write input CSV in a small thread-style loop (no pthread; just
+     * non-blocking writes interleaved with reads). For now, simple:
+     * write all at once since CSV is bounded by query result size. */
+    if (input_len > 0) {
+        ssize_t left = (ssize_t)input_len;
+        const char *p = input_csv;
+        while (left > 0) {
+            ssize_t w = write(in_pipe[1], p, (size_t)left);
+            if (w < 0) { if (errno == EINTR) continue; break; }
+            p += w; left -= w;
+        }
+    }
+    close(in_pipe[1]);
+
+    /* Read stdout + stderr with a per-fd buffer. Use poll() with the
+     * step's timeout. */
+    int timeout_ms = (st->python_timeout_sec > 0 ? st->python_timeout_sec : 300) * 1000;
+    int64_t deadline = (int64_t)time(NULL) * 1000 + timeout_ms;
+    size_t out_cap = 65536, out_len = 0;
+    char *out_buf = arena_alloc(a, out_cap);
+    char err_tail[1024]; size_t err_len = 0;
+
+    fcntl(out_pipe[0], F_SETFL, O_NONBLOCK);
+    fcntl(err_pipe[0], F_SETFL, O_NONBLOCK);
+    int fds_open = 2;
+    while (fds_open > 0) {
+        int64_t now_ms = (int64_t)time(NULL) * 1000;
+        if (now_ms >= deadline) {
+            kill(pid, SIGKILL);
+            snprintf(errbuf, errsz, "python step %s: timeout (%ds)",
+                     st->id, st->python_timeout_sec > 0 ? st->python_timeout_sec : 300);
+            close(out_pipe[0]); close(err_pipe[0]);
+            int s; waitpid(pid, &s, 0);
+            return -1;
+        }
+        struct pollfd pfd[2] = {
+            { .fd = out_pipe[0], .events = POLLIN },
+            { .fd = err_pipe[0], .events = POLLIN },
+        };
+        int rc = poll(pfd, 2, 200);
+        if (rc < 0) { if (errno == EINTR) continue; break; }
+        char tmp[4096];
+        for (int i = 0; i < 2; i++) {
+            if (!(pfd[i].revents & (POLLIN | POLLHUP))) continue;
+            ssize_t r = read(pfd[i].fd, tmp, sizeof(tmp));
+            if (r > 0) {
+                if (i == 0) {
+                    if (out_len + (size_t)r + 1 > out_cap) {
+                        while (out_len + (size_t)r + 1 > out_cap) out_cap *= 2;
+                        char *nb = arena_alloc(a, out_cap);
+                        memcpy(nb, out_buf, out_len);
+                        out_buf = nb;
+                    }
+                    memcpy(out_buf + out_len, tmp, (size_t)r);
+                    out_len += (size_t)r;
+                } else {
+                    /* err: keep just the tail (last 1KB) for diagnostics */
+                    size_t take = (size_t)r > sizeof(err_tail) - 1
+                                    ? sizeof(err_tail) - 1 : (size_t)r;
+                    if (err_len + take > sizeof(err_tail) - 1) {
+                        size_t shift = err_len + take - (sizeof(err_tail) - 1);
+                        memmove(err_tail, err_tail + shift, err_len - shift);
+                        err_len -= shift;
+                    }
+                    memcpy(err_tail + err_len, tmp + ((size_t)r - take), take);
+                    err_len += take;
+                }
+            } else if (r == 0 || (r < 0 && errno != EAGAIN)) {
+                close(pfd[i].fd); pfd[i].fd = -1; fds_open--;
+            }
+        }
+    }
+    out_buf[out_len] = '\0';
+    err_tail[err_len] = '\0';
+
+    int wstatus = 0;
+    waitpid(pid, &wstatus, 0);
+    if (!WIFEXITED(wstatus) || WEXITSTATUS(wstatus) != 0) {
+        snprintf(errbuf, errsz, "python step %s: exit=%d, stderr: %.300s",
+                 st->id, WEXITSTATUS(wstatus), err_tail);
+        return -1;
+    }
+
+    /* 4. Ingest output CSV into target_table.
+     * Reuse the same code path as POST /api/ingest/csv by calling into
+     * the connector via direct ingest helper.  Simplest: parse the CSV
+     * ourselves into a Schema+rows and call write_rs_to_table. */
+    if (!st->target_table[0] || out_len == 0) {
+        return 0;
+    }
+    /* Tokenize header line */
+    char *nl = strchr(out_buf, '\n');
+    if (!nl) {
+        snprintf(errbuf, errsz, "python step %s: output CSV has no header", st->id);
+        return -1;
+    }
+    *nl = '\0';
+    int header_ncols = 1;
+    for (char *p = out_buf; *p; p++) if (*p == ',') header_ncols++;
+
+    char **col_names = arena_alloc(a, (size_t)header_ncols * sizeof(char *));
+    int col_idx = 0;
+    char *tok = strtok(out_buf, ",");
+    while (tok && col_idx < header_ncols) {
+        col_names[col_idx++] = arena_strdup(a, tok);
+        tok = strtok(NULL, ",");
+    }
+
+    /* Build RS with the rest as text rows */
+    RS *rs = rs_new(a, header_ncols, col_names, 0);
+    char *cursor = nl + 1;
+    while (cursor && *cursor) {
+        char *line_end = strchr(cursor, '\n');
+        if (line_end) *line_end = '\0';
+        if (*cursor == '\0') { cursor = line_end ? line_end + 1 : NULL; continue; }
+        char **cells = arena_alloc(a, (size_t)header_ncols * sizeof(char *));
+        for (int i = 0; i < header_ncols; i++) cells[i] = (char *)"";
+        char *line_copy = arena_strdup(a, cursor);
+        int ci = 0;
+        char *cell = strtok(line_copy, ",");
+        while (cell && ci < header_ncols) {
+            cells[ci++] = arena_strdup(a, cell);
+            cell = strtok(NULL, ",");
+        }
+        rs_add(rs, a, cells, NULL);
+        cursor = line_end ? line_end + 1 : NULL;
+    }
+
+    int rows_written = write_rs_to_table(app, a, st->target_table, rs);
+    LOG_INFO("python step '%s' → %s: %d rows", st->id, st->target_table, rows_written);
+    return rows_written;
+}
+
 /* ── Execute all steps of a pipeline ── */
 void pipeline_execute_steps(Pipeline *p, App *app) {
     Arena *a = arena_create(4194304); /* 4 MiB */
@@ -3467,7 +3732,18 @@ void pipeline_execute_steps(Pipeline *p, App *app) {
         while (true) {
             st->status = STEP_RUNNING;
 
-            if (st->connector_type[0]) {
+            if (st->python_code[0]) {
+                /* Python step takes precedence over connector / transform_sql.
+                 * If transform_sql is set, it provides input data; otherwise
+                 * the user's script starts with an empty DataFrame. */
+                int n = run_python_step(app, a, st, p->error_msg, sizeof(p->error_msg));
+                if (n < 0) {
+                    st->status = STEP_FAILED;
+                } else {
+                    total_rows += n;
+                    st->status = STEP_SUCCESS;
+                }
+            } else if (st->connector_type[0]) {
                 int n = run_connector_step(app, a, st, p->error_msg, sizeof(p->error_msg));
                 if (n < 0) {
                     st->status = STEP_FAILED;

@@ -844,8 +844,24 @@ function pbUpdateStep(idx, field, val) {
 }
 
 function pbChangeConnType(idx, type) {
-  pb.steps[idx].connector_type    = type;
-  pb.steps[idx].connector_config  = '';
+  /* Special pseudo-type "__python": switches the step into Python mode.
+   * Internally that means clearing connector_type and seeding python_code
+   * with a starter snippet so the textarea has something useful in it. */
+  if (type === '__python') {
+    pb.steps[idx].connector_type   = '';
+    pb.steps[idx].connector_config = '';
+    if (!pb.steps[idx].python_code) {
+      pb.steps[idx].python_code =
+        '# input  : df  (pandas DataFrame from transform_sql)\n' +
+        '# output : df  (will be written to target_table as CSV)\n' +
+        'df["score"] = df["score"] * 2\n' +
+        'df = df[df["score"] > 50]';
+    }
+  } else {
+    pb.steps[idx].connector_type    = type;
+    pb.steps[idx].connector_config  = '';
+    pb.steps[idx].python_code       = '';
+  }
   /* re-render only the connector config section */
   const cfgDiv = document.getElementById(`step-conn-cfg-${idx}`);
   if (cfgDiv) cfgDiv.innerHTML = makeConnectorConfigHTML(pb.steps[idx], idx);
@@ -955,7 +971,8 @@ function makeStepCard(step, idx) {
         <div class="form-group" style="margin:0">
           <label>Источник данных</label>
           <select onchange="pbChangeConnType(${idx}, this.value)">
-            <option value=""           ${!step.connector_type                      ?'selected':''}>— только SQL-трансформация —</option>
+            <option value=""           ${!step.connector_type && !step.python_code ?'selected':''}>— только SQL-трансформация —</option>
+            <option value="__python"   ${!!step.python_code                         ?'selected':''}>🐍 Python-скрипт (pandas DataFrame)</option>
             <option value="csv"        ${step.connector_type==='csv'               ?'selected':''}>CSV файл</option>
             <option value="parquet"    ${step.connector_type==='parquet'           ?'selected':''}>Parquet файл</option>
             <option value="json_http"  ${step.connector_type==='json_http'         ?'selected':''}>HTTP / REST API (JSON)</option>
@@ -997,6 +1014,29 @@ function makeStepCard(step, idx) {
 function makeConnectorConfigHTML(step, idx) {
   const type = step.connector_type;
   const cfg  = safeParse(step.connector_config, {});
+
+  /* Python step (no connector_type, but has python_code) */
+  if (!type && step.python_code) {
+    return `
+      <div class="form-group" style="margin:0">
+        <label>Python-код <span class="label-hint">df = pandas DataFrame из transform_sql; результат записывается в target_table</span></label>
+        <textarea class="mono-textarea" rows="8"
+          oninput="pb.steps[${idx}].python_code=this.value"
+          style="font-family:var(--mono);font-size:.78rem">${escHtml(step.python_code)}</textarea>
+      </div>
+      <div class="step-row-2" style="margin-top:.4rem">
+        <div class="form-group" style="margin:0">
+          <label>Timeout (сек)</label>
+          <input type="number" min="1" max="3600"
+                 value="${step.python_timeout_sec || 300}"
+                 oninput="pb.steps[${idx}].python_timeout_sec=parseInt(this.value,10)||300">
+        </div>
+        <div style="font-size:.7rem;color:var(--muted);align-self:end">
+          Требуется <code>python3</code> + <code>pandas</code> на сервере.
+          Один subprocess на запуск шага.
+        </div>
+      </div>`;
+  }
 
   if (!type) return '';
 
@@ -1187,6 +1227,8 @@ async function savePipeline() {
     connector_config: s.connector_config || '',
     transform_sql:    s.transform_sql    || '',
     target_table:     s.target_table     || '',
+    python_code:      s.python_code      || '',
+    python_timeout_sec: s.python_timeout_sec || 300,
     max_retries:      s.max_retries != null ? s.max_retries : 3,
     retry_delay_sec:  s.retry_delay_sec != null ? s.retry_delay_sec : 30,
     deps:             s.deps             || [],

@@ -46,6 +46,16 @@ typedef struct {
     int         retry_count;       /* current retry counter */
     int         retry_delay_sec;   /* base delay, doubles on each retry */
     int64_t     retry_after;       /* unix ts — when to retry */
+
+    /* Python step (subprocess `python3 -c ...`).
+     * If python_code is non-empty, this step runs Python:
+     *   1. transform_sql (if set) is executed first → result fed as CSV
+     *      to the Python subprocess on stdin
+     *   2. user code operates on a `df` variable (pandas DataFrame)
+     *   3. final `df` is read from stdout and ingested into target_table
+     * Requires `pandas` available to the system `python3`. */
+    char        python_code[8192];
+    int         python_timeout_sec;   /* default: 300 */
 } PipelineStep;
 
 typedef struct {
