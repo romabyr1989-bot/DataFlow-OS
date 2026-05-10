@@ -69,13 +69,13 @@ int main(int argc, char** argv) {
     CliConfig cfg;
     if (!parse_args(argc, argv, cfg)) return 1;
 
-    arrow::flight::Location location;
-    auto loc_status = flight::Location::ForGrpcTcp(cfg.host, cfg.port).Value(&location);
-    if (!loc_status.ok()) {
-        std::cerr << "[flight] cannot construct location: " << loc_status.ToString() << "\n";
+    auto loc_result = flight::Location::ForGrpcTcp(cfg.host, cfg.port);
+    if (!loc_result.ok()) {
+        std::cerr << "[flight] cannot construct location: "
+                  << loc_result.status().ToString() << "\n";
         return 1;
     }
-
+    flight::Location location = loc_result.ValueOrDie();
     flight::FlightServerOptions options(location);
     auto service = std::make_unique<dfo::DfoFlightService>(cfg.gateway, cfg.api_key);
 

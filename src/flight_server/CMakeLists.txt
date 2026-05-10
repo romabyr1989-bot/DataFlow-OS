@@ -18,7 +18,7 @@
 cmake_minimum_required(VERSION 3.16)
 project(dfo_flight_server CXX)
 
-set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD 20)        # Arrow 24.x uses std::log2p1 (C++20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 

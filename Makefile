@@ -291,14 +291,43 @@ test-all: test test-sql test-integration
 FLIGHT_BIN     = $(BINDIR)/dfo_flight_server
 FLIGHT_BUILD   = src/flight_server/build
 
+# Auto-detect conda if installed — Arrow C++ via conda-forge is the
+# fastest path to the deps on macOS Intel (brew compiles for hours).
+# Override with FLIGHT_PREFIX=/path/to/your/install if you have a custom
+# install (e.g. /opt/homebrew on Apple Silicon).
+_CONDA_BASE := $(shell { test -d $(HOME)/miniconda3 && echo $(HOME)/miniconda3; } || \
+                       { test -d $(HOME)/anaconda3  && echo $(HOME)/anaconda3;  } || \
+                       true)
+FLIGHT_PREFIX ?= $(_CONDA_BASE)
+FLIGHT_CMAKE_ARGS = -DCMAKE_BUILD_TYPE=Release
+ifneq ($(FLIGHT_PREFIX),)
+  FLIGHT_CMAKE_ARGS += -DCMAKE_PREFIX_PATH=$(FLIGHT_PREFIX)
+  FLIGHT_CMAKE_ARGS += -Dnlohmann_json_DIR=$(FLIGHT_PREFIX)/share/cmake/nlohmann_json
+  # Arrow 24.x needs C++20 features (std::log2p1) that Apple Clang 14
+  # doesn't ship; fall back to conda's clang when available.
+  ifneq ($(wildcard $(FLIGHT_PREFIX)/bin/clang++),)
+    FLIGHT_CMAKE_ARGS += -DCMAKE_C_COMPILER=$(FLIGHT_PREFIX)/bin/clang
+    FLIGHT_CMAKE_ARGS += -DCMAKE_CXX_COMPILER=$(FLIGHT_PREFIX)/bin/clang++
+  endif
+endif
+
 flight: dirs
 	@if ! command -v cmake >/dev/null 2>&1; then \
 		echo "ERROR: cmake not found — install with brew/apt and retry"; exit 1; \
 	fi
+	@if [ -z "$(FLIGHT_PREFIX)" ] && ! pkg-config --exists arrow 2>/dev/null; then \
+		echo "ERROR: Arrow C++ not found. Install via:"; \
+		echo "  conda install -c conda-forge libarrow-all libgrpc nlohmann_json cxx-compiler"; \
+		echo "  # or, on Apple Silicon: brew install apache-arrow grpc nlohmann-json"; \
+		exit 1; \
+	fi
 	@mkdir -p $(FLIGHT_BUILD)
-	@cd $(FLIGHT_BUILD) && cmake -DCMAKE_BUILD_TYPE=Release .. && cmake --build . -j 2>&1
+	@cd $(FLIGHT_BUILD) && cmake $(FLIGHT_CMAKE_ARGS) .. && cmake --build . -j 2>&1
 	@cp $(FLIGHT_BUILD)/dfo_flight_server $(FLIGHT_BIN)
 	@echo "  LD  $(FLIGHT_BIN)"
+	@if [ -n "$(FLIGHT_PREFIX)" ]; then \
+		echo "  HINT: run with DYLD_LIBRARY_PATH=$(FLIGHT_PREFIX)/lib so libarrow*.dylib is found"; \
+	fi
 
 flight-clean:
 	@rm -rf $(FLIGHT_BUILD)

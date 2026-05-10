@@ -131,8 +131,11 @@ def flight_client(gateway_token):
 def test_list_flights_includes_smoke_table(flight_client):
     names = []
     for fi in flight_client.list_flights():
-        if fi.descriptor.descriptor_type == pyarrow_flight.FlightDescriptor.PATH:
-            names.extend(p.decode() for p in fi.descriptor.path)
+        # pyarrow renamed FlightDescriptor.PATH/CMD to DescriptorType.{PATH,CMD}
+        # at some point; compare by name to be version-agnostic.
+        if str(fi.descriptor.descriptor_type).endswith("PATH"):
+            names.extend(p.decode() if isinstance(p, bytes) else p
+                         for p in fi.descriptor.path)
     assert "flight_smoke" in names
 
 

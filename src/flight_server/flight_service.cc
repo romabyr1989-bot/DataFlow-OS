@@ -48,11 +48,8 @@ std::string ticket_to_sql(const flight::Ticket& t) {
     return s; // assume raw SQL
 }
 
-/* Build "sql:..." ticket bytes for a flight info endpoint */
-std::vector<uint8_t> sql_ticket(const std::string& sql) {
-    std::string s = "sql:" + sql;
-    return std::vector<uint8_t>(s.begin(), s.end());
-}
+/* Build the "sql:..." string used as a Flight ticket payload. */
+std::string sql_ticket_str(const std::string& sql) { return "sql:" + sql; }
 
 }  // namespace
 
@@ -71,7 +68,8 @@ arrow::Status DfoFlightService::ListFlights(
     json arr;
     try { arr = json::parse(resp.body); }
     catch (const std::exception& e) {
-        return arrow::Status::Invalid("gateway returned invalid JSON: ", e.what());
+        return arrow::Status::Invalid(
+            std::string("gateway returned invalid JSON: ") + e.what());
     }
     if (!arr.is_array())
         return arrow::Status::Invalid("expected array from /api/tables");
@@ -94,10 +92,8 @@ arrow::Status DfoFlightService::ListFlights(
         auto schema = (*table_or)->schema();
 
         auto descriptor = flight::FlightDescriptor::Path({name});
-        auto endpoint = flight::FlightEndpoint{
-            flight::Ticket{std::string(sql_ticket("SELECT * FROM " + name).begin(),
-                                       sql_ticket("SELECT * FROM " + name).end())},
-            {}};
+        flight::FlightEndpoint endpoint;
+        endpoint.ticket = flight::Ticket{ sql_ticket_str("SELECT * FROM " + name) };
         auto info_or = flight::FlightInfo::Make(*schema, descriptor,
                                                 {endpoint},
                                                 static_cast<int64_t>(t.value("rows", 0)),
@@ -133,13 +129,12 @@ arrow::Status DfoFlightService::GetFlightInfo(
     json qjson;
     try { qjson = json::parse(qresp.body); }
     catch (const std::exception& e) {
-        return arrow::Status::Invalid("invalid JSON: ", e.what());
+        return arrow::Status::Invalid(std::string("invalid JSON: ") + e.what());
     }
     ARROW_ASSIGN_OR_RAISE(auto table, json_query_result_to_arrow(qjson));
 
-    auto endpoint = flight::FlightEndpoint{
-        flight::Ticket{std::string(sql_ticket(sql).begin(), sql_ticket(sql).end())},
-        {}};
+    flight::FlightEndpoint endpoint;
+    endpoint.ticket = flight::Ticket{ sql_ticket_str(sql) };
     ARROW_ASSIGN_OR_RAISE(auto fi, flight::FlightInfo::Make(*table->schema(),
                                                              descriptor,
                                                              {endpoint},
@@ -181,12 +176,15 @@ arrow::Status DfoFlightService::DoGet(
     json qjson;
     try { qjson = json::parse(resp.body); }
     catch (const std::exception& e) {
-        return arrow::Status::Invalid("invalid JSON: ", e.what());
+        return arrow::Status::Invalid(std::string("invalid JSON: ") + e.what());
     }
     ARROW_ASSIGN_OR_RAISE(auto table, json_query_result_to_arrow(qjson));
 
-    /* TableBatchReader streams Table → record batches */
-    auto reader = std::make_shared<arrow::TableBatchReader>(*table);
+    /* TableBatchReader streams Table → record batches.
+     * Pass the shared_ptr<Table> overload (NOT the Table& one) so the
+     * table outlives the reader — DoGet returns immediately while the
+     * stream is consumed asynchronously by gRPC. */
+    auto reader = std::make_shared<arrow::TableBatchReader>(table);
     *stream = std::make_unique<flight::RecordBatchStream>(reader);
     return arrow::Status::OK();
 }

@@ -25,26 +25,62 @@ remains pure C with no new toolchain requirements.
 
 | Platform | Command |
 |----------|---------|
-| macOS    | `brew install apache-arrow grpc nlohmann-json` |
-| Debian/Ubuntu | `apt install libarrow-flight-dev libgrpc++-dev nlohmann-json3-dev libcurl4-openssl-dev cmake` |
-| Fedora   | `dnf install arrow-flight-devel grpc-devel json-devel libcurl-devel cmake` |
-| Nix      | `nix-shell -p arrow-cpp grpc nlohmann_json` |
+| macOS 14+ (Apple Silicon)   | `brew install apache-arrow grpc nlohmann-json` |
+| Debian / Ubuntu             | `apt install libarrow-flight-dev libgrpc++-dev nlohmann-json3-dev libcurl4-openssl-dev cmake` |
+| Fedora                      | `dnf install arrow-flight-devel grpc-devel json-devel libcurl-devel cmake` |
+| Nix                         | `nix-shell -p arrow-cpp grpc nlohmann_json` |
+| Conda (any platform)        | `conda install -c conda-forge libarrow-all libprotobuf grpc-cpp nlohmann_json` |
 
 Disk footprint after Homebrew install is ~600 MB (Arrow C++ alone is
 ~250 MB). If you can't install Arrow C++, fall back to the existing
 JSON `/api/tables/query` endpoint — it's slower but identical in
 functionality.
 
+### Platform note: macOS 13 (Ventura) on Intel
+
+Homebrew dropped macOS 13/Intel from its [Tier 1 support list](
+https://docs.brew.sh/Support-Tiers) in late 2024. `brew install
+apache-arrow` on that combination tries to compile from source and
+typically fails partway through aws-sdk-cpp / arrow build (multiple
+hours and several gigabytes of disk). We verified this in our own dev
+environment.
+
+If you're on macOS 13 Intel:
+- Easiest path: install via **conda-forge** (pre-built bottles,
+  ~2 minutes): `conda install -c conda-forge libarrow-all grpc-cpp nlohmann_json`,
+  then point CMake at the conda prefix:
+  `cmake -DCMAKE_PREFIX_PATH=$(conda info --base)/envs/<env>`.
+- Alternative: build inside a Linux container (Debian / Ubuntu image),
+  bind-mount the source, run `make flight` there.
+- Or upgrade to macOS 14+ on Apple Silicon — Homebrew bottles work
+  out of the box.
+
 ## Build & run
 
 ```sh
-make BUILD=release           # base project
+make BUILD=release           # base project (no Arrow needed)
 make flight                  # builds src/flight_server via cmake
-./build/release/bin/dfo_flight_server \
+DYLD_LIBRARY_PATH=$HOME/miniconda3/lib ./build/release/bin/dfo_flight_server \
     --gateway http://localhost:8080 \
     --api-key "$JWT_TOKEN" \
     --port 8815
 ```
+
+`make flight` auto-detects `~/miniconda3` or `~/anaconda3` and threads
+its prefix into cmake. Override with `make flight FLIGHT_PREFIX=/opt/X`
+for a custom install location, or unset it on Linux/Apple-Silicon if
+the system `pkg-config arrow` already finds your packages. If Arrow /
+gRPC / nlohmann_json aren't found, the target stops with a clear
+error message.
+
+Arrow ≥ 24.x needs C++20 (`std::log2p1`); Apple Clang 14 (Xcode 14)
+doesn't ship that yet, so the Makefile transparently uses
+`~/miniconda3/bin/clang++` (clang 19) when the conda prefix is active.
+
+**Runtime:** the binary needs `libarrow*.dylib` and friends on
+`DYLD_LIBRARY_PATH` (or rpath), which is why the example shows the
+`DYLD_LIBRARY_PATH=` prefix. The Makefile prints a HINT line after
+build with the right value.
 
 Get the JWT token like any DataFlow OS client:
 
@@ -168,11 +204,22 @@ remaining overhead is the gateway → Flight → client double-hop.
 ## Testing
 
 ```sh
-brew install apache-arrow grpc nlohmann-json
+# 1. Install deps once (conda is fastest on macOS Intel; brew on Apple Silicon)
+conda install -c conda-forge libarrow-all libgrpc nlohmann_json cxx-compiler
+
+# 2. Build
 make BUILD=release
 make flight
+
+# 3. Run e2e
 pip install pyarrow pytest
-pytest tests/integration/test_arrow_flight.py -v
+DYLD_LIBRARY_PATH=$HOME/miniconda3/lib pytest tests/integration/test_arrow_flight.py -v
 ```
 
-The test auto-skips if pyarrow isn't installed or the binary isn't built.
+Three checks: ListFlights enumerates user tables, DoGet with `sql:`
+ticket round-trips through pandas, DoGet with `table:` shortcut also
+works. The test auto-skips if pyarrow isn't installed or the binary
+isn't built.
+
+**Verified end-to-end on macOS 13 Intel + conda-forge Arrow 24.0** —
+3/3 tests passing as of commit (this iteration).
