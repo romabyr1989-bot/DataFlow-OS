@@ -85,6 +85,7 @@
     <section id="view-pipelines" class="view">
       <h1>Конвейеры
         <button class="btn btn-primary btn-sm" onclick="openPipelineBuilder(null)" title="Создать новый конвейер в визуальном редакторе">+ Новый конвейер</button>
+        <button class="btn btn-sm" onclick="openYamlImport()" title="Импортировать YAML-описание конвейера">📄 Импорт YAML</button>
         <button class="btn btn-sm" onclick="loadPipelines()" title="Перезагрузить список">↻ Обновить</button>
       </h1>
       <div class="help-banner">
@@ -152,6 +153,18 @@
             <span class="toggle-track"><span class="toggle-thumb"></span></span>
             <span class="toggle-label" id="pb-enabled-label">Включён</span>
           </label>
+        </div>
+      </div>
+
+      <!-- Step 4: event-driven triggers (webhook + file_arrival in addition to cron) -->
+      <div class="builder-settings-row" style="border-top:1px dashed var(--border);padding-top:.6rem">
+        <div style="flex:1">
+          <div style="display:flex;align-items:center;gap:.5rem;margin-bottom:.4rem">
+            <strong style="font-size:.85rem">Дополнительные триггеры</strong>
+            <span style="font-size:.7rem;color:var(--muted)">помимо cron — webhook URL, появление файла в директории</span>
+            <button class="btn btn-sm" style="margin-left:auto" onclick="pbAddTrigger()">+ Добавить триггер</button>
+          </div>
+          <div id="pb-triggers"></div>
         </div>
       </div>
       <div class="builder-settings-row">
@@ -687,6 +700,29 @@
     <div class="modal-actions">
       <button class="btn" onclick="document.getElementById('runs-modal').classList.add('hidden')">Закрыть</button>
     </div>
+  </div>
+</div>
+
+<!-- YAML import modal (Step 5: GitOps) -->
+<div id="yaml-modal" class="modal hidden">
+  <div class="modal-box" style="max-width:760px;width:90%">
+    <h2>Импорт YAML-конвейера</h2>
+    <p style="font-size:.8rem;color:var(--muted);margin:.25rem 0 .75rem">
+      Вставь содержимое <code>.yaml</code>-файла, нажми <b>Проверить</b>,
+      посмотри JSON-результат, затем <b>Применить</b> — конвейер сохранится через REST API.
+      Поддерживается тот же subset что и <code>pipelines_dir</code>.
+    </p>
+    <textarea id="yaml-input" rows="12"
+      style="width:100%;font-family:var(--mono);font-size:.8rem;padding:.5rem"
+      placeholder="name: my_etl&#10;triggers:&#10;  - type: cron&#10;    cron_expr: '@daily'&#10;steps:&#10;  - id: extract&#10;    transform_sql: SELECT 1&#10;    target_table: t"></textarea>
+    <div style="display:flex;gap:.5rem;margin-top:.6rem">
+      <button class="btn" onclick="previewYaml()">Проверить</button>
+      <button class="btn btn-primary" id="yaml-apply-btn" onclick="applyYaml()" disabled>Применить</button>
+      <span id="yaml-status" style="font-size:.8rem;color:var(--muted);margin-left:.5rem;align-self:center"></span>
+      <button class="btn" style="margin-left:auto"
+              onclick="document.getElementById('yaml-modal').classList.add('hidden')">Закрыть</button>
+    </div>
+    <pre id="yaml-preview-out" style="display:none;background:var(--surface2);padding:.5rem;border-radius:4px;font-size:.75rem;max-height:240px;overflow:auto;margin-top:.6rem"></pre>
   </div>
 </div>
 

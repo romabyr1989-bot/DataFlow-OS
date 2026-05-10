@@ -446,6 +446,65 @@ function makeResultTable(data) {
 
 
 /* ═══════════════════════════════════════════════════
+   YAML pipeline import (Step 5 — GitOps preview)
+═══════════════════════════════════════════════════ */
+let _yamlPreview = null;
+
+function openYamlImport() {
+  document.getElementById('yaml-modal').classList.remove('hidden');
+  document.getElementById('yaml-preview-out').style.display = 'none';
+  document.getElementById('yaml-status').textContent = '';
+  document.getElementById('yaml-apply-btn').disabled = true;
+  _yamlPreview = null;
+}
+
+async function previewYaml() {
+  const text = document.getElementById('yaml-input').value;
+  const status = document.getElementById('yaml-status');
+  const out    = document.getElementById('yaml-preview-out');
+  if (!text.trim()) { status.textContent = 'пусто'; return; }
+  status.textContent = 'проверяю…';
+  try {
+    const headers = { 'Content-Type': 'text/yaml' };
+    if (jwtToken) headers['Authorization'] = 'Bearer ' + jwtToken;
+    const r = await fetch(API + '/api/pipelines/preview-yaml',
+                          { method: 'POST', headers, body: text });
+    const body = await r.text();
+    if (!r.ok) {
+      out.style.display = 'block';
+      out.textContent = body;
+      status.textContent = `ошибка HTTP ${r.status}`;
+      _yamlPreview = null;
+      document.getElementById('yaml-apply-btn').disabled = true;
+      return;
+    }
+    let parsed;
+    try { parsed = JSON.parse(body); }
+    catch (_) { status.textContent = 'некорректный JSON-ответ'; return; }
+    out.style.display = 'block';
+    out.textContent = JSON.stringify(parsed, null, 2);
+    status.textContent = `✓ ok — pipeline "${parsed.name || '?'}", ${(parsed.steps || []).length} шаг(ов)`;
+    _yamlPreview = parsed;
+    document.getElementById('yaml-apply-btn').disabled = false;
+  } catch (err) {
+    status.textContent = String(err);
+    _yamlPreview = null;
+  }
+}
+
+async function applyYaml() {
+  if (!_yamlPreview) { showToast('Сначала нажми «Проверить»', 'error'); return; }
+  try {
+    await apiPost('/api/pipelines', _yamlPreview);
+    document.getElementById('yaml-modal').classList.add('hidden');
+    showToast(`Конвейер "${_yamlPreview.name}" импортирован`, 'ok');
+    loadPipelines();
+  } catch (err) {
+    showToast('Не удалось применить: ' + err, 'error');
+  }
+}
+
+/* ═══════════════════════════════════════════════════
    PIPELINE LIST
 ═══════════════════════════════════════════════════ */
 async function loadPipelines() {
@@ -597,6 +656,11 @@ function openPipelineBuilder(pipeline) {
   pb.webhook_url     = pipeline ? (pipeline.webhook_url || '') : '';
   pb.webhook_on      = pipeline ? (pipeline.webhook_on || 'failure') : 'failure';
   pb.alert_cooldown  = pipeline ? (pipeline.alert_cooldown || 300) : 300;
+  /* Step 4: extra triggers beyond the legacy `cron` field. We keep cron as
+   * its own primary input; webhook/file_arrival/manual ride here. */
+  pb.triggers = pipeline && Array.isArray(pipeline.triggers)
+    ? pipeline.triggers.filter(t => t.type !== 'cron').map(t => ({...t}))
+    : [];
 
   document.getElementById('pb-name').value      = pipeline ? (pipeline.name || '') : '';
   document.getElementById('pb-enabled').checked = pipeline ? !!pipeline.enabled : true;
@@ -617,7 +681,96 @@ function openPipelineBuilder(pipeline) {
   nb.classList.add('visible');
 
   renderBuilderSteps();
+  renderTriggers();
   switchView('builder');
+}
+
+/* ── Step 4: triggers UI ─────────────────────────────────────── */
+function pbAddTrigger() {
+  if (!pb.triggers) pb.triggers = [];
+  pb.triggers.push({
+    type: 'webhook',
+    webhook_token: 'wh_' + Math.random().toString(36).slice(2, 12),
+    webhook_method: 'POST',
+  });
+  renderTriggers();
+}
+
+function pbRemoveTrigger(idx) {
+  pb.triggers.splice(idx, 1);
+  renderTriggers();
+}
+
+function pbUpdateTrigger(idx, field, val) {
+  pb.triggers[idx][field] = val;
+}
+
+function pbChangeTriggerType(idx, type) {
+  const t = pb.triggers[idx] = { type };
+  if (type === 'webhook') {
+    t.webhook_token = 'wh_' + Math.random().toString(36).slice(2, 12);
+    t.webhook_method = 'POST';
+  } else if (type === 'file_arrival') {
+    t.watch_dir    = '/var/dfo/incoming';
+    t.file_pattern = '*.csv';
+  }
+  renderTriggers();
+}
+
+function renderTriggers() {
+  const el = document.getElementById('pb-triggers');
+  if (!el) return;
+  if (!pb.triggers || pb.triggers.length === 0) {
+    el.innerHTML = '<div style="font-size:.75rem;color:var(--muted);padding:.4rem 0">Триггеров нет — конвейер фирится только по cron (выше) или вручную.</div>';
+    return;
+  }
+  el.innerHTML = pb.triggers.map((t, i) => {
+    let body = '';
+    if (t.type === 'webhook') {
+      const port = location.port || '8080';
+      const url  = `${location.protocol}//${location.hostname}:${port}/api/triggers/${escAttr(t.webhook_token || '')}`;
+      body = `
+        <input type="text" placeholder="webhook_token (секрет)"
+               value="${escAttr(t.webhook_token || '')}"
+               oninput="pbUpdateTrigger(${i},'webhook_token',this.value);renderTriggers()"
+               style="flex:1;font-family:var(--mono);font-size:.78rem">
+        <select onchange="pbUpdateTrigger(${i},'webhook_method',this.value)" style="width:90px">
+          <option value="POST" ${t.webhook_method!=='GET'?'selected':''}>POST</option>
+          <option value="GET"  ${t.webhook_method==='GET'?'selected':''}>GET</option>
+        </select>
+        <code style="font-size:.7rem;color:var(--muted);flex:2;overflow:hidden;text-overflow:ellipsis;white-space:nowrap"
+              title="${escAttr(url)}">${escHtml(url)}</code>`;
+    } else if (t.type === 'file_arrival') {
+      body = `
+        <input type="text" placeholder="watch_dir"
+               value="${escAttr(t.watch_dir || '')}"
+               oninput="pbUpdateTrigger(${i},'watch_dir',this.value)"
+               style="flex:2;font-family:var(--mono);font-size:.78rem">
+        <input type="text" placeholder="*.csv"
+               value="${escAttr(t.file_pattern || '*')}"
+               oninput="pbUpdateTrigger(${i},'file_pattern',this.value)"
+               style="flex:1;font-family:var(--mono);font-size:.78rem">
+        <span style="font-size:.7rem;color:var(--muted)">Linux only</span>`;
+    } else if (t.type === 'manual') {
+      body = '<span style="font-size:.75rem;color:var(--muted);flex:1">Только через UI / POST /api/pipelines/:id/run</span>';
+    } else if (t.type === 'cron') {
+      body = `
+        <input type="text" placeholder="cron expression"
+               value="${escAttr(t.cron_expr || '')}"
+               oninput="pbUpdateTrigger(${i},'cron_expr',this.value)"
+               style="flex:1;font-family:var(--mono);font-size:.78rem">`;
+    }
+    return `<div style="display:flex;gap:.4rem;align-items:center;margin-bottom:.4rem">
+      <select onchange="pbChangeTriggerType(${i},this.value)" style="width:140px">
+        <option value="webhook"      ${t.type==='webhook'      ?'selected':''}>🪝 Webhook</option>
+        <option value="file_arrival" ${t.type==='file_arrival' ?'selected':''}>📁 File arrival</option>
+        <option value="cron"         ${t.type==='cron'         ?'selected':''}>⏰ Cron (доп.)</option>
+        <option value="manual"       ${t.type==='manual'       ?'selected':''}>👆 Только вручную</option>
+      </select>
+      ${body}
+      <button class="btn btn-sm btn-danger" onclick="pbRemoveTrigger(${i})" title="Удалить триггер">✕</button>
+    </div>`;
+  }).join('');
 }
 
 /* listen to enabled toggle */
@@ -807,6 +960,9 @@ function makeStepCard(step, idx) {
             <option value="parquet"    ${step.connector_type==='parquet'           ?'selected':''}>Parquet файл</option>
             <option value="json_http"  ${step.connector_type==='json_http'         ?'selected':''}>HTTP / REST API (JSON)</option>
             <option value="postgresql" ${step.connector_type==='postgresql'        ?'selected':''}>PostgreSQL</option>
+            <option value="s3"         ${step.connector_type==='s3'                ?'selected':''}>S3 / MinIO</option>
+            <option value="kafka"      ${step.connector_type==='kafka'             ?'selected':''}>Kafka</option>
+            <option value="airbyte"    ${step.connector_type==='airbyte'           ?'selected':''}>🛬 Airbyte (любой источник)</option>
           </select>
         </div>
         <div class="form-group" style="margin:0">
@@ -953,6 +1109,40 @@ function makeConnectorConfigHTML(step, idx) {
       </div>
     </div>`;
 
+  if (type === 'airbyte') {
+    /* Step 2 (connector): pick from AIRBYTE_CATALOG, then a JSON pane for
+     * the source-specific config (each Airbyte source has its own schema). */
+    const sources = Object.entries(AIRBYTE_CATALOG)
+      .sort((a,b) => a[1].category.localeCompare(b[1].category) ||
+                     a[0].localeCompare(b[0]));
+    const optsByCat = {};
+    sources.forEach(([name, m]) => {
+      (optsByCat[m.category] ||= []).push({name, image: m.image});
+    });
+    let groups = '';
+    for (const cat of Object.keys(optsByCat).sort()) {
+      groups += `<optgroup label="${escAttr(cat)}">`;
+      for (const s of optsByCat[cat]) {
+        groups += `<option value="${escAttr(s.image)}" ${cfg.image===s.image?'selected':''}>${escHtml(s.name)} — ${escHtml(s.image)}</option>`;
+      }
+      groups += '</optgroup>';
+    }
+    const innerCfg = cfg.config ? JSON.stringify(cfg.config, null, 2) : '{}';
+    return `
+      <div class="form-group" style="margin:0">
+        <label>Airbyte source image <span class="label-hint">whitelisted; см. AIRBYTE_CATALOG</span></label>
+        <select onchange="pbUpdateAirbyteImage(${idx}, this.value)">
+          <option value="">— выбери источник —</option>
+          ${groups}
+        </select>
+      </div>
+      <div class="form-group" style="margin:.4rem 0 0">
+        <label>Source config (JSON) <span class="label-hint">соответствует spec выбранного образа</span></label>
+        <textarea class="mono-textarea" rows="4" placeholder='{"start_date":"...", "api_token":"..."}'
+                  oninput="pbUpdateAirbyteConfig(${idx}, this.value)">${escHtml(innerCfg)}</textarea>
+      </div>`;
+  }
+
   /* fallback: raw JSON */
   return `
     <div class="form-group" style="margin:0">
@@ -960,6 +1150,21 @@ function makeConnectorConfigHTML(step, idx) {
       <textarea class="mono-textarea" rows="2" placeholder="{}"
                 oninput="pb.steps[${idx}].connector_config=this.value">${escHtml(step.connector_config || '')}</textarea>
     </div>`;
+}
+
+/* Airbyte connector_config = {"image": "...", "config": {…}} */
+function pbUpdateAirbyteImage(idx, image) {
+  const cfg = safeParse(pb.steps[idx].connector_config, {});
+  cfg.image = image;
+  if (!cfg.config) cfg.config = {};
+  pb.steps[idx].connector_config = JSON.stringify(cfg);
+}
+function pbUpdateAirbyteConfig(idx, jsonText) {
+  const cfg = safeParse(pb.steps[idx].connector_config, {});
+  let inner = {};
+  try { inner = JSON.parse(jsonText); } catch (_) { return; /* invalid JSON — wait for valid */ }
+  cfg.config = inner;
+  pb.steps[idx].connector_config = JSON.stringify(cfg);
 }
 
 /* ── Save pipeline ── */
@@ -988,7 +1193,13 @@ async function savePipeline() {
     ndeps:            (s.deps || []).length,
   }));
 
+  /* Step 4: emit triggers[] alongside legacy `cron` field. The gateway
+   * synthesizes a TRIGGER_CRON entry from `cron` when triggers[] is empty,
+   * so we don't need to duplicate it — only add the extra ones. */
+  const triggers = (pb.triggers || []).filter(t => t && t.type)
+                                       .map(t => ({...t}));
   const body = { name, cron, enabled, steps,
+                 triggers,
                  max_retries: maxRetries,
                  retry_delay_sec: retryDelay,
                  webhook_url: webhookUrl,
