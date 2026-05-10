@@ -64,7 +64,7 @@ RESP=$(curl -s -w "\n%{http_code}" -X POST "$BASE/api/auth/token" \
     -H "Content-Type: application/json" \
     -d '{"username":"admin","password":"admin"}')
 HTTP_CODE=$(echo "$RESP" | tail -1)
-BODY=$(echo "$RESP" | head -n -1)
+BODY=$(echo "$RESP" | sed '$d')
 TOKEN=$(echo "$BODY" | grep -o '"token":"[^"]*"' | cut -d'"' -f4)
 check "admin auth returns 200" "$([ "$HTTP_CODE" = "200" ] && echo 1 || echo 0)"
 AUTH="Authorization: Bearer $TOKEN"
@@ -101,7 +101,7 @@ check "INSERT row 3 (carol)" "$([ "$HTTP_CODE" = "200" ] && echo 1 || echo 0)"
 # SELECT all — should see 3 rows
 RESP=$(query "SELECT * FROM txn_test")
 HTTP_CODE=$(echo "$RESP" | tail -1)
-BODY=$(echo "$RESP" | head -n -1)
+BODY=$(echo "$RESP" | sed '$d')
 check "SELECT after INSERT returns 200" "$([ "$HTTP_CODE" = "200" ] && echo 1 || echo 0)"
 check "SELECT sees alice" "$(echo "$BODY" | grep -q 'alice' && echo 1 || echo 0)"
 check "SELECT sees bob" "$(echo "$BODY" | grep -q 'bob' && echo 1 || echo 0)"
@@ -110,7 +110,7 @@ check "SELECT sees carol" "$(echo "$BODY" | grep -q 'carol' && echo 1 || echo 0)
 # DELETE row with id='2' (bob)
 RESP=$(query "DELETE FROM txn_test WHERE id = '2'")
 HTTP_CODE=$(echo "$RESP" | tail -1)
-BODY=$(echo "$RESP" | head -n -1)
+BODY=$(echo "$RESP" | sed '$d')
 check "DELETE WHERE id='2' returns 200" "$([ "$HTTP_CODE" = "200" ] && echo 1 || echo 0)"
 check "DELETE response contains deleted count" \
     "$(echo "$BODY" | grep -qE '"deleted"|"rows":\[\["[1-9]' && echo 1 || echo 0)"
@@ -118,7 +118,7 @@ check "DELETE response contains deleted count" \
 # SELECT again — bob should be gone
 RESP=$(query "SELECT * FROM txn_test")
 HTTP_CODE=$(echo "$RESP" | tail -1)
-BODY=$(echo "$RESP" | head -n -1)
+BODY=$(echo "$RESP" | sed '$d')
 check "SELECT after DELETE returns 200" "$([ "$HTTP_CODE" = "200" ] && echo 1 || echo 0)"
 check "bob is no longer visible after DELETE" "$(echo "$BODY" | grep -q 'bob' && echo 0 || echo 1)"
 check "alice still visible after DELETE" "$(echo "$BODY" | grep -q 'alice' && echo 1 || echo 0)"
@@ -132,7 +132,7 @@ check "UPDATE WHERE id='1' returns 200" "$([ "$HTTP_CODE" = "200" ] && echo 1 ||
 # SELECT — verify alice has new score
 RESP=$(query "SELECT * FROM txn_test WHERE id = '1'")
 HTTP_CODE=$(echo "$RESP" | tail -1)
-BODY=$(echo "$RESP" | head -n -1)
+BODY=$(echo "$RESP" | sed '$d')
 check "SELECT after UPDATE returns 200" "$([ "$HTTP_CODE" = "200" ] && echo 1 || echo 0)"
 check "alice's score updated to 999" "$(echo "$BODY" | grep -q '999' && echo 1 || echo 0)"
 check "alice's old score 100 is gone" "$(echo "$BODY" | grep -q '"100"' && echo 0 || echo 1)"
@@ -150,7 +150,7 @@ check "CSV ingest to txn_ingest returns 200" "$([ "$HTTP_CODE" = "200" ] && echo
 
 RESP=$(query "SELECT * FROM txn_ingest")
 HTTP_CODE=$(echo "$RESP" | tail -1)
-BODY=$(echo "$RESP" | head -n -1)
+BODY=$(echo "$RESP" | sed '$d')
 check "SELECT from ingested table returns 200" "$([ "$HTTP_CODE" = "200" ] && echo 1 || echo 0)"
 check "ingested rows visible (v1)" "$(echo "$BODY" | grep -q 'v1' && echo 1 || echo 0)"
 check "ingested rows visible (v3)" "$(echo "$BODY" | grep -q 'v3' && echo 1 || echo 0)"

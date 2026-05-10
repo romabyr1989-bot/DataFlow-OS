@@ -65,7 +65,7 @@ RESP=$(curl -s -w "\n%{http_code}" -X POST "$BASE/api/auth/token" \
     -H "Content-Type: application/json" \
     -d '{"username":"admin","password":"admin"}')
 HTTP_CODE=$(echo "$RESP" | tail -1)
-BODY=$(echo "$RESP" | head -n -1)
+BODY=$(echo "$RESP" | sed '$d')
 TOKEN=$(echo "$BODY" | grep -o '"token":"[^"]*"' | cut -d'"' -f4)
 check "admin auth token returned 200" "$([ "$HTTP_CODE" = "200" ] && echo 1 || echo 0)"
 check "token is non-empty" "$([ -n "$TOKEN" ] && echo 1 || echo 0)"
@@ -96,7 +96,7 @@ RESP=$(curl -s -w "\n%{http_code}" -X POST "$BASE/api/tables/query" \
     -H "$AUTH" \
     -d '{"sql":"SELECT * FROM events"}')
 HTTP_CODE=$(echo "$RESP" | tail -1)
-BODY=$(echo "$RESP" | head -n -1)
+BODY=$(echo "$RESP" | sed '$d')
 check "admin SELECT from events returns 200" "$([ "$HTTP_CODE" = "200" ] && echo 1 || echo 0)"
 check "SELECT result contains event data" "$(echo "$BODY" | grep -q 'event1' && echo 1 || echo 0)"
 
@@ -104,7 +104,7 @@ check "SELECT result contains event data" "$(echo "$BODY" | grep -q 'event1' && 
 RESP=$(curl -s -w "\n%{http_code}" -X GET "$BASE/api/rbac/policies" \
     -H "$AUTH")
 HTTP_CODE=$(echo "$RESP" | tail -1)
-BODY=$(echo "$RESP" | head -n -1)
+BODY=$(echo "$RESP" | sed '$d')
 check "GET /api/rbac/policies returns 200" "$([ "$HTTP_CODE" = "200" ] && echo 1 || echo 0)"
 
 # Create events2 table
@@ -131,7 +131,7 @@ RESP=$(curl -s -w "\n%{http_code}" -X POST "$BASE/api/rbac/policies" \
     -H "$AUTH" \
     -d '{"role":2,"table_pattern":"events","allowed_actions":1,"row_filter":""}')
 HTTP_CODE=$(echo "$RESP" | tail -1)
-BODY=$(echo "$RESP" | head -n -1)
+BODY=$(echo "$RESP" | sed '$d')
 check "POST /api/rbac/policies for viewer READ on events returns 200" \
     "$([ "$HTTP_CODE" = "200" ] && echo 1 || echo 0)"
 check "policy set response ok=true" "$(echo "$BODY" | grep -q '"ok":true' && echo 1 || echo 0)"
@@ -143,7 +143,7 @@ RESP=$(curl -s -w "\n%{http_code}" -X POST "$BASE/api/auth/apikeys" \
     -H "$AUTH" \
     -d '{"user_id":"viewer1","role":"viewer"}')
 HTTP_CODE=$(echo "$RESP" | tail -1)
-BODY=$(echo "$RESP" | head -n -1)
+BODY=$(echo "$RESP" | sed '$d')
 check "create viewer API key returns 200" "$([ "$HTTP_CODE" = "200" ] && echo 1 || echo 0)"
 APIKEY=$(echo "$BODY" | grep -o '"key":"[^"]*"' | cut -d'"' -f4)
 check "API key is non-empty" "$([ -n "$APIKEY" ] && echo 1 || echo 0)"

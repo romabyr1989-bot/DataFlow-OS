@@ -67,7 +67,7 @@ RESP=$(curl -s -w "\n%{http_code}" -X POST "$BASE/api/auth/token" \
     -H "Content-Type: application/json" \
     -d '{"username":"admin","password":"admin"}')
 HTTP_CODE=$(echo "$RESP" | tail -1)
-BODY=$(echo "$RESP" | head -n -1)
+BODY=$(echo "$RESP" | sed '$d')
 TOKEN=$(echo "$BODY" | grep -o '"token":"[^"]*"' | cut -d'"' -f4)
 check "admin auth token returned 200" "$([ "$HTTP_CODE" = "200" ] && echo 1 || echo 0)"
 check "token non-empty" "$([ -n "$TOKEN" ] && echo 1 || echo 0)"
@@ -99,7 +99,7 @@ curl -s -o /dev/null -X POST "$BASE/api/tables/query" \
 RESP=$(curl -s -w "\n%{http_code}" -X GET "$BASE/api/audit?limit=50" \
     -H "$AUTH")
 HTTP_CODE=$(echo "$RESP" | tail -1)
-BODY=$(echo "$RESP" | head -n -1)
+BODY=$(echo "$RESP" | sed '$d')
 check "GET /api/audit returns 200" "$([ "$HTTP_CODE" = "200" ] && echo 1 || echo 0)"
 check "audit response is a JSON array" "$(echo "$BODY" | grep -q '^\[' && echo 1 || echo 0)"
 
@@ -115,7 +115,7 @@ sleep 1
 RESP=$(curl -s -w "\n%{http_code}" -X GET "$BASE/api/audit?limit=100" \
     -H "$AUTH")
 HTTP_CODE=$(echo "$RESP" | tail -1)
-BODY=$(echo "$RESP" | head -n -1)
+BODY=$(echo "$RESP" | sed '$d')
 check "audit query after bad auth returns 200" "$([ "$HTTP_CODE" = "200" ] && echo 1 || echo 0)"
 check "audit log contains auth_fail event (event_type=5)" \
     "$(echo "$BODY" | grep -qE '"event_type":5|invalid credentials' && echo 1 || echo 0)"
@@ -131,7 +131,7 @@ RESP=$(curl -s -w "\n%{http_code}" -X POST "$BASE/api/auth/apikeys" \
     -H "Content-Type: application/json" \
     -H "$AUTH" \
     -d '{"user_id":"viewer2","role":"viewer"}')
-VIEWER_KEY=$(echo "$RESP" | head -n -1 | grep -o '"key":"[^"]*"' | cut -d'"' -f4)
+VIEWER_KEY=$(echo "$RESP" | sed '$d' | grep -o '"key":"[^"]*"' | cut -d'"' -f4)
 if [ -n "$VIEWER_KEY" ]; then
     RESP=$(curl -s -w "\n%{http_code}" -X GET "$BASE/api/audit?limit=10" \
         -H "Authorization: Bearer $VIEWER_KEY")

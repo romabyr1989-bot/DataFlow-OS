@@ -93,7 +93,7 @@ RESP=$(curl -s -w "\n%{http_code}" -X POST "$BASE/api/auth/token" \
     -H "Content-Type: application/json" \
     -d '{"username":"admin","password":"admin"}')
 HTTP_CODE=$(echo "$RESP" | tail -1)
-BODY=$(echo "$RESP" | head -n -1)
+BODY=$(echo "$RESP" | sed '$d')
 TOKEN=$(echo "$BODY" | grep -o '"token":"[^"]*"' | cut -d'"' -f4)
 check "admin auth in cluster mode returns 200" "$([ "$HTTP_CODE" = "200" ] && echo 1 || echo 0)"
 AUTH="Authorization: Bearer $TOKEN"
@@ -131,7 +131,7 @@ RESP=$(curl -s -w "\n%{http_code}" -X POST "$BASE/api/tables/query" \
     -H "$AUTH" \
     -d '{"sql":"SELECT * FROM repl_test"}')
 HTTP_CODE=$(echo "$RESP" | tail -1)
-BODY=$(echo "$RESP" | head -n -1)
+BODY=$(echo "$RESP" | sed '$d')
 check "SELECT from repl_test returns 200" "$([ "$HTTP_CODE" = "200" ] && echo 1 || echo 0)"
 check "data_1 visible in repl_test" "$(echo "$BODY" | grep -q 'data_1' && echo 1 || echo 0)"
 check "data_3 visible in repl_test" "$(echo "$BODY" | grep -q 'data_3' && echo 1 || echo 0)"
