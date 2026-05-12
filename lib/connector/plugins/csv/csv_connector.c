@@ -72,13 +72,13 @@ static void *csv_create(const char *cfg, Arena *a) {
             for(int i=0;i<n;i++){char tmp[16];snprintf(tmp,sizeof(tmp),"col%d",i);ctx->headers[i]=arena_strdup(a,tmp);}
             rewind(f);
         }
-        /* sample next line for types */
+        /* All columns stored as TEXT. qengine has a pre-existing read-back
+         * bug for INT64/DOUBLE columns where it returns raw values in cells
+         * (causes segfault on SELECT). Keeping everything as TEXT matches
+         * the schema of pipeline-produced tables (dept_stats, top_sellers,
+         * etc.) which are queryable without issue. User can CAST in SQL. */
         ColType *types=arena_calloc(a,n*sizeof(ColType));
         for(int i=0;i<n;i++) types[i]=COL_TEXT;
-        if (fgets(line,sizeof(line),f)){
-            int vn; char **vals=split_line(a,line,ctx->delimiter,&vn);
-            for(int i=0;i<vn&&i<n;i++) types[i]=infer_type(vals[i]);
-        }
         Schema *schema=arena_calloc(a,sizeof(Schema));
         schema->ncols=n; schema->cols=arena_alloc(a,n*sizeof(ColDef));
         for(int i=0;i<n;i++){schema->cols[i].name=hdrs[i];schema->cols[i].type=types[i];schema->cols[i].nullable=true;}

@@ -131,9 +131,15 @@ $(OUTDIR)/%.o: %.c
 	@$(CC) $(CFLAGS) -c $< -o $@
 
 # gateway binary
+# Connector .so files are built with -undefined dynamic_lookup (Darwin) and
+# defer resolving symbols like btree_close, write_rs_to_table, etc. to runtime
+# dlopen(). For that to work the gateway must export its own symbols — hence
+# -rdynamic (GNU ld) / -Wl,-export_dynamic (ld64).
+EXPORT_DYNAMIC = $(if $(filter Darwin,$(shell uname)),-Wl$(comma)-export_dynamic,-rdynamic)
+comma := ,
 $(GATEWAY): $(ALL_OBJS)
 	@echo "  LD  $@"
-	@$(CC) $(CFLAGS) $^ -o $@ $(LDFLAGS)
+	@$(CC) $(CFLAGS) $^ -o $@ $(LDFLAGS) $(EXPORT_DYNAMIC)
 
 # storage node binary (cluster replica)
 SN_OBJS = $(patsubst %.c,$(OUTDIR)/%.o,$(ALL_LIB_SRCS) $(SN_SRCS))

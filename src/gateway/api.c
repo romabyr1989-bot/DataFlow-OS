@@ -26,6 +26,7 @@
 #include <fcntl.h>
 #include <poll.h>
 #include <math.h>
+#include <dirent.h>
 
 /* Thread-local: txn_id active during exec_stmt call (0 = auto-commit) */
 static _Thread_local TxnId g_txn_current = 0;
@@ -3245,6 +3246,179 @@ static void h_pipeline_create(HttpReq *req, HttpResp *resp) {
     arena_destroy(ba);
 }
 
+/* Forward declaration — implementation lives below pipeline_execute_steps.
+ * `external_arena` lets a caller (preview-step) keep the arena alive after
+ * the call so that Table.schema (allocated inside) remains valid for
+ * follow-up queries. Pass NULL to use a self-managed internal arena. */
+static void pipeline_execute_steps_internal(Pipeline *p, App *app, bool report, Arena *external_arena);
+
+/* ── POST /api/pipelines/preview-step ──
+ *
+ * Body: Pipeline JSON (typically a single-step pipeline).
+ * Query: ?save=0|1 (default 0). When 0, the step's target_table is overridden
+ *        with a temp name and the temp table is dropped after the result is
+ *        read. When 1, the step writes to its real target_table and the table
+ *        persists.
+ *
+ * Response 200: { "columns": [...], "rows": [[...]], "rows_returned": N,
+ *                 "rows_written": M, "target_table": "..." }
+ * Response 400/500: { "error": "..." } — surfaces server-side error_msg.
+ *
+ * Unlike POST /api/pipelines → POST /api/pipelines/:id/run round-trip, this
+ * does NOT touch the catalog (no pipeline row, no run-log row) and does NOT
+ * broadcast any WS event. The pipeline lives only on this thread's stack. */
+static void h_pipeline_preview_step(HttpReq *req, HttpResp *resp) {
+    if (!req->body || !req->body_len) { http_resp_error(resp, 400, "empty body"); return; }
+
+    /* Parse `save` flag from query string. */
+    bool save = false;
+    if (req->query) {
+        const char *p = strstr(req->query, "save=");
+        if (p) save = (p[5] == '1');
+    }
+
+    /* Parse `limit` from query string (default 100, capped at 10000). */
+    int limit = 100;
+    if (req->query) {
+        const char *p = strstr(req->query, "limit=");
+        if (p) {
+            int v = atoi(p + 6);
+            if (v > 0 && v <= 10000) limit = v;
+        }
+    }
+
+    /* Pipeline is ~1MB (MAX_STEPS=64 × ~14KB per step). Put it on the heap
+     * — putting it on the stack risks overflowing macOS's 512KB default
+     * thread stack (HTTP worker threads use a small stack). */
+    Pipeline *plp = calloc(1, sizeof(Pipeline));
+    if (!plp) { http_resp_error(resp, 500, "out of memory"); return; }
+    if (pipeline_from_json(plp, req->body) < 0) {
+        free(plp); http_resp_error(resp, 400, "invalid pipeline json"); return;
+    }
+    if (plp->nsteps == 0) {
+        free(plp); http_resp_error(resp, 400, "pipeline has no steps"); return;
+    }
+
+    /* Override target_table for preview mode so the user's real target isn't
+     * touched. For save=1 we trust the caller's target_table — but require
+     * that it's non-empty. */
+    char tmp_table[128];
+    snprintf(tmp_table, sizeof(tmp_table), "__preview_%lld_%d",
+             (long long)time(NULL), rand() & 0xFFFF);
+    if (!save) {
+        strncpy(plp->steps[plp->nsteps - 1].target_table, tmp_table,
+                sizeof(plp->steps[0].target_table) - 1);
+    } else if (!plp->steps[plp->nsteps - 1].target_table[0]) {
+        free(plp);
+        http_resp_error(resp, 400, "save=1 requires target_table on last step");
+        return;
+    }
+    const char *out_table = plp->steps[plp->nsteps - 1].target_table;
+
+    /* Tag the pipeline so any log-output that does leak through is clearly
+     * identifiable. We don't go through the scheduler — pipeline is heap-only. */
+    snprintf(plp->id, sizeof(plp->id), "__preview_%lld_%d",
+             (long long)time(NULL), rand() & 0xFFFF);
+
+    /* Force zero retries so /run won't sleep through retry-backoff cycles. */
+    for (int i = 0; i < plp->nsteps; i++) {
+        plp->steps[i].max_retries = 0;
+        plp->steps[i].retry_delay_sec = 1;
+    }
+
+    /* Single arena shared across step execution + the follow-up SELECT.
+     * pipeline_execute_steps_internal allocates Schema/etc. into this arena
+     * via recreate_table → write_rs_to_table; the schema must stay alive
+     * because subsequent exec_stmt walks Table.schema for typing. */
+    Arena *a = arena_create(4194304);
+    LOG_INFO("preview-step: executing %d step(s) → %s (save=%d)", plp->nsteps, out_table, (int)save);
+    pipeline_execute_steps_internal(plp, &g_app, /*report=*/false, /*external_arena=*/a);
+    if (plp->run_status == RUN_FAILED) {
+        JBuf jb; jb_init(&jb, a, 1024);
+        jb_obj_begin(&jb);
+        jb_key(&jb, "error"); jb_str(&jb, plp->error_msg[0] ? plp->error_msg : "step failed");
+        jb_obj_end(&jb);
+        http_resp_json(resp, 500, jb_done(&jb));
+        arena_destroy(a);
+        free(plp);
+        return;
+    }
+
+    /* Read the result inline — works now that CSV connector forces TEXT-only
+     * types (qengine read-back bug was specific to INT64/DOUBLE columns). */
+    char sql_buf[256];
+    snprintf(sql_buf, sizeof(sql_buf), "SELECT * FROM %s LIMIT %d", out_table, limit);
+    Stmt *stmt = sql_parse(a, sql_buf, strlen(sql_buf));
+    RS *rs = (stmt && !stmt->error) ? exec_stmt(a, stmt, NULL) : NULL;
+
+    JBuf jb; jb_init(&jb, a, 65536);
+    jb_obj_begin(&jb);
+    jb_key(&jb, "columns"); jb_arr_begin(&jb);
+    if (rs) for (int i = 0; i < rs->ncols; i++)
+        jb_str(&jb, rs->col_names[i] ? rs->col_names[i] : "");
+    jb_arr_end(&jb);
+    jb_key(&jb, "rows"); jb_arr_begin(&jb);
+    if (rs) for (int r = 0; r < rs->nrows; r++) {
+        jb_arr_begin(&jb);
+        for (int c = 0; c < rs->ncols; c++) {
+            const char *v = rs->rows[r].cells ? rs->rows[r].cells[c] : "";
+            jb_str(&jb, v ? v : "");
+        }
+        jb_arr_end(&jb);
+    }
+    jb_arr_end(&jb);
+    jb_key(&jb, "rows_returned"); jb_int(&jb, rs ? rs->nrows : 0);
+    jb_key(&jb, "target_table"); jb_str(&jb, save ? out_table : "");
+    jb_key(&jb, "preview"); jb_bool(&jb, !save);
+    jb_obj_end(&jb);
+
+    /* Body lives in the arena — copy to thread-local buffer since arena_destroy
+     * runs before the HTTP framework reads resp->body. */
+    static _Thread_local char *resp_buf = NULL;
+    static _Thread_local size_t resp_cap = 0;
+    const char *body = jb_done(&jb);
+    size_t body_len = body ? strlen(body) : 0;
+    if (body_len + 1 > resp_cap) {
+        free(resp_buf);
+        resp_cap = body_len + 1 + 4096;
+        resp_buf = malloc(resp_cap);
+    }
+    if (resp_buf) memcpy(resp_buf, body, body_len + 1);
+    http_resp_json(resp, 200, resp_buf ? resp_buf : "{}");
+
+    /* In preview mode (save=0) drop the temp table the step wrote to — we
+     * already extracted the rows into the response body. In save mode the
+     * table is the user's real target, leave it alone. */
+    if (!save) {
+        pthread_mutex_lock(&g_app.tables_mu);
+        Table *t = hm_get(&g_app.tables, out_table);
+        if (t) { table_close(t); hm_del(&g_app.tables, out_table); }
+        pthread_mutex_unlock(&g_app.tables_mu);
+        catalog_drop_table(g_app.catalog, out_table);
+        char dir_path[1024];
+        snprintf(dir_path, sizeof(dir_path), "%s/%s", g_app.data_dir, out_table);
+        /* Remove all files inside (wal.bin, schema.json, any indexes) then
+         * the directory itself. Don't assume a fixed set — table_create may
+         * write multiple sidecar files. */
+        DIR *d = opendir(dir_path);
+        if (d) {
+            struct dirent *ent;
+            while ((ent = readdir(d))) {
+                if (ent->d_name[0] == '.') continue;
+                char fp[2048];
+                snprintf(fp, sizeof(fp), "%s/%s", dir_path, ent->d_name);
+                unlink(fp);
+            }
+            closedir(d);
+        }
+        rmdir(dir_path);
+        if (t) __atomic_fetch_sub(&g_app.metrics->tables_count, 1, __ATOMIC_RELAXED);
+    }
+
+    arena_destroy(a);
+    free(plp);
+}
+
 /* ── POST /api/pipelines/preview-yaml ──
  *
  * Body: text/yaml — a single pipeline document.
@@ -3717,8 +3891,13 @@ static int run_python_step(App *app, Arena *a, PipelineStep *st,
 }
 
 /* ── Execute all steps of a pipeline ── */
-void pipeline_execute_steps(Pipeline *p, App *app) {
-    Arena *a = arena_create(4194304); /* 4 MiB */
+/* Internal: execute pipeline steps with optional run-logging/broadcast.
+ * `report=false` is used by the preview-step endpoint so transient one-shot
+ * runs don't clutter catalog's runs history or fire pipeline_done WS events.
+ * `external_arena=non-NULL` skips internal arena create/destroy so the
+ * caller can keep Schema/table allocations alive for follow-up queries. */
+static void pipeline_execute_steps_internal(Pipeline *p, App *app, bool report, Arena *external_arena) {
+    Arena *a = external_arena ? external_arena : arena_create(4194304); /* 4 MiB */
     int64_t started = (int64_t)time(NULL);
     int total_rows = 0;
     const char *run_error = NULL;
@@ -3795,15 +3974,24 @@ void pipeline_execute_steps(Pipeline *p, App *app) {
     p->run_status = RUN_SUCCESS;
 
 done:
-    catalog_log_run(app->catalog, p->id, started, (int64_t)time(NULL),
-                    p->run_status == RUN_SUCCESS ? 0 : 1, run_error, total_retries);
-    send_pipeline_alert(p, run_error, p->run_status == RUN_SUCCESS);
-    Arena *ba = arena_create(512);
-    app_ws_broadcast(app, arena_sprintf(ba,
-        "{\"event\":\"pipeline_done\",\"id\":\"%s\",\"status\":\"%s\",\"rows_written\":%d}",
-        p->id, p->run_status == RUN_SUCCESS ? "success" : "failed", total_rows));
-    arena_destroy(ba);
-    arena_destroy(a);
+    if (report) {
+        catalog_log_run(app->catalog, p->id, started, (int64_t)time(NULL),
+                        p->run_status == RUN_SUCCESS ? 0 : 1, run_error, total_retries);
+        send_pipeline_alert(p, run_error, p->run_status == RUN_SUCCESS);
+        Arena *ba = arena_create(512);
+        app_ws_broadcast(app, arena_sprintf(ba,
+            "{\"event\":\"pipeline_done\",\"id\":\"%s\",\"status\":\"%s\",\"rows_written\":%d}",
+            p->id, p->run_status == RUN_SUCCESS ? "success" : "failed", total_rows));
+        arena_destroy(ba);
+    } else {
+        (void)started; (void)run_error; (void)total_retries; (void)total_rows;
+    }
+    /* Only destroy the arena if WE created it. */
+    if (!external_arena) arena_destroy(a);
+}
+
+void pipeline_execute_steps(Pipeline *p, App *app) {
+    pipeline_execute_steps_internal(p, app, /*report=*/true, /*external_arena=*/NULL);
 }
 
 /* ── POST /api/pipelines/:id/run ── */
@@ -4601,6 +4789,7 @@ void api_register_routes(Router *r) {
     router_add(r,"GET",  "/api/pipelines",           h_pipelines_list);
     router_add(r,"POST", "/api/pipelines",           h_pipeline_create);
     router_add(r,"POST", "/api/pipelines/preview-yaml", h_pipeline_preview_yaml); /* Step 5 */
+    router_add(r,"POST", "/api/pipelines/preview-step", h_pipeline_preview_step);
     router_add(r,"GET",  "/api/pipelines/:id",       h_pipeline_get);
     router_add(r,"POST", "/api/pipelines/:id/run",   h_pipeline_run);
     router_add(r,"DELETE","/api/pipelines/:id",      h_pipeline_delete);

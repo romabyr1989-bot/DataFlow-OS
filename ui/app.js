@@ -18,13 +18,6 @@ let isLoggedIn = !!jwtToken;
 /* Pipeline builder */
 const pb = { steps: [], editId: null, max_retries: 3, retry_delay_sec: 30, webhook_url: '', webhook_on: 'failure', alert_cooldown: 300 };
 
-/* Ingest */
-let ingestContent  = null;
-let ingestColumns  = [];
-let ingestDelimiter = ',';
-let ingestMode = 'csv'; // 'csv' | 'parquet'
-let ingestFile = null;  // raw File object (for parquet binary upload)
-
 /* User preferences */
 let prefs = {};
 
@@ -119,10 +112,10 @@ document.querySelectorAll('.nav-item').forEach(a => {
   a.addEventListener('click', e => { e.preventDefault(); switchView(a.dataset.view); });
 });
 
-const VALID_VIEWS = new Set(['query','pipelines','builder','ingest','analytics','matviews','security','metrics','settings']);
+const VALID_VIEWS = new Set(['pipelines','builder','analytics','matviews','security','metrics','settings']);
 
 function switchView(name, { pushState = true } = {}) {
-  if (!VALID_VIEWS.has(name)) name = 'ingest';
+  if (!VALID_VIEWS.has(name)) name = 'pipelines';
 
   document.querySelectorAll('.nav-item').forEach(n => n.classList.remove('active'));
   document.querySelectorAll('.view').forEach(v => v.classList.remove('active'));
@@ -135,8 +128,7 @@ function switchView(name, { pushState = true } = {}) {
   const nb = document.getElementById('nav-builder');
   if (name !== 'builder') nb.classList.remove('visible');
 
-  if (name === 'query')     { loadQuerySidebar(); }
-  if (name === 'pipelines') loadPipelines();
+  if (name === 'pipelines') loadPipelinesView();
   if (name === 'analytics') loadAnalyticsModule();
   if (name === 'matviews')  loadMatviews();
   if (name === 'security')  { loadRbacPolicies(); }
@@ -147,9 +139,16 @@ function switchView(name, { pushState = true } = {}) {
     history.pushState({ view: name }, '', '#' + name);
 }
 
+/* Pipelines view now also hosts the tables panel (formerly a separate view). */
+function loadPipelinesView() {
+  loadPipelines();
+  loadQuerySidebar();
+}
+
 window.addEventListener('popstate', e => {
-  const view = (e.state?.view) || location.hash.replace('#', '') || 'ingest';
-  switchView(view, { pushState: false });
+  const { view, id } = parseHash();
+  if (view === 'builder' && id) { restoreBuilderFromHash(id); return; }
+  switchView(view || 'pipelines', { pushState: false });
 });
 
 
@@ -289,12 +288,267 @@ function makeTableCard(t) {
     ev.stopPropagation();
     deleteTable(t.name);
   });
-  card.onclick = () => {
-    document.getElementById('sql-input').value = `SELECT * FROM ${t.name} LIMIT ${prefs.rowLimit || 100}`;
-    document.getElementById('query-editor-block')?.scrollIntoView({ behavior: 'smooth' });
-    runQuery();
-  };
+  card.onclick = () => openTablePreview(t.name);
   return card;
+}
+
+/* Run a single step in isolation, without saving the parent pipeline.
+ *
+ * Strategy: build a one-shot transient pipeline with this step + a synthetic
+ * target_table (`__preview_xxx`), trigger it via /api/pipelines/:id/run, query
+ * the result, and clean up. Works uniformly for SQL, Python, and connector
+ * steps because we reuse the actual pipeline runner.
+ *
+ * opts.save = true   → write into the step's real target_table and keep it
+ * opts.save = false  → write into a temp table, return rows, delete the temp
+ */
+/* Run ONLY this step's transform_sql against current tables — no upstream
+ * chain, no connector, no python. Result renders in the inline preview panel
+ * below the card. Uses /api/tables/query directly (fastest path). */
+async function runStepSQL(idx) {
+  const step = pb.steps[idx];
+  const sql = (step?.transform_sql || '').trim();
+  const panel = document.getElementById(`step-preview-${idx}`);
+  if (!panel) return;
+  panel.style.display = '';
+  if (!sql) {
+    panel.innerHTML = '<div style="padding:.6rem;color:var(--amber)">SQL пустой — нечего запускать</div>';
+    return;
+  }
+  panel.innerHTML = '<div style="padding:.6rem;color:var(--muted)">Выполняется SQL…</div>';
+  const t0 = performance.now();
+  try {
+    const data = await apiPost('/api/tables/query', { sql });
+    if (!data) { panel.innerHTML = '<div style="padding:.6rem;color:var(--red)">Сервер вернул undefined</div>'; return; }
+    const ms = (performance.now() - t0).toFixed(1);
+    const rows = data.rows || [];
+    panel.innerHTML = '';
+    const status = document.createElement('div');
+    status.style.cssText = 'font-size:.78rem;color:var(--muted);margin-bottom:.4rem';
+    status.innerHTML = `▶ SQL — ${rows.length} ${pluralRows(rows.length)} · ${ms} мс`;
+    panel.appendChild(status);
+    panel.appendChild(makeResultTable(data));
+  } catch (err) {
+    let msg = String(err);
+    try { const j = JSON.parse(msg.replace(/^Error:\s*/,'')); if (j.error) msg = j.error; } catch(_) {}
+    panel.innerHTML = `<div style="padding:.75rem;color:var(--red);background:var(--surface);border:1px dashed var(--border);border-radius:var(--radius);font-family:var(--mono);font-size:.78rem">${escHtml(msg)}</div>`;
+  }
+}
+
+/* Run ONLY this step's python_code (with its transform_sql as input data) —
+ * no upstream chain. Single-step POST to /api/pipelines/preview-step. */
+async function runStepPython(idx) {
+  const step = pb.steps[idx];
+  const panel = document.getElementById(`step-preview-${idx}`);
+  if (!panel) return;
+  panel.style.display = '';
+  if (!step?.python_code) {
+    panel.innerHTML = '<div style="padding:.6rem;color:var(--amber)">Python-код пустой</div>';
+    return;
+  }
+  panel.innerHTML = '<div style="padding:.6rem;color:var(--muted)">Выполняется Python…</div>';
+
+  const payload = {
+    name: 'preview',
+    enabled: false,
+    steps: [{
+      id:                 'preview',
+      name:               step.name || 'preview',
+      connector_type:     '',
+      connector_config:   '',
+      transform_sql:      step.transform_sql || '',
+      python_code:        step.python_code,
+      python_timeout_sec: step.python_timeout_sec || 300,
+      target_table:       '',
+      max_retries:        0,
+      retry_delay_sec:    1,
+      deps:               [],
+    }],
+  };
+  const limit = prefs.rowLimit || 100;
+  const t0 = performance.now();
+  try {
+    const data = await apiPost(`/api/pipelines/preview-step?save=0&limit=${limit}`, payload);
+    if (!data) { panel.innerHTML = '<div style="padding:.6rem;color:var(--red)">Сервер вернул undefined</div>'; return; }
+    const ms = (performance.now() - t0).toFixed(1);
+    const rows = data.rows || [];
+    panel.innerHTML = '';
+    const status = document.createElement('div');
+    status.style.cssText = 'font-size:.78rem;color:var(--muted);margin-bottom:.4rem';
+    status.innerHTML = `▶ Python — ${rows.length} ${pluralRows(rows.length)} · ${ms} мс`;
+    panel.appendChild(status);
+    panel.appendChild(makeResultTable(data));
+  } catch (err) {
+    let msg = String(err);
+    try { const j = JSON.parse(msg.replace(/^Error:\s*/,'')); if (j.error) msg = j.error; } catch(_) {}
+    panel.innerHTML = `<div style="padding:.75rem;color:var(--red);background:var(--surface);border:1px dashed var(--border);border-radius:var(--radius);font-family:var(--mono);font-size:.78rem">${escHtml(msg)}</div>`;
+  }
+}
+
+async function runStepPreview(idx, opts = {}) {
+  const save = !!opts.save;
+  const step = pb.steps[idx];
+
+  /* In save mode, persist the entire builder state first — otherwise the
+   * user's SQL/Python edits in the textareas would be lost. The data write
+   * to target_table comes second so the pipeline JSON matches what produced
+   * the rows. */
+  if (save) {
+    try {
+      const created = await persistBuilderPipeline();
+      if (!created) return;
+    } catch (err) {
+      const panel = document.getElementById(`step-preview-${idx}`);
+      if (panel) {
+        panel.style.display = '';
+        panel.innerHTML = `<div style="padding:.75rem;color:var(--red);font-family:var(--mono);font-size:.78rem">Ошибка сохранения конвейера: ${escHtml(String(err))}</div>`;
+      }
+      return;
+    }
+  }
+
+  /* Show the panel up-front so any failure path is visible to the user. */
+  const panel = document.getElementById(`step-preview-${idx}`);
+  if (!panel) { console.error(`runStepPreview: no panel for idx=${idx}`); return; }
+  panel.style.display = '';
+  const setStatus = (msg, color) => {
+    panel.innerHTML = `<div style="padding:.6rem;color:${color || 'var(--muted)'};font-family:var(--mono);font-size:.78rem">${msg}</div>`;
+  };
+
+  if (!step) { setStatus(`step #${idx} не найден в pb.steps (length=${pb.steps.length})`, 'var(--red)'); return; }
+  if (!step.transform_sql && !step.python_code && !step.connector_type) {
+    setStatus('Шаг пустой — заполни SQL, Python или подключи коннектор', 'var(--amber)');
+    return;
+  }
+  if (save && !step.target_table) {
+    setStatus('Укажи target_table — иначе некуда сохранять', 'var(--amber)');
+    return;
+  }
+  setStatus(save
+    ? `Сохранение шага ${idx + 1}${idx > 0 ? ` (+ ${idx} upstream)` : ''}…`
+    : `Запуск шага ${idx + 1}${idx > 0 ? ` (+ ${idx} upstream)` : ''}…`);
+
+  const limit = prefs.rowLimit || 100;
+
+  /* Run every step up to AND INCLUDING the clicked one. Without this, a step
+   * that reads from an upstream target_table (e.g. SELECT ... FROM clean_employees)
+   * would find that table empty because step 0/1/… never ran. The backend
+   * overrides only the LAST step's target_table for save=0, so intermediate
+   * tables are written for real — same as running the pipeline up to here. */
+  const chain = pb.steps.slice(0, idx + 1).map((s, i) => ({
+    id:                 s.id || `s${i}`,
+    name:               s.name || `step ${i + 1}`,
+    connector_type:     s.connector_type || '',
+    connector_config:   s.connector_config || '',
+    transform_sql:      s.transform_sql || '',
+    python_code:        s.python_code || '',
+    python_timeout_sec: s.python_timeout_sec || 300,
+    target_table:       s.target_table || '',
+    max_retries:        0,
+    retry_delay_sec:    1,
+    deps:               [],
+  }));
+
+  const payload = { name: 'preview', enabled: false, steps: chain };
+
+  try {
+    /* Single-call flow: server runs the chain in-memory, returns rows
+     * directly. For save=0 the server transparently uses a temp table that
+     * is dropped before the response is sent — no client-side cleanup needed. */
+    const url = `/api/pipelines/preview-step?save=${save ? 1 : 0}&limit=${limit}`;
+    console.log('[step preview] POST', url, payload);
+    const data = await apiPost(url, payload);
+    if (!data) {
+      setStatus('Сервер вернул пустой ответ', 'var(--red)');
+      return;
+    }
+    console.log('[step preview] result:', data);
+    const rows = data.rows || [];
+    const cols = data.columns || [];
+    const outTable = data.target_table || step.target_table || '';
+    panel.innerHTML = '';
+
+    const status = document.createElement('div');
+    status.style.cssText = 'font-size:.78rem;color:var(--muted);margin-bottom:.4rem';
+    status.innerHTML = save
+      ? `✓ Сохранено в <strong>${escHtml(outTable)}</strong> — ${rows.length} ${pluralRows(rows.length)} (показаны первые ${limit})`
+      : `Превью — ${rows.length} ${pluralRows(rows.length)} (LIMIT ${limit})`;
+    panel.appendChild(status);
+
+    if (rows.length === 0) {
+      /* Diagnostic: parse FROM/JOIN out of transform_sql, fetch /api/tables,
+       * show which source tables are empty — that's the usual reason. */
+      const sql = (step.transform_sql || '').toLowerCase();
+      const sources = [...new Set([
+        ...[...sql.matchAll(/\bfrom\s+([a-z_][a-z0-9_]*)/g)].map(m => m[1]),
+        ...[...sql.matchAll(/\bjoin\s+([a-z_][a-z0-9_]*)/g)].map(m => m[1]),
+      ])];
+
+      let sourcesReport = '';
+      if (sources.length) {
+        try {
+          const tbls = await apiFetch('/api/tables');
+          const counts = sources.map(s => {
+            const t = (tbls || []).find(x => x.name === s);
+            return { name: s, rows: t ? (t.rows || 0) : null };
+          });
+          sourcesReport = `<div style="margin-top:.6rem;text-align:left">Источники в SQL:<br>${
+            counts.map(c => c.rows === null
+              ? `&nbsp;&nbsp;<code>${escHtml(c.name)}</code> <span style="color:var(--red)">— нет такой таблицы</span>`
+              : `&nbsp;&nbsp;<code>${escHtml(c.name)}</code> — <strong>${fmtNum(c.rows)}</strong> ${pluralRows(c.rows)}${c.rows===0?' <span style="color:var(--amber)">⚠ пусто</span>':''}`
+            ).join('<br>')
+          }</div>`;
+        } catch (_) { /* skip diagnostic on auth issues */ }
+      }
+
+      const empty = document.createElement('div');
+      empty.style.cssText = 'padding:1rem;color:var(--muted);background:var(--surface);border:1px dashed var(--border);border-radius:var(--radius)';
+      const colsHint = cols.length
+        ? `<div style="text-align:center">Схема результата: <code>${cols.map(escHtml).join(', ')}</code></div>`
+        : '';
+      empty.innerHTML = `${colsHint}
+        <div style="text-align:center;margin-top:.5rem">Шаг отработал, но вернул <strong>0 строк</strong>.</div>
+        ${sourcesReport}`;
+      panel.appendChild(empty);
+    } else {
+      panel.appendChild(makeResultTable(data));
+    }
+
+    if (save) {
+      showToast(`Таблица «${outTable}» обновлена`, 'ok');
+      loadQuerySidebar();
+    }
+    /* No client-side cleanup: server already dropped the temp table for save=0. */
+  } catch (err) {
+    let msg = String(err);
+    try { const j = JSON.parse(msg.replace(/^Error:\s*/,'')); if (j.error) msg = j.error; } catch(_) {}
+    panel.innerHTML = `<div style="padding:.75rem;color:var(--red);background:var(--surface);border:1px dashed var(--border);border-radius:var(--radius);font-family:var(--mono);font-size:.78rem">${escHtml(msg)}</div>`;
+  }
+}
+
+/* Preview the first N rows of a table in a modal (replaces the old Query view's
+ * inline SQL editor flow). For ad-hoc SQL, use the Analytics page. */
+async function openTablePreview(name) {
+  const modal = document.getElementById('table-preview-modal');
+  if (!modal) return;
+  document.getElementById('table-preview-title').textContent = `Таблица: ${name}`;
+  const status = document.getElementById('table-preview-status');
+  const body   = document.getElementById('table-preview-body');
+  const limit  = prefs.rowLimit || 100;
+  status.textContent = 'Загрузка…';
+  body.innerHTML = '';
+  modal.classList.remove('hidden');
+  const t0 = performance.now();
+  try {
+    const data = await apiPost('/api/tables/query', { sql: `SELECT * FROM ${name} LIMIT ${limit}` });
+    const ms = (performance.now() - t0).toFixed(1);
+    const rows = data.rows || [];
+    status.textContent = `${rows.length} ${pluralRows(rows.length)} · ${ms} мс · LIMIT ${limit}`;
+    body.appendChild(makeResultTable(data));
+  } catch (err) {
+    status.textContent = 'Ошибка';
+    body.innerHTML = `<div style="color:var(--red);padding:.5rem;font-family:monospace">${escHtml(String(err))}</div>`;
+  }
 }
 
 async function openIndexManager(tableName, ev) {
@@ -346,70 +600,9 @@ async function deleteTable(name) {
   }
 }
 
-function queryTable(name) {
-  document.getElementById('sql-input').value = `SELECT * FROM ${name} LIMIT ${prefs.rowLimit || 100}`;
-  runQuery();
-}
-
-function insertIntoQuery(name) {
-  const ta  = document.getElementById('sql-input');
-  const pos = ta.selectionStart;
-  ta.value  = ta.value.slice(0, pos) + name + ta.value.slice(ta.selectionEnd);
-  ta.focus();
-  ta.setSelectionRange(pos + name.length, pos + name.length);
-}
-
-function clearQuery() {
-  document.getElementById('sql-input').value = '';
-  document.getElementById('query-result').innerHTML = '';
-  document.getElementById('query-status').textContent = '';
-}
-
-async function runQuery() {
-  const sql = document.getElementById('sql-input').value.trim();
-  if (!sql) return;
-  const status = document.getElementById('query-status');
-  const result = document.getElementById('query-result');
-  status.textContent = 'Выполняется…';
-  result.innerHTML   = '';
-  const t0 = performance.now();
-  try {
-    const data = await apiPost('/api/tables/query', { sql });
-    const ms   = (performance.now() - t0).toFixed(1);
-    const cols = data.columns || [];
-    const rows = data.rows || [];
-    const dmlKey = cols.length === 1 && rows.length === 1 && (cols[0] === 'deleted' || cols[0] === 'updated') ? cols[0] : null;
-    if (dmlKey) {
-      const n = parseInt(rows[0][0] ?? rows[0][dmlKey] ?? 0, 10);
-      const label = dmlKey === 'deleted' ? 'Удалено' : 'Обновлено';
-      status.textContent = `${label}: ${n} · ${ms} мс`;
-      result.appendChild(makeDmlBanner(dmlKey, n));
-    } else {
-      status.textContent = `${rows.length} ${pluralRows(rows.length)} · ${ms} мс`;
-      result.appendChild(makeResultTable(data));
-    }
-  } catch (err) {
-    status.textContent = 'Ошибка';
-    let msg = String(err);
-    try { const j = JSON.parse(msg.replace(/^Error:\s*/,'')); if (j.error) msg = j.error; } catch(_) {}
-    result.innerHTML = `<div style="color:var(--red);padding:.5rem;font-family:monospace">${escHtml(msg)}</div>`;
-  }
-}
-
-function makeDmlBanner(op, count) {
-  const d = document.createElement('div');
-  d.className = 'dml-banner';
-  const icon = op === 'deleted' ? '🗑' : '✏';
-  const verb = op === 'deleted' ? 'Удалено' : 'Обновлено';
-  const rowWord = count === 1 ? 'строка' : count >= 2 && count <= 4 ? 'строки' : 'строк';
-  d.innerHTML = `<span class="dml-icon">${icon}</span>${verb}: <span class="dml-count">${count}</span>&nbsp;${rowWord}`;
-  return d;
-}
+/* SQL editor moved to the Analytics page; standalone Query view was removed. */
 
 document.addEventListener('DOMContentLoaded', () => {
-  document.getElementById('sql-input')?.addEventListener('keydown', e => {
-    if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') { e.preventDefault(); runQuery(); }
-  });
   document.getElementById('an-view-sql')?.addEventListener('keydown', e => {
     if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') { e.preventDefault(); runViewQuery(); }
   });
@@ -682,7 +875,37 @@ function openPipelineBuilder(pipeline) {
 
   renderBuilderSteps();
   renderTriggers();
-  switchView('builder');
+
+  /* Push a pipeline-specific URL so F5 can restore the same builder context.
+   * Use switchView with pushState:false so it doesn't push generic '#builder'
+   * that would lose the id. */
+  switchView('builder', { pushState: false });
+  const wantHash = '#builder/' + (pb.editId || 'new');
+  if (location.hash !== wantHash) {
+    history.pushState({ view: 'builder', id: pb.editId || null }, '', wantHash);
+  }
+}
+
+/* Parse a hash like '#builder/p_xxx' or '#analytics' into { view, id }.
+ * Returns id=null when the hash is a plain view name. */
+function parseHash() {
+  const raw = location.hash.replace('#', '');
+  const slash = raw.indexOf('/');
+  if (slash > 0) return { view: raw.slice(0, slash), id: raw.slice(slash + 1) };
+  return { view: raw, id: null };
+}
+
+/* Look up a pipeline by id and open the builder on it, or fall back to the
+ * list. Used by bootView/initApp/popstate when the URL is '#builder/<id>'. */
+async function restoreBuilderFromHash(id) {
+  if (!id || id === 'new') { switchView('pipelines', { pushState: false }); return; }
+  try {
+    const pipelines = await apiFetch('/api/pipelines');
+    const p = (pipelines || []).find(x => x.id === id);
+    if (p) { openPipelineBuilder(p); return; }
+  } catch (_) { /* fall through to pipelines */ }
+  switchView('pipelines', { pushState: false });
+  history.replaceState({ view: 'pipelines' }, '', '#pipelines');
 }
 
 /* ── Step 4: triggers UI ─────────────────────────────────────── */
@@ -892,7 +1115,16 @@ function renderBuilderSteps() {
     return;
   }
   container.innerHTML = '';
-  pb.steps.forEach((step, i) => container.appendChild(makeStepCard(step, i)));
+  pb.steps.forEach((step, i) => {
+    container.appendChild(makeStepCard(step, i));
+    /* Sibling div that lives directly below each card — this is where the
+     * inline target-table preview renders when the card is clicked. */
+    const preview = document.createElement('div');
+    preview.id = `step-preview-${i}`;
+    preview.className = 'step-preview-inline';
+    preview.style.cssText = 'display:none;margin:-0.5rem 0 1rem 0';
+    container.appendChild(preview);
+  });
 }
 
 function renderFlowGraph() {
@@ -942,7 +1174,9 @@ function renderFlowGraph() {
       <text x="${cx}" y="${y + 30}" text-anchor="middle" font-size="13" font-weight="600"
             fill="${TEXT}" font-family="system-ui,sans-serif">${escHtml(name)}</text>
       ${table ? `<text x="${cx}" y="${y + 52}" text-anchor="middle" font-size="11"
-            fill="${SUB}" font-family="system-ui,sans-serif">→ ${escHtml(table)}</text>` : ''}
+            fill="${SUB}" font-family="system-ui,sans-serif"
+            onclick="event.stopPropagation();document.getElementById('step-card-${i}')?.scrollIntoView({behavior:'smooth',block:'nearest'});runStepPreview(${i})"
+            style="cursor:pointer;text-decoration:underline">→ ${escHtml(table)}</text>` : ''}
     </g>`;
   });
 
@@ -954,6 +1188,23 @@ function makeStepCard(step, idx) {
   const div = document.createElement('div');
   div.className = 'step-card';
   div.id = `step-card-${idx}`;
+  div.style.cursor = 'pointer';
+  /* Click on the card body (but not on form controls) toggles the target_table
+   * preview panel inline below the card. */
+  div.addEventListener('click', (e) => {
+    /* Ignore clicks on actual form controls; everything else (labels, hints,
+     * card background) toggles the inline preview. We RUN the step in preview
+     * mode rather than just querying target_table — most steps haven't been
+     * executed yet, so the existing table is empty. */
+    if (e.target.closest('input, textarea, select, button, option')) return;
+    const panel = document.getElementById(`step-preview-${idx}`);
+    if (panel && panel.style.display !== 'none') {
+      panel.style.display = 'none';
+      panel.innerHTML = '';
+    } else {
+      runStepPreview(idx);
+    }
+  });
   div.innerHTML = `
     <div class="step-header">
       <span class="step-num">${idx + 1}</span>
@@ -983,11 +1234,13 @@ function makeStepCard(step, idx) {
           </select>
         </div>
         <div class="form-group" style="margin:0">
-          <label>Результат → таблица</label>
-          <input type="text" placeholder="имя_таблицы"
+          <label>Результат → таблица <span class="label-hint">— клик по карточке откроет содержимое</span></label>
+          <input id="step-target-${idx}" type="text" placeholder="имя_таблицы"
                  value="${escAttr(step.target_table)}"
                  oninput="pbUpdateStep(${idx},'target_table',this.value);renderFlowGraph()">
         </div>
+      </div>
+      <div id="step-conn-cfg-${idx}" style="margin-top:0.75rem">${makeConnectorConfigHTML(step, idx)}</div>
       <div class="step-row-2" style="margin-top:0.75rem">
         <div class="form-group" style="margin:0">
           <label>Max retries</label>
@@ -1001,10 +1254,21 @@ function makeStepCard(step, idx) {
         </div>
       </div>
       <div class="form-group" style="margin:0">
-        <label>SQL-трансформация <span class="label-hint">выполняется после загрузки данных</span></label>
+        <label style="display:flex;align-items:center;gap:.5rem">
+          SQL-трансформация
+          <span class="label-hint">выполняется после загрузки данных</span>
+          <button type="button" class="btn btn-sm btn-primary" style="margin-left:auto;padding:.15rem .55rem;font-size:.72rem"
+                  onclick="event.stopPropagation();runStepSQL(${idx})"
+                  title="Выполнить только этот SQL (без upstream-шагов)">▶ SQL</button>
+        </label>
         <textarea class="mono-textarea" rows="4"
                   placeholder="SELECT * FROM source_table WHERE ..."
                   oninput="pbUpdateStep(${idx},'transform_sql',this.value)">${escHtml(step.transform_sql || '')}</textarea>
+      </div>
+      <div style="display:flex;gap:.5rem;margin-top:.75rem;flex-wrap:wrap;align-items:center">
+        <button class="btn btn-sm" onclick="event.stopPropagation();runStepPreview(${idx},{save:true})"
+                title="Запустить шаг и записать результат в target_table">💾 Сохранить в target_table</button>
+        <span style="font-size:.7rem;color:var(--muted);margin-left:auto">клик по карточке → весь chain до этого шага</span>
       </div>
     </div>
   `;
@@ -1019,7 +1283,13 @@ function makeConnectorConfigHTML(step, idx) {
   if (!type && step.python_code) {
     return `
       <div class="form-group" style="margin:0">
-        <label>Python-код <span class="label-hint">df = pandas DataFrame из transform_sql; результат записывается в target_table</span></label>
+        <label style="display:flex;align-items:center;gap:.5rem">
+          Python-код
+          <span class="label-hint">df = pandas DataFrame из transform_sql; результат — в target_table</span>
+          <button type="button" class="btn btn-sm btn-primary" style="margin-left:auto;padding:.15rem .55rem;font-size:.72rem"
+                  onclick="event.stopPropagation();runStepPython(${idx})"
+                  title="Выполнить только этот Python (без upstream-шагов)">▶ Python</button>
+        </label>
         <textarea class="mono-textarea" rows="8"
           oninput="pb.steps[${idx}].python_code=this.value"
           style="font-family:var(--mono);font-size:.78rem">${escHtml(step.python_code)}</textarea>
@@ -1208,7 +1478,8 @@ function pbUpdateAirbyteConfig(idx, jsonText) {
 }
 
 /* ── Save pipeline ── */
-async function savePipeline() {
+/* Persist the current builder state to the server. Returns true on success. */
+async function persistBuilderPipeline() {
   const name    = document.getElementById('pb-name').value.trim();
   const cron    = document.getElementById('pb-cron').value.trim();
   const enabled = document.getElementById('pb-enabled').checked;
@@ -1218,7 +1489,7 @@ async function savePipeline() {
   const webhookOn  = document.getElementById('pb-webhook-on').value || 'failure';
   const alertCooldown = parseInt(document.getElementById('pb-alert-cooldown').value, 10);
 
-  if (!name) { showToast('Необходимо указать название конвейера', 'error'); return; }
+  if (!name) { showToast('Необходимо указать название конвейера', 'error'); return null; }
 
   const steps = pb.steps.map((s, i) => ({
     id:               s.id || `step_${i + 1}`,
@@ -1234,14 +1505,8 @@ async function savePipeline() {
     deps:             s.deps             || [],
     ndeps:            (s.deps || []).length,
   }));
-
-  /* Step 4: emit triggers[] alongside legacy `cron` field. The gateway
-   * synthesizes a TRIGGER_CRON entry from `cron` when triggers[] is empty,
-   * so we don't need to duplicate it — only add the extra ones. */
-  const triggers = (pb.triggers || []).filter(t => t && t.type)
-                                       .map(t => ({...t}));
-  const body = { name, cron, enabled, steps,
-                 triggers,
+  const triggers = (pb.triggers || []).filter(t => t && t.type).map(t => ({...t}));
+  const body = { name, cron, enabled, steps, triggers,
                  max_retries: maxRetries,
                  retry_delay_sec: retryDelay,
                  webhook_url: webhookUrl,
@@ -1249,187 +1514,30 @@ async function savePipeline() {
                  alert_cooldown: isNaN(alertCooldown) ? 300 : alertCooldown };
   if (pb.editId) body.id = pb.editId;
 
+  if (pb.editId) {
+    await apiFetch(`/api/pipelines/${pb.editId}`, 'DELETE');
+  }
+  const created = await apiPost('/api/pipelines', body);
+  if (created?.id) pb.editId = created.id;
+  /* Keep the builder URL in sync with the (possibly new) id. */
+  const hash = '#builder/' + (pb.editId || 'new');
+  if (location.hash !== hash) history.replaceState({ view: 'builder', id: pb.editId }, '', hash);
+  return created;
+}
+
+async function savePipeline() {
   try {
-    if (pb.editId) {
-      /* update = delete + re-create */
-      await apiFetch(`/api/pipelines/${pb.editId}`, 'DELETE');
-    }
-    await apiPost('/api/pipelines', body);
-    showToast(`Конвейер "${name}" сохранён`, 'ok');
-    logActivity(`сохранён конвейер: ${name}`);
+    const created = await persistBuilderPipeline();
+    if (!created) return;
+    const nm = created.name || document.getElementById('pb-name').value.trim();
+    showToast(`Конвейер "${nm}" сохранён`, 'ok');
+    logActivity(`сохранён конвейер: ${nm}`);
     document.getElementById('nav-builder').classList.remove('visible');
     switchView('pipelines');
     loadPipelines();
   } catch (err) {
     showToast(`Ошибка: ${err}`, 'error');
   }
-}
-
-
-/* ═══════════════════════════════════════════════════
-   INGEST
-═══════════════════════════════════════════════════ */
-const dropZone = document.getElementById('drop-zone');
-dropZone.addEventListener('dragover',  e => { e.preventDefault(); dropZone.classList.add('over'); });
-dropZone.addEventListener('dragleave', () => dropZone.classList.remove('over'));
-dropZone.addEventListener('drop', e => {
-  e.preventDefault(); dropZone.classList.remove('over');
-  const file = e.dataTransfer.files[0]; if (file) handleFile(file);
-});
-
-function handleFileSelect(input) { if (input.files[0]) handleFile(input.files[0]); }
-
-const DROP_ZONE_DEFAULT_HTML = `
-  <svg class="drop-svg" viewBox="0 0 48 48" fill="none" xmlns="http://www.w3.org/2000/svg">
-    <rect x="6" y="10" width="36" height="28" rx="4" stroke="currentColor" stroke-width="2.2" fill="none"/>
-    <path d="M16 22l8-8 8 8M24 14v16" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/>
-    <path d="M14 34h20" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"/>
-  </svg>
-  <div class="drop-hint">Перетащите файл сюда</div>
-  <div class="drop-or">или</div>
-  <button class="btn" onclick="document.getElementById('file-input').click()">Выбрать файл</button>
-`;
-
-function handleFile(file) {
-  const isParquet = /\.parquet$/i.test(file.name);
-  if (isParquet) switchIngestMode('parquet');
-
-  ingestFile = file;
-  const tableName = file.name.replace(/\.[^.]+$/, '').replace(/[^a-z0-9_]/gi, '_').toLowerCase();
-  document.getElementById('ingest-table').value = tableName;
-  document.getElementById('upload-btn').disabled = false;
-  dropZone.innerHTML = `
-    <svg class="drop-svg" style="color:var(--green)" viewBox="0 0 48 48" fill="none" xmlns="http://www.w3.org/2000/svg">
-      <circle cx="24" cy="24" r="18" stroke="currentColor" stroke-width="2.2" fill="none"/>
-      <path d="M16 24l6 6 10-10" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/>
-    </svg>
-    <div class="drop-hint">${escHtml(file.name)}</div>
-    <div class="drop-or">${fmtBytes(file.size)}</div>
-    <button class="btn btn-sm" onclick="document.getElementById('file-input').click()">Заменить файл</button>
-  `;
-  if (!isParquet) {
-    const reader = new FileReader();
-    reader.onload = e => { ingestContent = e.target.result; processIngestCSV(ingestContent); };
-    reader.readAsText(file);
-  } else {
-    document.getElementById('ingest-right').style.display = 'none';
-  }
-  document.getElementById('file-input').value = '';
-}
-
-function switchIngestMode(mode) {
-  ingestMode = mode;
-  document.getElementById('tab-csv')?.classList.toggle('active', mode === 'csv');
-  document.getElementById('tab-parquet')?.classList.toggle('active', mode === 'parquet');
-  const hint = document.querySelector('.drop-hint');
-  if (hint && !ingestFile) hint.textContent = mode === 'parquet' ? 'Перетащите .parquet файл сюда' : 'Перетащите файл сюда';
-}
-
-function detectDelimiterStr(line) {
-  const commas = (line.match(/,/g) || []).length;
-  const tabs   = (line.match(/\t/g) || []).length;
-  const semis  = (line.match(/;/g)  || []).length;
-  if (tabs > commas && tabs > semis) return '\t';
-  if (semis > commas) return ';';
-  return ',';
-}
-
-function inferType(val) {
-  const v = (val || '').trim();
-  if (!v || /^(null|na|n\/a)$/i.test(v)) return 'text';
-  if (/^(true|false)$/i.test(v))         return 'bool';
-  if (/^-?\d+$/.test(v))                 return 'int64';
-  if (/^-?\d+\.?\d*([eE][+-]?\d+)?$/.test(v)) return 'double';
-  return 'text';
-}
-
-function processIngestCSV(content) {
-  const lines = content.split('\n').filter(l => l.trim());
-  if (!lines.length) return;
-  ingestDelimiter = detectDelimiterStr(lines[0]);
-  const headers = splitCSVLineDelim(lines[0], ingestDelimiter)
-    .map(h => h.replace(/\r/g, '').trim());
-  const sample = lines.length > 1 ? splitCSVLineDelim(lines[1], ingestDelimiter) : [];
-  ingestColumns = headers.map((name, i) => ({ name, type: inferType(sample[i] || '') }));
-  showPreview(content);
-  document.getElementById('ingest-right').style.display = '';
-}
-
-function showPreview(csv) {
-  const lines = csv.split('\n').filter(Boolean).slice(0, 6);
-  if (!lines.length) return;
-  const delim = ingestDelimiter || ',';
-  const cols  = splitCSVLineDelim(lines[0], delim);
-  const rows  = lines.slice(1).map(l => splitCSVLineDelim(l, delim));
-  let html = '<table class="preview-table"><thead><tr>';
-  cols.forEach(c => { html += `<th>${escHtml(c.replace(/\r/g,''))}</th>`; });
-  html += '</tr></thead><tbody>';
-  rows.forEach(row => {
-    html += '<tr>';
-    row.forEach(v => { html += `<td>${escHtml(v.replace(/\r/g,''))}</td>`; });
-    html += '</tr>';
-  });
-  html += '</tbody></table>';
-  document.getElementById('preview-table').innerHTML = html;
-}
-
-async function uploadCSV() {
-  if (ingestMode === 'parquet') { uploadParquet(); return; }
-  const table = document.getElementById('ingest-table').value.trim() || 'upload';
-  if (!ingestContent) { showToast('Файл не выбран', 'warn'); return; }
-  const status = document.getElementById('ingest-status');
-  status.textContent = 'Загрузка…';
-  try {
-    const resp = await apiPostRaw(`/api/ingest/csv?table=${encodeURIComponent(table)}`, ingestContent, 'text/csv');
-    status.innerHTML = `<span style="color:var(--green)">✓ ${fmtNum(resp.rows)} строк → <strong>${resp.table}</strong></span>`;
-    showToast(`Импортировано ${fmtNum(resp.rows)} строк в "${resp.table}"`, 'ok');
-    logActivity(`загружено ${resp.rows} строк → ${resp.table}`);
-    document.getElementById('upload-btn').disabled = true;
-    ingestContent = null; ingestColumns = [];
-    dropZone.innerHTML = DROP_ZONE_DEFAULT_HTML;
-    document.getElementById('ingest-right').style.display = 'none';
-    document.getElementById('ingest-table').value = '';
-    document.getElementById('file-input').value = '';
-  } catch (err) {
-    status.innerHTML = `<span style="color:var(--red)">Error: ${escHtml(String(err))}</span>`;
-    showToast(String(err), 'error');
-  }
-}
-
-
-async function uploadParquet() {
-  const table = document.getElementById('ingest-table').value.trim() || 'upload';
-  if (!ingestFile) { showToast('Файл не выбран', 'warn'); return; }
-  const status = document.getElementById('ingest-status');
-  status.textContent = 'Загрузка…';
-  try {
-    const resp = await apiPostRaw(`/api/ingest/parquet?table=${encodeURIComponent(table)}`, ingestFile, 'application/octet-stream');
-    status.innerHTML = `<span style="color:var(--green)">✓ ${fmtNum(resp.rows)} строк → <strong>${resp.table}</strong></span>`;
-    showToast(`Импортировано ${fmtNum(resp.rows)} строк в "${resp.table}"`, 'ok');
-    logActivity(`загружено ${resp.rows} строк (parquet) → ${resp.table}`);
-    document.getElementById('upload-btn').disabled = true;
-    ingestContent = null; ingestFile = null;
-    dropZone.innerHTML = DROP_ZONE_DEFAULT_HTML;
-    document.getElementById('ingest-right').style.display = 'none';
-    document.getElementById('ingest-table').value = '';
-    document.getElementById('file-input').value = '';
-  } catch (err) {
-    status.innerHTML = `<span style="color:var(--red)">Error: ${escHtml(String(err))}</span>`;
-    showToast(String(err), 'error');
-  }
-}
-
-
-function splitCSVLineDelim(line, delim) {
-  const out = []; let cur = '', inQ = false;
-  for (let i = 0; i < line.length; i++) {
-    const c = line[i];
-    if (c === '"') { inQ = !inQ; }
-    else if (c === delim && !inQ) { out.push(cur.trim()); cur = ''; }
-    else cur += c;
-  }
-  out.push(cur.trim());
-  return out;
 }
 
 
@@ -3664,8 +3772,18 @@ function initApp() {
   applyPrefs();
   applyPrefsToSettingsForm();
 
-  const hash = location.hash.replace('#', '') || 'ingest';
-  switchView(hash, { pushState: false });
+  const { view, id } = parseHash();
+
+  if (view === 'builder' && id) {
+    /* '#builder/<id>' — fetch the pipeline and reopen the builder on it. */
+    restoreBuilderFromHash(id);
+  } else {
+    const v = VALID_VIEWS.has(view) ? view : 'pipelines';
+    /* '#builder' without an id is a stale URL — go to list. */
+    const fallback = (v === 'builder') ? 'pipelines' : v;
+    switchView(fallback, { pushState: false });
+    if (fallback !== view) history.replaceState({ view: fallback }, '', '#' + fallback);
+  }
 
   connectWS();
   restartMetricsTimer(); /* clears any existing timer before starting a new one */
@@ -3791,11 +3909,7 @@ async function dropMatview(name) {
 }
 
 function queryMatview(name) {
-  switchView('query');
-  setTimeout(() => {
-    document.getElementById('sql-input').value = `SELECT * FROM ${name} LIMIT 100`;
-    runQuery();
-  }, 150);
+  openTablePreview(name);
 }
 
 /* ═══════════════════════════════════════════════════
@@ -3950,11 +4064,21 @@ applyPrefs();
 connectWS();
 restartMetricsTimer();
 
-/* Restore view from URL hash, or default to tables */
+/* Restore view from URL hash on initial load.
+ * - Unknown / removed views (e.g. legacy '#ingest', '#query') → pipelines
+ * - '#builder' on a cold load has no pipeline in memory → pipelines
+ * - Valid hash → stays as-is. URL is rewritten to reflect the actual view so
+ *   the next refresh keeps the user where they actually are. */
 (function bootView() {
-  const hash = location.hash.replace('#', '').trim();
-  const view = VALID_VIEWS.has(hash) ? hash : 'ingest';
-  /* replace initial state so back-button doesn't exit the app */
-  history.replaceState({ view }, '', '#' + view);
-  switchView(view, { pushState: false });
+  const { view, id } = parseHash();
+  /* '#builder/<id>' is handled later by initApp (it needs network).
+   * Here at module-load we only show *something* valid before login resolves. */
+  if (view === 'builder' && id) {
+    /* leave URL alone; initApp will reopen the builder once logged in */
+    return;
+  }
+  let v = VALID_VIEWS.has(view) ? view : 'pipelines';
+  if (v === 'builder') v = 'pipelines';
+  history.replaceState({ view: v }, '', '#' + v);
+  switchView(v, { pushState: false });
 })();
